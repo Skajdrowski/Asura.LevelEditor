@@ -28,6 +28,9 @@ namespace editor {
 constexpr char kProjectMagic[8] = {'A', 'L', 'E', 'V', '2', '0', '0', '5'};
 constexpr uint32_t kProjectVersion = 3;
 constexpr uint32_t kNoTemplate = 0xffffffffu;
+constexpr float kSpawnCollisionHalfWidth = 0.3f;
+constexpr float kSpawnCollisionHeight = 1.8f;
+constexpr float kSpawnCollisionVerticalOffset = 0.1f;
 
 enum class EntityKind : uint32_t { SpawnPoint, Light, Sound, ObjectTemplate };
 
@@ -670,6 +673,106 @@ bool make_editor_sounds(const Document& doc, Sounds* sounds, Arena* arena, Error
     return true;
 }
 
+Asura_Vector_3 collision_sub(Asura_Vector_3 a, Asura_Vector_3 b) {
+    return {a.x - b.x, a.y - b.y, a.z - b.z};
+}
+
+float collision_dot(Asura_Vector_3 a, Asura_Vector_3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+
+Asura_Vector_3 collision_cross(Asura_Vector_3 a, Asura_Vector_3 b) {
+    return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x};
+}
+
+bool triangle_overlaps_box_axis(Asura_Vector_3 a, Asura_Vector_3 b, Asura_Vector_3 c,
+                                Asura_Vector_3 axis, Asura_Vector_3 half_size) {
+    if (collision_dot(axis, axis) <= 1e-12f)
+        return true;
+    const float pa = collision_dot(a, axis), pb = collision_dot(b, axis), pc = collision_dot(c, axis);
+    const float radius = half_size.x * fabsf(axis.x) + half_size.y * fabsf(axis.y) +
+                         half_size.z * fabsf(axis.z);
+    return fminf(pa, fminf(pb, pc)) <= radius && fmaxf(pa, fmaxf(pb, pc)) >= -radius;
+}
+
+bool triangle_intersects_box(Asura_Vector_3 a, Asura_Vector_3 b, Asura_Vector_3 c,
+                             const Asura_Bounding_Box& box) {
+    const Asura_Vector_3 center{(box.MinX + box.MaxX) * 0.5f, (box.MinY + box.MaxY) * 0.5f,
+                                (box.MinZ + box.MaxZ) * 0.5f};
+    const Asura_Vector_3 half_size{(box.MaxX - box.MinX) * 0.5f, (box.MaxY - box.MinY) * 0.5f,
+                                   (box.MaxZ - box.MinZ) * 0.5f};
+    a = collision_sub(a, center);
+    b = collision_sub(b, center);
+    c = collision_sub(c, center);
+    if (fmaxf(a.x, fmaxf(b.x, c.x)) < -half_size.x || fminf(a.x, fminf(b.x, c.x)) > half_size.x ||
+        fmaxf(a.y, fmaxf(b.y, c.y)) < -half_size.y || fminf(a.y, fminf(b.y, c.y)) > half_size.y ||
+        fmaxf(a.z, fmaxf(b.z, c.z)) < -half_size.z || fminf(a.z, fminf(b.z, c.z)) > half_size.z)
+        return false;
+
+    const Asura_Vector_3 edges[3] = {collision_sub(b, a), collision_sub(c, b), collision_sub(a, c)};
+    if (!triangle_overlaps_box_axis(a, b, c, collision_cross(edges[0], edges[1]), half_size))
+        return false;
+    for (Asura_Vector_3 edge : edges) {
+        const Asura_Vector_3 axes[3] = {{0, edge.z, -edge.y}, {-edge.z, 0, edge.x}, {edge.y, -edge.x, 0}};
+        for (Asura_Vector_3 axis : axes)
+            if (!triangle_overlaps_box_axis(a, b, c, axis, half_size))
+                return false;
+    }
+    return true;
+}
+
+struct SpawnCollisionProbe {
+    const Entity* entity;
+    Asura_Bounding_Box bounds;
+    uint32_t index;
+};
+
+bool validate_spawn_clearance(const Document& doc, const ObjData& obj, const Config& cfg, Error* err) {
+    std::vector<SpawnCollisionProbe> probes;
+    probes.reserve(doc.entities.size());
+    uint32_t spawn_index = 0;
+    for (const Entity& entity : doc.entities) {
+        if (entity.kind != EntityKind::SpawnPoint)
+            continue;
+        SpawnCollisionProbe probe{};
+        probe.entity = &entity;
+        probe.index = spawn_index++;
+        probe.bounds = {entity.position.x - kSpawnCollisionHalfWidth,
+                        entity.position.x + kSpawnCollisionHalfWidth,
+                        entity.position.y - kSpawnCollisionVerticalOffset - kSpawnCollisionHeight,
+                        entity.position.y - kSpawnCollisionVerticalOffset,
+                        entity.position.z - kSpawnCollisionHalfWidth,
+                        entity.position.z + kSpawnCollisionHalfWidth};
+        probes.push_back(probe);
+    }
+    if (probes.empty())
+        return true;
+
+    for (uint32_t face_index = 0; face_index < obj.face_count; ++face_index) {
+        VertexKey keys[3];
+        if (!face_keys(obj, obj.faces[face_index], keys, err))
+            return false;
+        const Asura_Vector_3 a = transform_vec(obj.positions[keys[0].v], cfg);
+        const Asura_Vector_3 b = transform_vec(obj.positions[keys[1].v], cfg);
+        const Asura_Vector_3 c = transform_vec(obj.positions[keys[2].v], cfg);
+        const Asura_Bounding_Box triangle_bounds{
+            fminf(a.x, fminf(b.x, c.x)), fmaxf(a.x, fmaxf(b.x, c.x)),
+            fminf(a.y, fminf(b.y, c.y)), fmaxf(a.y, fmaxf(b.y, c.y)),
+            fminf(a.z, fminf(b.z, c.z)), fmaxf(a.z, fmaxf(b.z, c.z))};
+        for (const SpawnCollisionProbe& probe : probes) {
+            if (triangle_bounds.MaxX < probe.bounds.MinX || triangle_bounds.MinX > probe.bounds.MaxX ||
+                triangle_bounds.MaxY < probe.bounds.MinY || triangle_bounds.MinY > probe.bounds.MaxY ||
+                triangle_bounds.MaxZ < probe.bounds.MinZ || triangle_bounds.MinZ > probe.bounds.MaxZ)
+                continue;
+            if (!triangle_intersects_box(a, b, c, probe.bounds))
+                continue;
+            return fail(err,
+                        "Spawn '%s' at (%.3f, %.3f, %.3f) clips through environment geometry.",
+                        probe.entity->name.c_str(), probe.entity->position.x,
+                        probe.entity->position.y, probe.entity->position.z);
+        }
+    }
+    return true;
+}
+
 bool pack_document(const Document& doc, const char* output_path, std::string* why) {
     if (doc.obj_path.empty()) {
         if (why)
@@ -701,10 +804,14 @@ bool pack_document(const Document& doc, const char* output_path, std::string* wh
     TextureSet textures{};
     ModuleMetric* metrics = nullptr;
     bool ok = arena_init(&arena, cfg.arena_reserve, &err) && arena_init(&scratch, cfg.arena_reserve, &err) &&
-              buffer_init(&output, cfg.output_reserve, &err) && map_file(cfg.obj, &obj_file, &err) &&
-              parse_obj(&obj_file, &obj, &arena, &err) && load_material_map(cfg, &material_map, &arena, &err) &&
-              load_shade_source(cfg, obj, &shade, &arena, &scratch, &err) &&
-              build_env(cfg, obj, material_map, shade.count ? &shade : nullptr, &arena, &scratch, &env, &err);
+              map_file(cfg.obj, &obj_file, &err) && parse_obj(&obj_file, &obj, &arena, &err);
+    if (ok)
+        ok = validate_spawn_clearance(doc, obj, cfg, &err);
+    if (ok)
+        ok = buffer_init(&output, cfg.output_reserve, &err) &&
+             load_material_map(cfg, &material_map, &arena, &err) &&
+             load_shade_source(cfg, obj, &shade, &arena, &scratch, &err) &&
+             build_env(cfg, obj, material_map, shade.count ? &shade : nullptr, &arena, &scratch, &env, &err);
     if (ok) {
         env_payload = env.payload;
         ok = env_view(env_payload, &view, &arena, &err) && view.module_count &&
