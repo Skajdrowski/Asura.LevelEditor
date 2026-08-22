@@ -547,18 +547,18 @@ bool append_editor_lights(Buffer* out, const Document& doc, Error* err) {
 }
 
 bool append_editor_spawnpoints(Buffer* out, const Document& doc, Error* err) {
-    uint32_t spawn_index = 0;
+    uint32_t index = 0;
     for (const Entity& e : doc.entities) {
         if (e.kind != EntityKind::SpawnPoint)
             continue;
         Snipe_ServerEntity_SpawnPoint_ChunkDataV0 data{};
-        data.m_xEntity.Guid = e.guid;
+        data.m_xEntity.Guid = kSpawnGuidBase + index;
         data.m_xEntity.Classification = SnipeEntityClass_SpawnPoint;
         data.m_xPosition = e.position;
         const float yaw = e.rotation.y * 3.14159265358979323846f / 180.0f;
         const float pitch = e.rotation.x * 3.14159265358979323846f / 180.0f;
         data.m_xDirection = {cosf(pitch) * sinf(yaw), sinf(pitch), cosf(pitch) * cosf(yaw)};
-        data.m_iSpawnIndex = static_cast<int32_t>(spawn_index++);
+        data.m_iSpawnIndex = index;
         data.m_iPosture = 0;
         data.m_uTeamMask = e.value_u32_a;
         data.m_uGameModeMask = e.value_u32_b;
@@ -566,6 +566,7 @@ bool append_editor_spawnpoints(Buffer* out, const Document& doc, Error* err) {
         ChunkMark ch = begin_chunk(out, ASURA_CHUNK_ENTITY, 0, 0, err);
         buffer_append(out, &data, sizeof(data), err);
         end_chunk(out, ch, err);
+        index++;
     }
     return !err->set;
 }
@@ -642,11 +643,11 @@ bool make_editor_sounds(const Document& doc, Sounds* sounds, Arena* arena, Error
     if (!sounds->items)
         return false;
     sounds->count = count;
-    uint32_t at = 0, resource_id = 1;
+    uint32_t index = 0, resource_id = 1;
     for (const Entity& e : doc.entities) {
         if (e.kind != EntityKind::Sound)
             continue;
-        SoundEntry& s = sounds->items[at++];
+        SoundEntry& s = sounds->items[index];
         s.name = {e.sound_name.data(), static_cast<uint32_t>(e.sound_name.size())};
         s.file = e.sound_file.empty() ? nullptr : e.sound_file.c_str();
         s.position = e.position;
@@ -658,12 +659,13 @@ bool make_editor_sounds(const Document& doc, Sounds* sounds, Arena* arena, Error
         s.outer_cuboid_radius = {10, 10, 10};
         s.orientation = euler_quaternion(e.rotation);
         s.sound_resource_id = resource_id++;
-        s.controller_guid = e.guid;
-        s.phonon_guid = e.guid + 0x100000;
+        s.controller_guid = kSoundControllerGuidBase + index;
+        s.phonon_guid = kPhononGuidBase + index;
         s.flags = e.sound_loop ? 3u : 2u;
         s.controller_padding = 0x4974;
         s.emit_enti = true;
         s.active = true;
+        index++;
     }
     return true;
 }

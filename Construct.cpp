@@ -7,6 +7,9 @@ namespace {
 
 constexpr uint8_t kAsuraMagic[8] = {'A', 's', 'u', 'r', 'a', ' ', ' ', ' '};
 constexpr uint32_t kMaxAabbTreeObjects = 65535;
+constexpr uint32_t kSpawnGuidBase = 0x186a0;
+constexpr uint32_t kPhononGuidBase = 0x186a0;
+constexpr uint32_t kSoundControllerGuidBase = 0x18c40;
 // sub_4836C0 shares one 0x4000-byte buffer between AABB
 // traversal frames (28 bytes each) and returned object IDs (4 bytes each).
 // Keep a complete module query comfortably below that workspace limit.
@@ -2692,7 +2695,7 @@ bool append_spawnpoints(Buffer* out, const char* path, Arena* scratch, Error* er
                     pitch = static_cast<float>(json_number(it, "pitch", 0) * 3.14159265358979323846 / 180.0);
         data.m_xDirection = {static_cast<float>(cos(pitch) * sin(yaw)), static_cast<float>(sin(pitch)),
                              static_cast<float>(cos(pitch) * cos(yaw))};
-        data.m_xEntity.Guid = static_cast<uint32_t>(json_integer(it, "guid", 0x186a0 + i));
+        data.m_xEntity.Guid = static_cast<uint32_t>(json_integer(it, "guid", kSpawnGuidBase + i));
         data.m_xEntity.Classification = SnipeEntityClass_SpawnPoint;
         data.m_xEntity.m_usPadding =
             static_cast<uint16_t>(json_integer(it, "entity_padding", json_integer(it, "u16_unk", 0)));
@@ -2901,10 +2904,10 @@ bool load_sounds(const Config& cfg, Sounds* out, Arena* arena, Error* err) {
                                     retrigger_box[3], retrigger_box[4], retrigger_box[5]};
         s.orientation = {orientation[0], orientation[1], orientation[2], orientation[3]};
         s.controller_guid =
-            static_cast<uint32_t>(json_integer(it, "controller_guid", json_integer(it, "guid", 0x18c40 + i)));
+            static_cast<uint32_t>(json_integer(it, "controller_guid", json_integer(it, "guid", kSoundControllerGuidBase + i)));
         s.controller_padding = static_cast<uint16_t>(json_integer(
             it, "controller_padding", json_integer(it, "controller_u16_unk", json_integer(it, "u16_unk", 0x4974))));
-        s.phonon_guid = static_cast<uint32_t>(json_integer(it, "phonon_guid", 0x186a0 + i));
+        s.phonon_guid = static_cast<uint32_t>(json_integer(it, "phonon_guid", kPhononGuidBase + i));
         s.flags = static_cast<uint32_t>(json_integer(it, "flags", s.emit_enti ? (loop ? 3 : 2) : (loop ? 0x13 : 0x12)));
         Json* id = json_get(it, "sound_id");
         uint32_t requested = id ? static_cast<uint32_t>(json_integer(it, "sound_id", 0)) : 0;
