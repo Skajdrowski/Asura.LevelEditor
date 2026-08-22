@@ -2171,20 +2171,33 @@ bool append_sky_resources(Buffer* out, const Config& cfg, Arena* scratch, Error*
         return true;
     if (!dir_exists(cfg.sky_texture_dir))
         return fail(err, "sky texture directory not found: %s", cfg.sky_texture_dir);
-    const char* files[] = {"fr.tga", "lf.tga", "bk.tga", "rt.tga", "up.tga", "ch_04_sky.bmp"};
-    for (const char* fn : files) {
-        char path[MAX_PATH];
-        if (!join_path(path, MAX_PATH, cfg.sky_texture_dir, str_from_c(fn)))
-            return fail(err, "sky file path too long");
-        if (!file_exists(path))
+    ArenaMark files_mark = arena_mark(scratch);
+    Vec<DiskFile> disk_files{};
+    if (!list_files(cfg.sky_texture_dir, scratch, &disk_files, err))
+        return false;
+    struct SkyFaceFile {
+        const char* stem;
+        const char* target_name;
+    };
+    const SkyFaceFile faces[] = {{"fr", "fr.tga"}, {"lf", "lf.tga"}, {"bk", "bk.tga"},
+                                 {"rt", "rt.tga"}, {"up", "up.tga"}, {"ch_04_sky", "ch_04_sky.bmp"}};
+    for (const SkyFaceFile& face : faces) {
+        const DiskFile* source = nullptr;
+        for (uint32_t i = 0; i < disk_files.count; ++i)
+            if (str_ieq(path_stem(str_from_c(disk_files.data[i].name)), str_from_c(face.stem))) {
+                source = &disk_files.data[i];
+                break;
+            }
+        if (!source)
             continue;
         char name[256];
-        snprintf(name, sizeof(name), "\\graphics\\sky\\%s", fn);
-        Str stem = path_stem(str_from_c(fn));
-        const bool flip = cfg.sky_flip_faces.size && csv_has_str(cfg.sky_flip_faces, stem);
-        if (!append_file_rscf(out, str_from_c(name), ASURA_RESOURCEFILE_TYPE_TEXTURE, 0, path, scratch, flip, err))
+        snprintf(name, sizeof(name), "\\graphics\\sky\\%s", face.target_name);
+        const bool flip = cfg.sky_flip_faces.size && csv_has_str(cfg.sky_flip_faces, str_from_c(face.stem));
+        if (!append_file_rscf(out, str_from_c(name), ASURA_RESOURCEFILE_TYPE_TEXTURE, 0, source->path, scratch, flip,
+                              err))
             return false;
     }
+    arena_reset(scratch, files_mark);
     return true;
 }
 

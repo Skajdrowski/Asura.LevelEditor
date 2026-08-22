@@ -12,7 +12,6 @@
 #include <algorithm>
 #include <array>
 #include <fstream>
-#include <set>
 #include <string>
 #include <vector>
 
@@ -26,23 +25,12 @@
 namespace editor {
 
 constexpr char kProjectMagic[8] = {'A', 'L', 'E', 'V', '2', '0', '0', '5'};
-constexpr uint32_t kProjectVersion = 3;
-constexpr uint32_t kNoTemplate = 0xffffffffu;
+constexpr uint32_t kProjectVersion = 6;
 constexpr float kSpawnCollisionHalfWidth = 0.3f;
 constexpr float kSpawnCollisionHeight = 1.8f;
 constexpr float kSpawnCollisionVerticalOffset = 0.1f;
 
-enum class EntityKind : uint32_t { SpawnPoint, Light, Sound, ObjectTemplate };
-
-struct EntityTemplate {
-    std::string name;
-    std::string donor_pc;
-    std::vector<uint8_t> enti;
-    uint32_t position_offset = 0;
-    uint32_t quaternion_offset = 0;
-    uint16_t classification = 0;
-    uint32_t source_guid = 0;
-};
+enum class EntityKind : uint32_t { SpawnPoint, Light, Sound };
 
 struct Entity {
     EntityKind kind = EntityKind::SpawnPoint;
@@ -50,7 +38,6 @@ struct Entity {
     Asura_Vector_3 position{};
     Asura_Vector_3 rotation{}; // pitch, yaw, roll in degrees
     uint32_t guid = 0;
-    uint32_t template_index = kNoTemplate;
     float value_a = 0;
     float value_b = 0;
     uint32_t value_u32_a = 0;
@@ -67,7 +54,8 @@ struct Document {
     std::string output_path;
     std::string material_map;
     std::string texture_dir;
-    std::vector<EntityTemplate> templates;
+    std::string weapons_donor;
+    std::string sky_texture_dir;
     std::vector<Entity> entities;
     uint32_t next_guid = 0x500000;
     bool dirty = false;
@@ -231,18 +219,9 @@ bool save_project(const Document& doc, const char* path, std::string* why) {
     w.str(doc.output_path);
     w.str(doc.material_map);
     w.str(doc.texture_dir);
+    w.str(doc.weapons_donor);
+    w.str(doc.sky_texture_dir);
     w.u32(doc.next_guid);
-    w.u32(static_cast<uint32_t>(doc.templates.size()));
-    for (const EntityTemplate& t : doc.templates) {
-        w.str(t.name);
-        w.str(t.donor_pc);
-        w.u32(t.position_offset);
-        w.u32(t.quaternion_offset);
-        w.u32(t.classification);
-        w.u32(t.source_guid);
-        w.u32(static_cast<uint32_t>(t.enti.size()));
-        w.raw(t.enti.data(), t.enti.size());
-    }
     w.u32(static_cast<uint32_t>(doc.entities.size()));
     for (const Entity& e : doc.entities) {
         w.u32(static_cast<uint32_t>(e.kind));
@@ -250,7 +229,6 @@ bool save_project(const Document& doc, const char* path, std::string* why) {
         write_vec3(w, e.position);
         write_vec3(w, e.rotation);
         w.u32(e.guid);
-        w.u32(e.template_index);
         w.f32(e.value_a);
         w.f32(e.value_b);
         w.u32(e.value_u32_a);
@@ -272,6 +250,28 @@ bool save_project(const Document& doc, const char* path, std::string* why) {
         return false;
     }
     return true;
+}
+
+void skip_legacy_project_records(BinaryReader& r) {
+    const uint32_t count = r.u32();
+    if (count > 4096) {
+        r.ok = false;
+        return;
+    }
+    for (uint32_t i = 0; i < count && r.ok; ++i) {
+        r.str();
+        r.str();
+        r.u32();
+        r.u32();
+        r.u32();
+        r.u32();
+        const uint32_t size = r.u32();
+        if (!r.ok || size > 32 * MiB || size > r.size - r.at) {
+            r.ok = false;
+            return;
+        }
+        r.at += size;
+    }
 }
 
 bool load_project(Document* doc, const char* path, std::string* why) {
@@ -306,63 +306,54 @@ bool load_project(Document* doc, const char* path, std::string* why) {
     next.output_path = r.str();
     next.material_map = r.str();
     next.texture_dir = r.str();
+    if (project_version >= 4)
+        next.weapons_donor = r.str();
+    if (project_version >= 6)
+        next.sky_texture_dir = r.str();
     next.next_guid = r.u32();
-    const uint32_t template_count = r.u32();
-    if (template_count > 4096)
-        r.ok = false;
-    next.templates.resize(r.ok ? template_count : 0);
-    for (EntityTemplate& t : next.templates) {
-        t.name = r.str();
-        t.donor_pc = r.str();
-        t.position_offset = r.u32();
-        t.quaternion_offset = r.u32();
-        t.classification = static_cast<uint16_t>(r.u32());
-        t.source_guid = r.u32();
-        const uint32_t n = r.u32();
-        if (!r.ok || n > 32 * MiB || n > r.size - r.at) {
-            r.ok = false;
-            break;
-        }
-        t.enti.resize(n);
-        r.raw(t.enti.data(), n);
-    }
+    if (project_version <= 4)
+        skip_legacy_project_records(r);
     const uint32_t entity_count = r.u32();
     if (entity_count > 100000)
         r.ok = false;
-    next.entities.resize(r.ok ? entity_count : 0);
-    for (Entity& e : next.entities) {
+    next.entities.reserve(r.ok ? entity_count : 0);
+    bool skipped_legacy_entities = false;
+    for (uint32_t i = 0; i < entity_count && r.ok; ++i) {
+        Entity e;
         const uint32_t kind = r.u32();
-        if (kind > static_cast<uint32_t>(EntityKind::ObjectTemplate))
+        const uint32_t maximum_kind = project_version <= 4 ? 3u : static_cast<uint32_t>(EntityKind::Sound);
+        if (kind > maximum_kind)
             r.ok = false;
-        e.kind = static_cast<EntityKind>(kind);
+        const bool supported = kind <= static_cast<uint32_t>(EntityKind::Sound);
+        if (supported)
+            e.kind = static_cast<EntityKind>(kind);
         e.name = r.str();
         e.position = read_vec3(r);
         e.rotation = read_vec3(r);
         e.guid = r.u32();
-        e.template_index = r.u32();
+        if (project_version <= 4)
+            r.u32();
         e.value_a = r.f32();
         e.value_b = r.f32();
         e.value_u32_a = r.u32();
         e.value_u32_b = r.u32();
         e.sound_name = r.str();
         e.sound_file = r.str();
-        if (e.kind == EntityKind::Sound)
+        if (kind == static_cast<uint32_t>(EntityKind::Sound))
             e.sound_loop = project_version >= 3 ? r.u32() != 0 : true;
-        if (e.kind == EntityKind::Light)
+        if (kind == static_cast<uint32_t>(EntityKind::Light))
             e.light = project_version >= 2 ? read_light(r) : legacy_editor_light(e);
+        if (supported)
+            next.entities.push_back(std::move(e));
+        else
+            skipped_legacy_entities = true;
     }
     if (!r.ok || r.at != r.size) {
         if (why)
             *why = "The editor project is truncated or corrupt.";
         return false;
     }
-    for (const Entity& e : next.entities)
-        if (e.kind == EntityKind::ObjectTemplate && e.template_index >= next.templates.size()) {
-            if (why)
-                *why = "The project contains a broken object-template reference.";
-            return false;
-        }
-    next.dirty = false;
+    next.dirty = skipped_legacy_entities;
     *doc = std::move(next);
     return true;
 }
@@ -427,97 +418,6 @@ bool load_preview_mesh(const std::string& path, Mesh* mesh, std::string* why) {
     return ok;
 }
 
-bool locate_physical_transform(const uint8_t* data, uint32_t size, uint32_t* position, uint32_t* quaternion) {
-    bool found = false;
-    for (uint32_t at = sizeof(Asura_Chunk_Entity); at + 32 <= size; at += 4) {
-        if (read_u32(data + at) != 7)
-            continue;
-        float p[3], q[4];
-        memcpy(p, data + at + 4, sizeof(p));
-        memcpy(q, data + at + 16, sizeof(q));
-        bool finite = true;
-        for (float v : p)
-            finite = finite && isfinite(v) && fabsf(v) < 10000000.0f;
-        float qn = 0;
-        for (float v : q) {
-            finite = finite && isfinite(v) && fabsf(v) <= 1.01f;
-            qn += v * v;
-        }
-        if (finite && qn > .75f && qn < 1.25f) {
-            *position = at + 4;
-            *quaternion = at + 16;
-            found = true;
-        }
-    }
-    return found;
-}
-
-struct ImportCandidate {
-    uint32_t chunk_index = 0;
-    uint32_t position_offset = 0;
-    uint32_t quaternion_offset = 0;
-    uint32_t guid = 0;
-    uint16_t classification = 0;
-};
-
-bool scan_import_candidates(const char* path, std::vector<ImportCandidate>* candidates, std::string* why) {
-    Error err{};
-    Arena arena{};
-    ChunkList chunks{};
-    bool ok = arena_init(&arena, 128 * MiB, &err) && parse_chunks(path, &chunks, &arena, &err);
-    if (ok) {
-        for (uint32_t i = 0; i < chunks.count; ++i) {
-            const ChunkRef& ch = chunks.chunks[i];
-            if (ch.cid != ASURA_CHUNK_ENTITY || ch.size < sizeof(Asura_Chunk_Entity))
-                continue;
-            ImportCandidate c{};
-            if (!locate_physical_transform(ch.data, ch.size, &c.position_offset, &c.quaternion_offset))
-                continue;
-            c.chunk_index = i;
-            c.guid = read_u32(ch.data + sizeof(Asura_Chunk_Header));
-            c.classification = read_u16(ch.data + sizeof(Asura_Chunk_Header) + 4);
-            candidates->push_back(c);
-        }
-    }
-    if (ok && candidates->empty()) {
-        ok = false;
-        if (why)
-            *why = "No ENTI with the 2005 physical-object transform base was found in this donor.";
-    } else if (!ok && why && why->empty()) {
-        *why = err.set ? err.message : "Could not inspect the donor PC file.";
-    }
-    unmap_file(&chunks.file);
-    arena_release(&arena);
-    return ok;
-}
-
-bool import_template(const char* path, const ImportCandidate& candidate, EntityTemplate* out, std::string* why) {
-    Error err{};
-    Arena arena{};
-    ChunkList chunks{};
-    bool ok = arena_init(&arena, 128 * MiB, &err) && parse_chunks(path, &chunks, &arena, &err);
-    if (!ok || candidate.chunk_index >= chunks.count) {
-        if (why)
-            *why = err.set ? err.message : "The selected donor entity no longer exists.";
-        unmap_file(&chunks.file);
-        arena_release(&arena);
-        return false;
-    }
-    const ChunkRef& ch = chunks.chunks[candidate.chunk_index];
-    char label[128];
-    snprintf(label, sizeof(label), "Object 0x%04X (source GUID %u)", candidate.classification, candidate.guid);
-    out->name = label;
-    out->donor_pc = path;
-    out->enti.assign(ch.data, ch.data + ch.size);
-    out->position_offset = candidate.position_offset;
-    out->quaternion_offset = candidate.quaternion_offset;
-    out->classification = candidate.classification;
-    out->source_guid = candidate.guid;
-    unmap_file(&chunks.file);
-    arena_release(&arena);
-    return true;
-}
-
 Asura_Quat euler_quaternion(const Asura_Vector_3& degrees) {
     constexpr float d2r = 3.14159265358979323846f / 180.0f;
     const float hx = degrees.x * d2r * .5f, hy = degrees.y * d2r * .5f, hz = degrees.z * d2r * .5f;
@@ -572,68 +472,6 @@ bool append_editor_spawnpoints(Buffer* out, const Document& doc, Error* err) {
         index++;
     }
     return !err->set;
-}
-
-bool append_template_entities(Buffer* out, const Document& doc, Error* err) {
-    for (const Entity& e : doc.entities) {
-        if (e.kind != EntityKind::ObjectTemplate)
-            continue;
-        if (e.template_index >= doc.templates.size())
-            return fail(err, "object '%s' references a missing template", e.name.c_str());
-        const EntityTemplate& t = doc.templates[e.template_index];
-        if (t.enti.size() < sizeof(Asura_Chunk_Entity) || t.position_offset + 12 > t.enti.size() ||
-            t.quaternion_offset + 16 > t.enti.size())
-            return fail(err, "object template '%s' has invalid patch offsets", t.name.c_str());
-        std::vector<uint8_t> bytes = t.enti;
-        memcpy(bytes.data() + sizeof(Asura_Chunk_Header), &e.guid, sizeof(e.guid));
-        memcpy(bytes.data() + t.position_offset, &e.position, sizeof(e.position));
-        const Asura_Quat q = euler_quaternion(e.rotation);
-        memcpy(bytes.data() + t.quaternion_offset, &q, sizeof(q));
-        if (buffer_append(out, bytes.data(), bytes.size(), err) == ~0ull)
-            return false;
-    }
-    return true;
-}
-
-bool is_template_support_chunk(uint32_t cid) {
-    const uint32_t support[] = {
-        ASURA_CHUNK_TEXTURENAMES, ASURA_CHUNK_TEXTUREFLAGS, ASURA_CHUNK_MATERIAL, ASURA_CHUNK_MATERIALNAMES,
-        fourcc('H', 'C', 'A', 'N'), fourcc('H', 'S', 'K', 'N'), fourcc('H', 'M', 'P', 'T'),
-        fourcc('H', 'S', 'B', 'B'), fourcc('S', 'H', 'A', 'P'), fourcc('S', 'H', 'P', 'D')};
-    for (uint32_t x : support)
-        if (x == cid)
-            return true;
-    return false;
-}
-
-bool append_template_resources(Buffer* out, const Document& doc, Arena* scratch, Error* err) {
-    std::set<std::string> donors;
-    for (const Entity& e : doc.entities)
-        if (e.kind == EntityKind::ObjectTemplate && e.template_index < doc.templates.size())
-            donors.insert(doc.templates[e.template_index].donor_pc);
-    for (const std::string& path : donors) {
-        ArenaMark mark = arena_mark(scratch);
-        ChunkList chunks{};
-        if (!parse_chunks(path.c_str(), &chunks, scratch, err))
-            return false;
-        for (uint32_t i = 0; i < chunks.count; ++i) {
-            const ChunkRef& ch = chunks.chunks[i];
-            bool copy = is_template_support_chunk(ch.cid);
-            RscfInfo r{};
-            if (rscf_info(ch, &r)) {
-                const bool is_environment = r.type == ASURA_RESOURCEFILE_TYPE_PLATFORMSPECIFIC &&
-                                            r.subtype == ASURA_RESOURCEFILE_TYPE_PC_ENVIRONMENT;
-                copy = !is_environment;
-            }
-            if (copy && !append_chunk_copy(out, ch, err))
-                break;
-        }
-        unmap_file(&chunks.file);
-        arena_reset(scratch, mark);
-        if (err->set)
-            return false;
-    }
-    return true;
 }
 
 bool make_editor_sounds(const Document& doc, Sounds* sounds, Arena* arena, Error* err) {
@@ -790,6 +628,8 @@ bool pack_document(const Document& doc, const char* output_path, std::string* wh
     }
     cfg.material_map = doc.material_map.empty() ? nullptr : doc.material_map.c_str();
     cfg.texture_dir = doc.texture_dir.empty() ? nullptr : doc.texture_dir.c_str();
+    cfg.weapon_from_pc = doc.weapons_donor.empty() ? nullptr : doc.weapons_donor.c_str();
+    cfg.sky_texture_dir = doc.sky_texture_dir.empty() ? nullptr : doc.sky_texture_dir.c_str();
     cfg.allow_unknown_materials = doc.material_map.empty();
 
     Arena arena{}, scratch{};
@@ -826,7 +666,8 @@ bool pack_document(const Document& doc, const char* output_path, std::string* wh
     if (ok) {
         buffer_append(&output, kAsuraMagic, sizeof(kAsuraMagic), &err);
         ok = append_fnfo(&output, &err) && append_rsfl(&output, cfg, &scratch, &err) &&
-             append_template_resources(&output, doc, &scratch, &err) &&
+             append_weapon_support(&output, cfg, &scratch, &err) &&
+             append_sky_resources(&output, cfg, &scratch, &err) &&
              append_textures(&output, cfg, view, material_map, &arena, &scratch, &textures, &err) &&
              append_rscf(&output, str_from_c(cfg.env_name), ASURA_RESOURCEFILE_TYPE_PLATFORMSPECIFIC,
                          ASURA_RESOURCEFILE_TYPE_PC_ENVIRONMENT, env_payload.base,
@@ -836,8 +677,8 @@ bool pack_document(const Document& doc, const char* output_path, std::string* wh
              append_emod(&output, view, view.module_count, cfg, material_map, &scratch, metrics, &err) &&
              append_mlin(&output, metrics, view.module_count, &err) &&
              append_mrvb(&output, view.module_count, &err) && append_nav1(&output, view.module_count, &err) &&
-             append_template_entities(&output, doc, &err) && append_sound_entities(&output, sounds, &err) &&
-             append_editor_spawnpoints(&output, doc, &err) && append_skyb(&output, &err) &&
+             append_sound_entities(&output, sounds, &err) && append_editor_spawnpoints(&output, doc, &err) &&
+             append_skyb(&output, &err) &&
              append_fog(&output, &err) && append_wthr(&output, &err) &&
              buffer_append(&output, nullptr, sizeof(Asura_Chunk_Header), &err) != ~0ull &&
              write_entire_file(output_path, output.base, output.size, &err);
@@ -864,11 +705,12 @@ enum ControlId : int {
     ID_EXPORT_PC,
     ID_MATERIAL_MAP,
     ID_TEXTURE_DIR,
+    ID_WEAPONS_DONOR,
+    ID_SKYBOX_TEXTURES,
     ID_ENTITY_LIST,
     ID_ADD_SPAWN,
     ID_ADD_LIGHT,
     ID_ADD_SOUND,
-    ID_IMPORT_OBJECT,
     ID_DELETE_ENTITY,
     ID_APPLY_INSPECTOR,
     ID_BROWSE_SOUND,
@@ -915,7 +757,6 @@ struct AppState {
     Camera camera;
     int selected = -1;
     int pending_kind = -1;
-    uint32_t pending_template = kNoTemplate;
     bool orbiting = false;
     bool panning = false;
     bool moving_entity = false;
@@ -1188,6 +1029,56 @@ struct GpuVertex {
     DirectX::XMFLOAT4 color;
 };
 
+struct SkyboxVertex {
+    DirectX::XMFLOAT3 position;
+    DirectX::XMFLOAT2 uv;
+};
+
+struct SkyboxAnimationConstants {
+    DirectX::XMFLOAT2 offset_a;
+    DirectX::XMFLOAT2 offset_b;
+};
+
+struct DdsPixelFormat {
+    uint32_t size;
+    uint32_t flags;
+    uint32_t four_cc;
+    uint32_t rgb_bit_count;
+    uint32_t r_mask;
+    uint32_t g_mask;
+    uint32_t b_mask;
+    uint32_t a_mask;
+};
+
+struct DdsHeader {
+    uint32_t size;
+    uint32_t flags;
+    uint32_t height;
+    uint32_t width;
+    uint32_t pitch_or_linear_size;
+    uint32_t depth;
+    uint32_t mip_count;
+    uint32_t reserved[11];
+    DdsPixelFormat pixel_format;
+    uint32_t caps;
+    uint32_t caps2;
+    uint32_t caps3;
+    uint32_t caps4;
+    uint32_t reserved2;
+};
+
+struct DdsHeaderDx10 {
+    uint32_t format;
+    uint32_t resource_dimension;
+    uint32_t misc_flag;
+    uint32_t array_size;
+    uint32_t misc_flags2;
+};
+
+static_assert(sizeof(DdsPixelFormat) == 32);
+static_assert(sizeof(DdsHeader) == 124);
+static_assert(sizeof(DdsHeaderDx10) == 20);
+
 struct GpuRenderer {
     ID3D11Device* device = nullptr;
     ID3D11DeviceContext* context = nullptr;
@@ -1198,7 +1089,14 @@ struct GpuRenderer {
     ID3D11VertexShader* vertex_shader = nullptr;
     ID3D11PixelShader* pixel_shader = nullptr;
     ID3D11InputLayout* input_layout = nullptr;
+    ID3D11VertexShader* skybox_vertex_shader = nullptr;
+    ID3D11PixelShader* skybox_pixel_shader = nullptr;
+    ID3D11PixelShader* skybox_cloud_pixel_shader = nullptr;
+    ID3D11InputLayout* skybox_input_layout = nullptr;
     ID3D11Buffer* camera_buffer = nullptr;
+    ID3D11Buffer* skybox_animation_buffer = nullptr;
+    ID3D11Buffer* skybox_vertices = nullptr;
+    ID3D11Buffer* skybox_cloud_vertices = nullptr;
     ID3D11Buffer* mesh_vertices = nullptr;
     ID3D11Buffer* mesh_indices = nullptr;
     ID3D11Buffer* puppet_vertices = nullptr;
@@ -1206,10 +1104,19 @@ struct GpuRenderer {
     ID3D11RasterizerState* rasterizer = nullptr;
     ID3D11DepthStencilState* depth_enabled = nullptr;
     ID3D11DepthStencilState* depth_disabled = nullptr;
+    ID3D11DepthStencilState* skybox_depth = nullptr;
+    ID3D11BlendState* skybox_cloud_blend = nullptr;
+    ID3D11SamplerState* skybox_sampler = nullptr;
+    ID3D11SamplerState* skybox_cloud_sampler = nullptr;
+    ID3D11ShaderResourceView* skybox_faces[6]{};
+    ID3D11ShaderResourceView* skybox_cloud = nullptr;
+    ID3D11ShaderResourceView* white_texture = nullptr;
     uint32_t mesh_index_count = 0;
+    uint32_t skybox_cloud_vertex_count = 0;
     uint32_t puppet_capacity = 0;
     uint32_t overlay_capacity = 0;
     uint32_t width = 0, height = 0;
+    bool skybox_active = false;
     bool ready = false;
 };
 
@@ -1219,6 +1126,253 @@ template <typename T> void gpu_release(T*& object) {
     if (object)
         object->Release();
     object = nullptr;
+}
+
+void gpu_release_skybox_textures() {
+    for (ID3D11ShaderResourceView*& face : gpu.skybox_faces)
+        gpu_release(face);
+    gpu_release(gpu.skybox_cloud);
+    gpu.skybox_active = false;
+}
+
+bool dds_format_layout(DXGI_FORMAT format, uint32_t* block_bytes, uint32_t* bytes_per_pixel) {
+    *block_bytes = 0;
+    *bytes_per_pixel = 0;
+    switch (format) {
+    case DXGI_FORMAT_BC1_UNORM:
+    case DXGI_FORMAT_BC1_UNORM_SRGB:
+    case DXGI_FORMAT_BC4_UNORM:
+    case DXGI_FORMAT_BC4_SNORM: *block_bytes = 8; return true;
+    case DXGI_FORMAT_BC2_UNORM:
+    case DXGI_FORMAT_BC2_UNORM_SRGB:
+    case DXGI_FORMAT_BC3_UNORM:
+    case DXGI_FORMAT_BC3_UNORM_SRGB:
+    case DXGI_FORMAT_BC5_UNORM:
+    case DXGI_FORMAT_BC5_SNORM: *block_bytes = 16; return true;
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8X8_UNORM:
+    case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB: *bytes_per_pixel = 4; return true;
+    default: return false;
+    }
+}
+
+bool gpu_create_dds_view(const char* path, ID3D11ShaderResourceView** output, std::string* why) {
+    *output = nullptr;
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file) {
+        if (why)
+            *why = std::string("Could not open skybox texture: ") + path;
+        return false;
+    }
+    const std::streamoff end = file.tellg();
+    if (end < static_cast<std::streamoff>(4 + sizeof(DdsHeader)) || end > static_cast<std::streamoff>(512 * MiB)) {
+        if (why)
+            *why = std::string("Skybox texture is not a valid DDS file: ") + path;
+        return false;
+    }
+    std::vector<uint8_t> bytes(static_cast<size_t>(end));
+    file.seekg(0);
+    file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    if (!file || memcmp(bytes.data(), "DDS ", 4) != 0) {
+        if (why)
+            *why = std::string("Skybox texture does not contain DDS data: ") + path;
+        return false;
+    }
+    DdsHeader header{};
+    memcpy(&header, bytes.data() + 4, sizeof(header));
+    if (header.size != sizeof(DdsHeader) || header.pixel_format.size != sizeof(DdsPixelFormat) || !header.width ||
+        !header.height || header.width > 16384 || header.height > 16384) {
+        if (why)
+            *why = std::string("Skybox texture has an unsupported DDS header: ") + path;
+        return false;
+    }
+
+    constexpr uint32_t dds_four_cc = 0x4;
+    constexpr uint32_t dds_rgb = 0x40;
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    size_t data_at = 4 + sizeof(DdsHeader);
+    if ((header.pixel_format.flags & dds_four_cc) && header.pixel_format.four_cc == fourcc('D', 'X', '1', '0')) {
+        if (bytes.size() < data_at + sizeof(DdsHeaderDx10)) {
+            if (why)
+                *why = std::string("Skybox DDS DX10 header is truncated: ") + path;
+            return false;
+        }
+        DdsHeaderDx10 dx10{};
+        memcpy(&dx10, bytes.data() + data_at, sizeof(dx10));
+        data_at += sizeof(dx10);
+        if (dx10.resource_dimension != D3D11_RESOURCE_DIMENSION_TEXTURE2D || dx10.array_size != 1 ||
+            (dx10.misc_flag & D3D11_RESOURCE_MISC_TEXTURECUBE)) {
+            if (why)
+                *why = std::string("Skybox DDS must contain one 2D texture: ") + path;
+            return false;
+        }
+        format = static_cast<DXGI_FORMAT>(dx10.format);
+    } else if (header.pixel_format.flags & dds_four_cc) {
+        const uint32_t code = header.pixel_format.four_cc;
+        if (code == fourcc('D', 'X', 'T', '1'))
+            format = DXGI_FORMAT_BC1_UNORM;
+        else if (code == fourcc('D', 'X', 'T', '2') || code == fourcc('D', 'X', 'T', '3'))
+            format = DXGI_FORMAT_BC2_UNORM;
+        else if (code == fourcc('D', 'X', 'T', '4') || code == fourcc('D', 'X', 'T', '5'))
+            format = DXGI_FORMAT_BC3_UNORM;
+        else if (code == fourcc('A', 'T', 'I', '1') || code == fourcc('B', 'C', '4', 'U'))
+            format = DXGI_FORMAT_BC4_UNORM;
+        else if (code == fourcc('A', 'T', 'I', '2') || code == fourcc('B', 'C', '5', 'U'))
+            format = DXGI_FORMAT_BC5_UNORM;
+    } else if ((header.pixel_format.flags & dds_rgb) && header.pixel_format.rgb_bit_count == 32) {
+        if (header.pixel_format.r_mask == 0x000000ff && header.pixel_format.g_mask == 0x0000ff00 &&
+            header.pixel_format.b_mask == 0x00ff0000)
+            format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        else if (header.pixel_format.r_mask == 0x00ff0000 && header.pixel_format.g_mask == 0x0000ff00 &&
+                 header.pixel_format.b_mask == 0x000000ff)
+            format = header.pixel_format.a_mask == 0xff000000 ? DXGI_FORMAT_B8G8R8A8_UNORM
+                                                               : DXGI_FORMAT_B8G8R8X8_UNORM;
+    }
+
+    uint32_t block_bytes = 0, bytes_per_pixel = 0;
+    if (!dds_format_layout(format, &block_bytes, &bytes_per_pixel)) {
+        if (why)
+            *why = std::string("Skybox DDS pixel format is unsupported: ") + path;
+        return false;
+    }
+    const uint32_t mip_count = std::clamp(header.mip_count ? header.mip_count : 1u, 1u, 15u);
+    std::vector<D3D11_SUBRESOURCE_DATA> initial(mip_count);
+    uint32_t width = header.width, height = header.height;
+    for (uint32_t mip = 0; mip < mip_count; ++mip) {
+        const uint64_t row_pitch = block_bytes ? static_cast<uint64_t>(std::max(1u, (width + 3) / 4)) * block_bytes
+                                               : static_cast<uint64_t>(width) * bytes_per_pixel;
+        const uint64_t rows = block_bytes ? std::max(1u, (height + 3) / 4) : height;
+        const uint64_t size = row_pitch * rows;
+        if (row_pitch > 0xffffffffu || size > bytes.size() - data_at) {
+            if (why)
+                *why = std::string("Skybox DDS mip data is truncated: ") + path;
+            return false;
+        }
+        initial[mip].pSysMem = bytes.data() + data_at;
+        initial[mip].SysMemPitch = static_cast<UINT>(row_pitch);
+        initial[mip].SysMemSlicePitch = static_cast<UINT>(size);
+        data_at += static_cast<size_t>(size);
+        width = std::max(1u, width / 2);
+        height = std::max(1u, height / 2);
+    }
+
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = header.width;
+    desc.Height = header.height;
+    desc.MipLevels = mip_count;
+    desc.ArraySize = 1;
+    desc.Format = format;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_IMMUTABLE;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    ID3D11Texture2D* texture = nullptr;
+    const HRESULT texture_result = gpu.device->CreateTexture2D(&desc, initial.data(), &texture);
+    const HRESULT view_result = SUCCEEDED(texture_result)
+                                    ? gpu.device->CreateShaderResourceView(texture, nullptr, output)
+                                    : texture_result;
+    gpu_release(texture);
+    if (FAILED(view_result)) {
+        if (why)
+            *why = std::string("Direct3D could not create the skybox texture: ") + path;
+        return false;
+    }
+    return true;
+}
+
+bool find_skybox_texture(const std::string& directory, const char* stem, char* output, uint32_t output_size) {
+    char search[MAX_PATH * 4]{};
+    if (!join_path(search, sizeof(search), directory.c_str(), str_from_c("*")))
+        return false;
+    WIN32_FIND_DATAA entry{};
+    HANDLE find = FindFirstFileA(search, &entry);
+    if (find == INVALID_HANDLE_VALUE)
+        return false;
+    char first_matching_file[MAX_PATH * 4]{};
+    bool found = false;
+    do {
+        if (entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            continue;
+        std::string name = entry.cFileName;
+        const size_t dot = name.find_last_of('.');
+        if (dot != std::string::npos)
+            name.resize(dot);
+        if (_stricmp(name.c_str(), stem) != 0)
+            continue;
+        char candidate[MAX_PATH * 4]{};
+        if (!join_path(candidate, sizeof(candidate), directory.c_str(), str_from_c(entry.cFileName)))
+            continue;
+        if (!first_matching_file[0])
+            strncpy_s(first_matching_file, candidate, _TRUNCATE);
+        std::ifstream file(candidate, std::ios::binary);
+        char magic[4]{};
+        file.read(magic, sizeof(magic));
+        if (file.gcount() == sizeof(magic) && memcmp(magic, "DDS ", sizeof(magic)) == 0) {
+            strncpy_s(output, output_size, candidate, _TRUNCATE);
+            found = true;
+            break;
+        }
+    } while (FindNextFileA(find, &entry));
+    FindClose(find);
+    if (!found && first_matching_file[0]) {
+        strncpy_s(output, output_size, first_matching_file, _TRUNCATE);
+        found = true;
+    }
+    return found;
+}
+
+bool gpu_load_skybox(const std::string& directory, std::string* why) {
+    if (g.window)
+        KillTimer(g.window, 2);
+    gpu_release_skybox_textures();
+    if (directory.empty())
+        return true;
+    if (!gpu.ready) {
+        if (why)
+            *why = "The Direct3D viewport is unavailable.";
+        return false;
+    }
+    // SKYB v7 slots: 0 is the empty lower face, 1..5 are the five
+    // static images, and 6..7 are the animated cloud textures.
+    const char* stems[] = {"fr", "lf", "bk", "rt", "up"};
+    ID3D11ShaderResourceView* next[6]{};
+    ID3D11ShaderResourceView* next_cloud = nullptr;
+    uint32_t found = 0;
+    for (uint32_t i = 0; i < _countof(stems); ++i) {
+        char path[MAX_PATH * 4]{};
+        if (!find_skybox_texture(directory, stems[i], path, sizeof(path)))
+            continue;
+        ++found;
+        if (!gpu_create_dds_view(path, &next[i + 1], why)) {
+            for (ID3D11ShaderResourceView*& face : next)
+                gpu_release(face);
+            return false;
+        }
+    }
+    char cloud_path[MAX_PATH * 4]{};
+    if (find_skybox_texture(directory, "ch_04_sky", cloud_path, sizeof(cloud_path))) {
+        ++found;
+        if (!gpu_create_dds_view(cloud_path, &next_cloud, why)) {
+            for (ID3D11ShaderResourceView*& face : next)
+                gpu_release(face);
+            return false;
+        }
+    }
+    if (!found) {
+        if (why)
+            *why = "The selected folder contains none of the expected DDS skybox textures "
+                   "(fr, lf, bk, rt, up, ch_04_sky; filename extensions are ignored).";
+        return false;
+    }
+    for (uint32_t i = 0; i < _countof(next); ++i)
+        gpu.skybox_faces[i] = next[i];
+    gpu.skybox_cloud = next_cloud;
+    gpu.skybox_active = true;
+    if (gpu.skybox_cloud && g.window)
+        SetTimer(g.window, 2, 33, nullptr);
+    return true;
 }
 
 void gpu_release_targets() {
@@ -1233,6 +1387,19 @@ void gpu_shutdown() {
     if (gpu.context)
         gpu.context->ClearState();
     gpu_release_targets();
+    gpu_release_skybox_textures();
+    gpu_release(gpu.white_texture);
+    gpu_release(gpu.skybox_cloud_sampler);
+    gpu_release(gpu.skybox_sampler);
+    gpu_release(gpu.skybox_cloud_blend);
+    gpu_release(gpu.skybox_depth);
+    gpu_release(gpu.skybox_cloud_vertices);
+    gpu_release(gpu.skybox_vertices);
+    gpu_release(gpu.skybox_animation_buffer);
+    gpu_release(gpu.skybox_input_layout);
+    gpu_release(gpu.skybox_cloud_pixel_shader);
+    gpu_release(gpu.skybox_pixel_shader);
+    gpu_release(gpu.skybox_vertex_shader);
     gpu_release(gpu.overlay_vertices);
     gpu_release(gpu.puppet_vertices);
     gpu_release(gpu.mesh_indices);
@@ -1331,6 +1498,35 @@ float4 PSMain(VSOutput input) : SV_TARGET {
                            : float3(0.32, 0.39, 0.43);
     return float4(baseColor * light, 1.0);
 }
+Texture2D skyboxTexture : register(t0);
+Texture2D skyboxCloud : register(t1);
+SamplerState skyboxSampler : register(s0);
+SamplerState skyboxCloudSampler : register(s1);
+cbuffer SkyboxAnimationBuffer : register(b1) {
+    float2 cloudOffsetA;
+    float2 cloudOffsetB;
+};
+struct SkyVSInput { float3 position : POSITION; float2 uv : TEXCOORD; };
+struct SkyVSOutput { float4 position : SV_POSITION; float2 uv : TEXCOORD0; float3 direction : TEXCOORD1; };
+SkyVSOutput SkyVSMain(SkyVSInput input) {
+    SkyVSOutput output;
+    output.position = mul(float4(input.position, 1.0), viewProjection);
+    output.position.z = output.position.w;
+    output.uv = input.uv;
+    output.direction = input.position;
+    return output;
+}
+float4 SkyPSMain(SkyVSOutput input) : SV_TARGET {
+    return float4(skyboxTexture.Sample(skyboxSampler, input.uv).rgb, 1.0);
+}
+float4 SkyCloudPSMain(SkyVSOutput input) : SV_TARGET {
+    float3 cloudA = skyboxCloud.Sample(skyboxCloudSampler, input.uv + cloudOffsetA).rgb;
+    float3 cloudB = skyboxCloud.Sample(skyboxCloudSampler, input.uv * 2.0 + cloudOffsetB).rgb;
+    float3 cloudColour = saturate((cloudA + cloudB) * 0.75 + float3(0.18, 0.19, 0.18));
+    float elevation = normalize(input.direction).y;
+    float horizonFade = smoothstep(-0.05, 0.20, elevation);
+    return float4(cloudColour, horizonFade * 0.72);
+}
 )";
     ID3DBlob *vs_blob = nullptr, *ps_blob = nullptr, *errors = nullptr;
     result = D3DCompile(shader_source, sizeof(shader_source) - 1, nullptr, nullptr, nullptr, "VSMain", "vs_4_0",
@@ -1366,11 +1562,156 @@ float4 PSMain(VSOutput input) : SV_TARGET {
         gpu_shutdown();
         return false;
     }
+    ID3DBlob *sky_vs_blob = nullptr, *sky_ps_blob = nullptr, *sky_cloud_ps_blob = nullptr;
+    result = D3DCompile(shader_source, sizeof(shader_source) - 1, nullptr, nullptr, nullptr, "SkyVSMain", "vs_4_0",
+                        D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &sky_vs_blob, &errors);
+    gpu_release(errors);
+    if (SUCCEEDED(result))
+        result = D3DCompile(shader_source, sizeof(shader_source) - 1, nullptr, nullptr, nullptr, "SkyPSMain", "ps_4_0",
+                            D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &sky_ps_blob, &errors);
+    gpu_release(errors);
+    if (SUCCEEDED(result))
+        result = D3DCompile(shader_source, sizeof(shader_source) - 1, nullptr, nullptr, nullptr, "SkyCloudPSMain",
+                            "ps_4_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &sky_cloud_ps_blob, &errors);
+    gpu_release(errors);
+    if (FAILED(result) ||
+        FAILED(gpu.device->CreateVertexShader(sky_vs_blob->GetBufferPointer(), sky_vs_blob->GetBufferSize(), nullptr,
+                                               &gpu.skybox_vertex_shader)) ||
+        FAILED(gpu.device->CreatePixelShader(sky_ps_blob->GetBufferPointer(), sky_ps_blob->GetBufferSize(), nullptr,
+                                              &gpu.skybox_pixel_shader)) ||
+        FAILED(gpu.device->CreatePixelShader(sky_cloud_ps_blob->GetBufferPointer(),
+                                              sky_cloud_ps_blob->GetBufferSize(), nullptr,
+                                              &gpu.skybox_cloud_pixel_shader))) {
+        gpu_release(sky_vs_blob);
+        gpu_release(sky_ps_blob);
+        gpu_release(sky_cloud_ps_blob);
+        gpu_shutdown();
+        return false;
+    }
+    D3D11_INPUT_ELEMENT_DESC skybox_elements[] = {
+        {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, offsetof(SkyboxVertex, position),
+         D3D11_INPUT_PER_VERTEX_DATA, 0},
+        {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, offsetof(SkyboxVertex, uv), D3D11_INPUT_PER_VERTEX_DATA, 0},
+    };
+    result = gpu.device->CreateInputLayout(skybox_elements, _countof(skybox_elements),
+                                           sky_vs_blob->GetBufferPointer(), sky_vs_blob->GetBufferSize(),
+                                           &gpu.skybox_input_layout);
+    gpu_release(sky_vs_blob);
+    gpu_release(sky_ps_blob);
+    gpu_release(sky_cloud_ps_blob);
+    if (FAILED(result)) {
+        gpu_shutdown();
+        return false;
+    }
+
+    const Asura_Vector_3 target_corners[] = {{-1, 1, -1}, {-1, 1, 1}, {1, 1, 1}, {1, 1, -1},
+                                             {-1, -1, -1}, {-1, -1, 1}, {1, -1, 1}, {1, -1, -1}};
+    const uint32_t target_faces[6][4] = {{1, 0, 3, 2}, {0, 4, 7, 3}, {3, 7, 6, 2},
+                                         {2, 6, 5, 1}, {1, 5, 4, 0}, {4, 5, 6, 7}};
+    // SniperElite.exe sub_49D000 assigns these UVs to the four
+    // vertices of every face. The later PDB build's base-face order is
+    // different and rotates the 2005 PC sky textures in this viewport.
+    const DirectX::XMFLOAT2 uv[] = {{1, 1}, {1, 0}, {0, 0}, {0, 1}};
+    const uint32_t triangles[] = {0, 1, 2, 0, 2, 3};
+    constexpr float skybox_orientation = 3.107175588607788f;
+    const float orientation_sin = sinf(skybox_orientation), orientation_cos = cosf(skybox_orientation);
+    SkyboxVertex skybox_vertices[36]{};
+    for (uint32_t face = 0; face < 6; ++face) {
+        for (uint32_t vertex = 0; vertex < 6; ++vertex) {
+            const uint32_t corner_in_face = triangles[vertex];
+            const Asura_Vector_3 source = target_corners[target_faces[face][corner_in_face]];
+            const Asura_Vector_3 oriented{source.x * orientation_cos + source.z * orientation_sin,
+                                          -source.y,
+                                          source.z * orientation_cos - source.x * orientation_sin};
+            skybox_vertices[face * 6 + vertex] = {{oriented.x, oriented.y, oriented.z}, uv[corner_in_face]};
+        }
+    }
+    D3D11_BUFFER_DESC skybox_vertex_desc{};
+    skybox_vertex_desc.ByteWidth = sizeof(skybox_vertices);
+    skybox_vertex_desc.Usage = D3D11_USAGE_IMMUTABLE;
+    skybox_vertex_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    D3D11_SUBRESOURCE_DATA skybox_vertex_data{skybox_vertices};
+    if (FAILED(gpu.device->CreateBuffer(&skybox_vertex_desc, &skybox_vertex_data, &gpu.skybox_vertices))) {
+        gpu_shutdown();
+        return false;
+    }
+
+    // sub_423210/sub_49D600 build a tessellated sphere and flatten/offset
+    // it to form a cloud ellipsoid around the camera. The target's angular
+    // coordinates have a longitude singularity; use a continuous X/Z
+    // projection in the preview so looking through the zenith cannot turn
+    // the texture into radial wedges. Four repeats approximate the target's
+    // texture density around the upper ellipsoid.
+    constexpr uint32_t cloud_latitudes = 24, cloud_longitudes = 48;
+    constexpr float pi = 3.14159265358979323846f, tau = pi * 2.0f;
+    std::vector<SkyboxVertex> cloud_vertices;
+    cloud_vertices.reserve(cloud_latitudes * cloud_longitudes * 6);
+    const auto cloud_vertex = [](float theta, float phi) {
+        const float radial = sinf(theta);
+        const float source_x = cosf(phi) * radial;
+        const float source_y = cosf(theta);
+        const float source_z = sinf(phi) * radial;
+        return SkyboxVertex{{source_x * 40.0f, (source_y - .75f) * 10.0f, source_z * 40.0f},
+                            {source_x * 4.0f, source_z * 4.0f}};
+    };
+    for (uint32_t latitude = 0; latitude < cloud_latitudes; ++latitude) {
+        const float theta0 = pi * latitude / cloud_latitudes;
+        const float theta1 = pi * (latitude + 1) / cloud_latitudes;
+        for (uint32_t longitude = 0; longitude < cloud_longitudes; ++longitude) {
+            const float phi0 = tau * longitude / cloud_longitudes;
+            const float phi1 = tau * (longitude + 1) / cloud_longitudes;
+            const SkyboxVertex a = cloud_vertex(theta0, phi0), b = cloud_vertex(theta1, phi0);
+            const SkyboxVertex c = cloud_vertex(theta1, phi1), d = cloud_vertex(theta0, phi1);
+            cloud_vertices.insert(cloud_vertices.end(), {a, b, c, a, c, d});
+        }
+    }
+    D3D11_BUFFER_DESC cloud_vertex_desc{};
+    cloud_vertex_desc.ByteWidth = static_cast<UINT>(cloud_vertices.size() * sizeof(SkyboxVertex));
+    cloud_vertex_desc.Usage = D3D11_USAGE_IMMUTABLE;
+    cloud_vertex_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    D3D11_SUBRESOURCE_DATA cloud_vertex_data{cloud_vertices.data()};
+    if (FAILED(gpu.device->CreateBuffer(&cloud_vertex_desc, &cloud_vertex_data, &gpu.skybox_cloud_vertices))) {
+        gpu_shutdown();
+        return false;
+    }
+    gpu.skybox_cloud_vertex_count = static_cast<uint32_t>(cloud_vertices.size());
+
+    const uint32_t white_pixel = 0xffffffffu;
+    D3D11_TEXTURE2D_DESC white_desc{};
+    white_desc.Width = white_desc.Height = white_desc.MipLevels = white_desc.ArraySize = 1;
+    white_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    white_desc.SampleDesc.Count = 1;
+    white_desc.Usage = D3D11_USAGE_IMMUTABLE;
+    white_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    D3D11_SUBRESOURCE_DATA white_data{&white_pixel, sizeof(white_pixel), sizeof(white_pixel)};
+    ID3D11Texture2D* white_texture = nullptr;
+    result = gpu.device->CreateTexture2D(&white_desc, &white_data, &white_texture);
+    if (SUCCEEDED(result))
+        result = gpu.device->CreateShaderResourceView(white_texture, nullptr, &gpu.white_texture);
+    gpu_release(white_texture);
+    D3D11_SAMPLER_DESC sampler_desc{};
+    sampler_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    sampler_desc.AddressU = sampler_desc.AddressV = sampler_desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sampler_desc.MaxLOD = D3D11_FLOAT32_MAX;
+    if (FAILED(result) || FAILED(gpu.device->CreateSamplerState(&sampler_desc, &gpu.skybox_sampler))) {
+        gpu_shutdown();
+        return false;
+    }
+    sampler_desc.AddressU = sampler_desc.AddressV = sampler_desc.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
+    if (FAILED(gpu.device->CreateSamplerState(&sampler_desc, &gpu.skybox_cloud_sampler))) {
+        gpu_shutdown();
+        return false;
+    }
     D3D11_BUFFER_DESC constant_desc{};
     constant_desc.ByteWidth = sizeof(DirectX::XMFLOAT4X4);
     constant_desc.Usage = D3D11_USAGE_DEFAULT;
     constant_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     if (FAILED(gpu.device->CreateBuffer(&constant_desc, nullptr, &gpu.camera_buffer))) {
+        gpu_shutdown();
+        return false;
+    }
+    constant_desc.ByteWidth = sizeof(SkyboxAnimationConstants);
+    if (FAILED(gpu.device->CreateBuffer(&constant_desc, nullptr, &gpu.skybox_animation_buffer))) {
         gpu_shutdown();
         return false;
     }
@@ -1388,6 +1729,24 @@ float4 PSMain(VSOutput input) : SV_TARGET {
     depth_desc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
     depth_desc.DepthFunc = D3D11_COMPARISON_LESS_EQUAL;
     if (FAILED(gpu.device->CreateDepthStencilState(&depth_desc, &gpu.depth_enabled))) {
+        gpu_shutdown();
+        return false;
+    }
+    depth_desc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+    if (FAILED(gpu.device->CreateDepthStencilState(&depth_desc, &gpu.skybox_depth))) {
+        gpu_shutdown();
+        return false;
+    }
+    D3D11_BLEND_DESC cloud_blend_desc{};
+    cloud_blend_desc.RenderTarget[0].BlendEnable = TRUE;
+    cloud_blend_desc.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
+    cloud_blend_desc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+    cloud_blend_desc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+    cloud_blend_desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+    cloud_blend_desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+    cloud_blend_desc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    cloud_blend_desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    if (FAILED(gpu.device->CreateBlendState(&cloud_blend_desc, &gpu.skybox_cloud_blend))) {
         gpu_shutdown();
         return false;
     }
@@ -1487,6 +1846,45 @@ bool gpu_update_overlay(const std::vector<GpuVertex>& vertices) {
     return gpu_update_dynamic_vertices(&gpu.overlay_vertices, &gpu.overlay_capacity, vertices);
 }
 
+void gpu_render_skybox(const DirectX::XMFLOAT4X4& view_projection) {
+    if (!gpu.skybox_active || !gpu.skybox_vertices || !gpu.skybox_sampler || !gpu.white_texture)
+        return;
+    gpu.context->UpdateSubresource(gpu.camera_buffer, 0, nullptr, &view_projection, 0, 0);
+    gpu.context->VSSetConstantBuffers(0, 1, &gpu.camera_buffer);
+    gpu.context->IASetInputLayout(gpu.skybox_input_layout);
+    gpu.context->VSSetShader(gpu.skybox_vertex_shader, nullptr, 0);
+    gpu.context->PSSetShader(gpu.skybox_pixel_shader, nullptr, 0);
+    gpu.context->PSSetSamplers(0, 1, &gpu.skybox_sampler);
+    gpu.context->OMSetDepthStencilState(gpu.skybox_depth, 0);
+    const UINT stride = sizeof(SkyboxVertex), offset = 0;
+    gpu.context->IASetVertexBuffers(0, 1, &gpu.skybox_vertices, &stride, &offset);
+    gpu.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    const float animation_time = static_cast<float>(fmod(GetTickCount64() * .001, 8192.0));
+    const SkyboxAnimationConstants animation{{animation_time / 128.0f, -animation_time / 64.0f},
+                                              {animation_time / 64.0f, animation_time / 128.0f}};
+    gpu.context->UpdateSubresource(gpu.skybox_animation_buffer, 0, nullptr, &animation, 0, 0);
+    gpu.context->PSSetConstantBuffers(1, 1, &gpu.skybox_animation_buffer);
+    for (uint32_t face = 0; face < 6; ++face) {
+        ID3D11ShaderResourceView* texture = gpu.skybox_faces[face] ? gpu.skybox_faces[face] : gpu.white_texture;
+        gpu.context->PSSetShader(gpu.skybox_pixel_shader, nullptr, 0);
+        gpu.context->PSSetShaderResources(0, 1, &texture);
+        gpu.context->PSSetSamplers(0, 1, &gpu.skybox_sampler);
+        gpu.context->Draw(6, face * 6);
+    }
+    if (gpu.skybox_cloud && gpu.skybox_cloud_pixel_shader && gpu.skybox_cloud_sampler &&
+        gpu.skybox_cloud_vertices && gpu.skybox_cloud_vertex_count) {
+        gpu.context->PSSetShader(gpu.skybox_cloud_pixel_shader, nullptr, 0);
+        gpu.context->PSSetShaderResources(1, 1, &gpu.skybox_cloud);
+        gpu.context->PSSetSamplers(1, 1, &gpu.skybox_cloud_sampler);
+        gpu.context->OMSetBlendState(gpu.skybox_cloud_blend, nullptr, 0xffffffffu);
+        gpu.context->IASetVertexBuffers(0, 1, &gpu.skybox_cloud_vertices, &stride, &offset);
+        gpu.context->Draw(gpu.skybox_cloud_vertex_count, 0);
+        gpu.context->OMSetBlendState(nullptr, nullptr, 0xffffffffu);
+    }
+    ID3D11ShaderResourceView* none[] = {nullptr, nullptr};
+    gpu.context->PSSetShaderResources(0, _countof(none), none);
+}
+
 void append_gpu_spawn_puppet(const Entity& entity, bool selected, std::vector<GpuVertex>* output) {
     const SpawnPuppet* puppet = spawn_puppet_for_team(entity.value_u32_a);
     if (!puppet)
@@ -1521,9 +1919,6 @@ void gpu_render() {
     D3D11_VIEWPORT viewport{0, 0, static_cast<float>(width), static_cast<float>(height), 0, 1};
     gpu.context->RSSetViewports(1, &viewport);
     gpu.context->RSSetState(gpu.rasterizer);
-    gpu.context->IASetInputLayout(gpu.input_layout);
-    gpu.context->VSSetShader(gpu.vertex_shader, nullptr, 0);
-    gpu.context->PSSetShader(gpu.pixel_shader, nullptr, 0);
     Asura_Vector_3 camera_position, right, up, forward;
     camera_axes(&camera_position, &right, &up, &forward);
     using namespace DirectX;
@@ -1544,11 +1939,19 @@ void gpu_render() {
             far_plane = fmaxf(far_plane, sqrtf(dot(offset, offset)) + range + 1.0f);
         }
     }
+    const XMMATRIX projection = XMMatrixPerspectiveFovLH(fov_y, static_cast<float>(width) / height, near_plane,
+                                                          far_plane);
+    XMFLOAT4X4 skybox_view_projection{};
+    const XMVECTOR view_direction = XMVector3Normalize(XMVectorSubtract(target, eye));
+    XMStoreFloat4x4(&skybox_view_projection,
+                    XMMatrixTranspose(XMMatrixLookToLH(XMVectorZero(), view_direction, world_up) * projection));
+    gpu_render_skybox(skybox_view_projection);
+
     XMFLOAT4X4 view_projection{};
-    XMStoreFloat4x4(&view_projection, XMMatrixTranspose(XMMatrixLookAtLH(eye, target, world_up) *
-                                                        XMMatrixPerspectiveFovLH(fov_y,
-                                                                                 static_cast<float>(width) / height,
-                                                                                 near_plane, far_plane)));
+    XMStoreFloat4x4(&view_projection, XMMatrixTranspose(XMMatrixLookAtLH(eye, target, world_up) * projection));
+    gpu.context->IASetInputLayout(gpu.input_layout);
+    gpu.context->VSSetShader(gpu.vertex_shader, nullptr, 0);
+    gpu.context->PSSetShader(gpu.pixel_shader, nullptr, 0);
     gpu.context->UpdateSubresource(gpu.camera_buffer, 0, nullptr, &view_projection, 0, 0);
     gpu.context->VSSetConstantBuffers(0, 1, &gpu.camera_buffer);
     const UINT stride = sizeof(GpuVertex), offset = 0;
@@ -2191,8 +2594,6 @@ void refresh_list() {
             prefix = "Light";
         else if (e.kind == EntityKind::Sound)
             prefix = "Sound";
-        else if (e.kind == EntityKind::ObjectTemplate)
-            prefix = "Object";
         std::string line = std::string(prefix) + "  " + e.name;
         SendMessageA(g.list, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(line.c_str()));
     }
@@ -2260,14 +2661,6 @@ void refresh_inspector() {
         SendMessageA(g.sound_loop, BM_SETCHECK, e.sound_loop ? BST_CHECKED : BST_UNCHECKED, 0);
         ShowWindow(g.sound_loop, SW_SHOW);
         ShowWindow(g.sound_browse, SW_SHOW);
-    } else {
-        set_control_text(g.value_label[0], "Class");
-        set_control_text(g.value_label[1], "Source GUID");
-        const EntityTemplate& t = g.document.templates[e.template_index];
-        set_float(g.value[0], static_cast<float>(t.classification));
-        set_float(g.value[1], static_cast<float>(t.source_guid));
-        EnableWindow(g.value[0], false);
-        EnableWindow(g.value[1], false);
     }
 }
 
@@ -2352,12 +2745,11 @@ bool open_obj_path(const std::string& path) {
     return true;
 }
 
-void add_entity_at(EntityKind kind, const Asura_Vector_3& p, uint32_t template_index = kNoTemplate) {
+void add_entity_at(EntityKind kind, const Asura_Vector_3& p) {
     Entity e;
     e.kind = kind;
     e.position = p;
     e.guid = g.document.next_guid++;
-    e.template_index = template_index;
     char name[160];
     if (kind == EntityKind::SpawnPoint) {
         snprintf(name, sizeof(name), "Spawn %zu", g.document.entities.size() + 1);
@@ -2373,14 +2765,10 @@ void add_entity_at(EntityKind kind, const Asura_Vector_3& p, uint32_t template_i
         snprintf(name, sizeof(name), "Sound %zu", g.document.entities.size() + 1);
         e.value_a = 50;
         e.value_b = 250;
-    } else {
-        const EntityTemplate& t = g.document.templates[template_index];
-        snprintf(name, sizeof(name), "%s", t.name.c_str());
     }
     e.name = name;
     g.document.entities.push_back(std::move(e));
     g.pending_kind = -1;
-    g.pending_template = kNoTemplate;
     g.selected = static_cast<int>(g.document.entities.size()) - 1;
     mark_dirty();
     refresh_list();
@@ -2389,13 +2777,12 @@ void add_entity_at(EntityKind kind, const Asura_Vector_3& p, uint32_t template_i
     request_redraw();
 }
 
-void begin_place(EntityKind kind, uint32_t template_index = kNoTemplate) {
+void begin_place(EntityKind kind) {
     if (g.document.obj_path.empty()) {
         MessageBoxA(g.window, "Open an environment OBJ first.", "Level Editor", MB_ICONINFORMATION);
         return;
     }
     g.pending_kind = static_cast<int>(kind);
-    g.pending_template = template_index;
     set_status("Click the viewport to place the entity on the Y=0 ground plane. Right-drag orbits; wheel zooms.");
 }
 
@@ -2819,9 +3206,10 @@ void layout_controls() {
     }
     const int right = r.right - 262;
     const int top_y = 7;
-    const struct { int id, x, w; } top[] = {{ID_OPEN_OBJ, 8, 84},       {ID_OPEN_PROJECT, 96, 84},
-                                            {ID_SAVE_PROJECT, 184, 84}, {ID_EXPORT_PC, 272, 90},
-                                            {ID_MATERIAL_MAP, 366, 104}, {ID_TEXTURE_DIR, 474, 100}};
+    const struct { int id, x, w; } top[] = {{ID_OPEN_OBJ, 8, 84},         {ID_OPEN_PROJECT, 96, 84},
+                                            {ID_SAVE_PROJECT, 184, 84},   {ID_EXPORT_PC, 272, 90},
+                                            {ID_MATERIAL_MAP, 366, 104},  {ID_TEXTURE_DIR, 474, 100},
+                                            {ID_WEAPONS_DONOR, 578, 112}, {ID_SKYBOX_TEXTURES, 694, 116}};
     for (auto c : top)
         MoveWindow(GetDlgItem(g.window, c.id), c.x, top_y, c.w, 28, TRUE);
     MoveWindow(g.list, 8, 48, 220, std::max(80, static_cast<int>(r.bottom) - 270), TRUE);
@@ -2830,8 +3218,7 @@ void layout_controls() {
     MoveWindow(GetDlgItem(g.window, ID_ADD_SPAWN), 8, y, bw, 27, TRUE);
     MoveWindow(GetDlgItem(g.window, ID_ADD_LIGHT), 120, y, bw, 27, TRUE);
     y += 31;
-    MoveWindow(GetDlgItem(g.window, ID_ADD_SOUND), 8, y, bw, 27, TRUE);
-    MoveWindow(GetDlgItem(g.window, ID_IMPORT_OBJECT), 120, y, bw, 27, TRUE);
+    MoveWindow(GetDlgItem(g.window, ID_ADD_SOUND), 8, y, 218, 27, TRUE);
     y += 31;
     MoveWindow(GetDlgItem(g.window, ID_DELETE_ENTITY), 8, y, 218, 27, TRUE);
     y += 38;
@@ -2883,11 +3270,12 @@ void create_controls() {
     make_control("BUTTON", "Export .PC", BS_DEFPUSHBUTTON, ID_EXPORT_PC);
     make_control("BUTTON", "Material map", BS_PUSHBUTTON, ID_MATERIAL_MAP);
     make_control("BUTTON", "Texture folder", BS_PUSHBUTTON, ID_TEXTURE_DIR);
+    make_control("BUTTON", "Weapons donor", BS_PUSHBUTTON, ID_WEAPONS_DONOR);
+    make_control("BUTTON", "Skybox textures", BS_PUSHBUTTON, ID_SKYBOX_TEXTURES);
     g.list = make_control("LISTBOX", "", LBS_NOTIFY | WS_VSCROLL | WS_BORDER, ID_ENTITY_LIST);
     make_control("BUTTON", "+ Spawn", BS_PUSHBUTTON, ID_ADD_SPAWN);
     make_control("BUTTON", "+ Light", BS_PUSHBUTTON, ID_ADD_LIGHT);
     make_control("BUTTON", "+ Sound", BS_PUSHBUTTON, ID_ADD_SOUND);
-    make_control("BUTTON", "Import object", BS_PUSHBUTTON, ID_IMPORT_OBJECT);
     make_control("BUTTON", "Delete selected", BS_PUSHBUTTON, ID_DELETE_ENTITY);
     make_control("STATIC", "Right-drag: orbit\r\nMiddle-drag: pan\r\nWheel: zoom", SS_LEFT, 900);
     make_control("STATIC", "Name", SS_LEFT, 910);
@@ -2947,6 +3335,15 @@ void command_save_project() {
     set_status("Project saved.");
 }
 
+bool reload_skybox_preview(bool show_warning) {
+    std::string why;
+    const bool loaded = gpu_load_skybox(g.document.sky_texture_dir, &why);
+    if (!loaded && show_warning && !g.document.sky_texture_dir.empty())
+        MessageBoxA(g.window, why.c_str(), "Skybox preview unavailable", MB_ICONWARNING);
+    request_redraw();
+    return loaded;
+}
+
 void command_open_project() {
     if (!confirm_discard())
         return;
@@ -2966,12 +3363,16 @@ void command_open_project() {
         g.mesh = std::move(mesh);
     }
     g.document = std::move(doc);
+    const bool skybox_loaded = reload_skybox_preview(true);
     g.selected = g.document.entities.empty() ? -1 : 0;
     frame_mesh();
     refresh_list();
     refresh_inspector();
     update_title();
-    set_status("Project loaded.");
+    if (!skybox_loaded)
+        set_status("Project loaded; skybox preview is unavailable.");
+    else
+        set_status(g.document.dirty ? "Project loaded; unsupported legacy entities were removed." : "Project loaded.");
     request_redraw();
 }
 
@@ -3002,41 +3403,6 @@ void command_export() {
     mark_dirty();
     set_status("Export complete: the .PC contains the environment and editor-authored entities.");
     MessageBoxA(g.window, path.c_str(), "Exported .PC", MB_ICONINFORMATION);
-}
-
-void command_import_object() {
-    std::string donor;
-    if (!choose_path(g.window, false, "Choose a target-game donor .PC", "Asura PC files\0*.PC\0All files\0*.*\0", "PC",
-                     &donor))
-        return;
-    std::vector<ImportCandidate> candidates;
-    std::string why;
-    if (!scan_import_candidates(donor.c_str(), &candidates, &why)) {
-        MessageBoxA(g.window, why.c_str(), "No importable physical entity", MB_ICONERROR);
-        return;
-    }
-    HMENU popup = CreatePopupMenu();
-    for (size_t i = 0; i < candidates.size() && i < 200; ++i) {
-        char label[160];
-        snprintf(label, sizeof(label), "Class 0x%04X   GUID %u   ENTI chunk %u", candidates[i].classification,
-                 candidates[i].guid, candidates[i].chunk_index);
-        AppendMenuA(popup, MF_STRING, static_cast<UINT_PTR>(i + 1), label);
-    }
-    POINT cursor{};
-    GetCursorPos(&cursor);
-    const UINT choice = TrackPopupMenu(popup, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN, cursor.x, cursor.y, 0,
-                                       g.window, nullptr);
-    DestroyMenu(popup);
-    if (!choice)
-        return;
-    EntityTemplate t;
-    if (!import_template(donor.c_str(), candidates[choice - 1], &t, &why)) {
-        MessageBoxA(g.window, why.c_str(), "Could not import entity template", MB_ICONERROR);
-        return;
-    }
-    g.document.templates.push_back(std::move(t));
-    mark_dirty();
-    begin_place(EntityKind::ObjectTemplate, static_cast<uint32_t>(g.document.templates.size() - 1));
 }
 
 void command_browse_sound() {
@@ -3073,6 +3439,28 @@ void command_texture_dir() {
     g.document.texture_dir = path;
     mark_dirty();
     set_status(g.document.texture_dir.c_str());
+}
+
+void command_weapons_donor() {
+    std::string path = g.document.weapons_donor;
+    if (!choose_path(g.window, false, "Choose a target-game weapons donor .PC",
+                     "Asura PC files\0*.PC\0All files\0*.*\0", "PC", &path))
+        return;
+    g.document.weapons_donor = path;
+    mark_dirty();
+    set_status(g.document.weapons_donor.c_str());
+}
+
+void command_skybox_textures() {
+    std::string path = g.document.sky_texture_dir;
+    if (!choose_directory(g.window, "Choose skybox texture folder", &path))
+        return;
+    g.document.sky_texture_dir = path;
+    mark_dirty();
+    if (reload_skybox_preview(true))
+        set_status("Skybox DDS textures loaded into the viewport.");
+    else
+        set_status("Skybox texture folder saved; preview is unavailable.");
 }
 
 void delete_selected() {
@@ -3158,6 +3546,8 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             g.fast_preview = false;
             invalidate_environment_cache();
             request_redraw();
+        } else if (wparam == 2 && gpu.skybox_cloud) {
+            request_redraw();
         }
         return 0;
     case WM_ERASEBKGND:
@@ -3179,14 +3569,16 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             command_material_map();
         else if (id == ID_TEXTURE_DIR)
             command_texture_dir();
+        else if (id == ID_WEAPONS_DONOR)
+            command_weapons_donor();
+        else if (id == ID_SKYBOX_TEXTURES)
+            command_skybox_textures();
         else if (id == ID_ADD_SPAWN)
             begin_place(EntityKind::SpawnPoint);
         else if (id == ID_ADD_LIGHT)
             begin_place(EntityKind::Light);
         else if (id == ID_ADD_SOUND)
             begin_place(EntityKind::Sound);
-        else if (id == ID_IMPORT_OBJECT)
-            command_import_object();
         else if (id == ID_DELETE_ENTITY)
             delete_selected();
         else if (id == ID_APPLY_INSPECTOR)
@@ -3207,7 +3599,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
         SetFocus(hwnd);
         Asura_Vector_3 world{};
         if (g.pending_kind >= 0 && ground_point_from_screen(p.x, p.y, &world)) {
-            add_entity_at(static_cast<EntityKind>(g.pending_kind), world, g.pending_template);
+            add_entity_at(static_cast<EntityKind>(g.pending_kind), world);
             return 0;
         }
         const int hit = hit_entity(p.x, p.y);
@@ -3310,12 +3702,14 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             Document doc;
             if (load_project(&doc, p.c_str(), &why)) {
                 g.document = std::move(doc);
+                const bool skybox_loaded = reload_skybox_preview(true);
                 if (!g.document.obj_path.empty())
                     load_preview_mesh(g.document.obj_path, &g.mesh, &why);
                 frame_mesh();
                 refresh_list();
                 refresh_inspector();
                 update_title();
+                set_status(skybox_loaded ? "Project loaded." : "Project loaded; skybox preview is unavailable.");
                 request_redraw();
             } else
                 MessageBoxA(hwnd, why.c_str(), "Could not open project", MB_ICONERROR);
@@ -3328,6 +3722,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
         return 0;
     case WM_DESTROY:
         KillTimer(hwnd, 1);
+        KillTimer(hwnd, 2);
         release_environment_cache();
         if (g.font)
             DeleteObject(g.font);
@@ -3349,7 +3744,7 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
                    ? 0
                    : 5;
     }
-    const bool gpu_smoke = __argc == 3 && strcmp(__argv[1], "--gpu-smoke") == 0;
+    const bool gpu_smoke = (__argc == 3 || __argc == 4) && strcmp(__argv[1], "--gpu-smoke") == 0;
     if (__argc == 4 && strcmp(__argv[1], "--pack") == 0) {
         Document doc;
         std::string why;
@@ -3415,6 +3810,8 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
         return 1;
     if (gpu_smoke) {
         const bool loaded = open_obj_path(__argv[2]);
+        std::string skybox_why;
+        const bool skybox_loaded = __argc == 3 || gpu_load_skybox(__argv[3], &skybox_why);
         if (loaded) {
             Entity light;
             light.kind = EntityKind::Light;
@@ -3454,9 +3851,15 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
             g.selected = 1;
             gpu_render();
         }
-        const bool rendered = loaded && gpu.ready && gpu.mesh_vertices && gpu.mesh_indices && gpu.mesh_index_count &&
-                              gpu.puppet_vertices && gpu.puppet_capacity && gpu.overlay_vertices &&
-                              gpu.overlay_capacity;
+        bool all_skybox_faces = true;
+        if (__argc == 4) {
+            all_skybox_faces = gpu.skybox_faces[0] == nullptr && gpu.skybox_cloud != nullptr;
+            for (uint32_t face = 1; face < 6; ++face)
+                all_skybox_faces &= gpu.skybox_faces[face] != nullptr;
+        }
+        const bool rendered = loaded && skybox_loaded && all_skybox_faces && gpu.ready && gpu.mesh_vertices &&
+                              gpu.mesh_indices && gpu.mesh_index_count && gpu.puppet_vertices && gpu.puppet_capacity &&
+                              gpu.overlay_vertices && gpu.overlay_capacity;
         DestroyWindow(window);
         return rendered ? 0 : 3;
     }
@@ -3475,12 +3878,14 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
             Document doc;
             if (load_project(&doc, path.c_str(), &why)) {
                 g.document = std::move(doc);
+                const bool skybox_loaded = reload_skybox_preview(true);
                 if (!g.document.obj_path.empty())
                     load_preview_mesh(g.document.obj_path, &g.mesh, &why);
                 frame_mesh();
                 refresh_list();
                 refresh_inspector();
                 update_title();
+                set_status(skybox_loaded ? "Project loaded." : "Project loaded; skybox preview is unavailable.");
             }
         }
     }
