@@ -306,6 +306,39 @@ enum SNIPE_ENTITY_CLASSIFICATION_2005 : uint16_t {
     SnipeEntityClass_PositionMarker = 0x8052
 };
 
+// Item ID stored by Snipe_ServerEntity_PickupObject. These are gameplay item
+// classifications, separate from the inherited physical object's resource IDs.
+enum SNIPE_ITEM_ID_2005 : uint8_t {
+    SnipeItem_PistolAmmo = 0x01,
+    SnipeItem_RifleAmmo = 0x02,
+    SnipeItem_PPSHAmmo = 0x03,
+    SnipeItem_MP40Ammo = 0x04,
+    SnipeItem_MG42Ammo = 0x05,
+    SnipeItem_DP28Ammo = 0x06,
+    SnipeItem_Panzerfaust = 0x08,
+    SnipeItem_StickGrenade = 0x09,
+    SnipeItem_FragGrenade = 0x0A,
+    SnipeItem_SmokeGrenade = 0x0B,
+    SnipeItem_Knife = 0x0C,
+    SnipeItem_MedKit = 0x0D,
+    SnipeItem_Bandage = 0x0E,
+    SnipeItem_TnT = 0x0F,
+    SnipeItem_Binoculars = 0x11,
+    SnipeItem_Gewehr43 = 0x13,
+    SnipeItem_Mosin91 = 0x14,
+    SnipeItem_SVT40 = 0x15,
+    SnipeItem_Luger = 0x16,
+    SnipeItem_P38 = 0x17,
+    SnipeItem_PPSH = 0x18,
+    SnipeItem_MP40 = 0x19,
+    SnipeItem_MG42 = 0x1A,
+    SnipeItem_DP28 = 0x1B,
+    SnipeItem_TimeBomb = 0x1C,
+    SnipeItem_Panzerschreck = 0x1D,
+    SnipeItem_TripWire = 0x1E,
+    SnipeItem_PanzerschreckAmmo = 0x26
+};
+
 // PC wire masks at Asura_Light::m_uFlags.  The PDB exposes these as bitfields,
 // but reproducing the Xbox bitfield declaration in a little-endian PC compiler
 // reverses their masks.  The 2005 target directly confirms 0x01 (corona), 0x20
