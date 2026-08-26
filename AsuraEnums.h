@@ -306,6 +306,28 @@ enum SNIPE_ENTITY_CLASSIFICATION_2005 : uint16_t {
     SnipeEntityClass_PositionMarker = 0x8052
 };
 
+// Bit masks serialized by Snipe_ServerEntity_SpawnPoint v0.  The target's
+// SupportsTeam switch maps actor teams to these four bits.  The first three
+// names also match the retail spawn records and editor character resources.
+// The public semantic name of actor-team zero is unresolved, so that remaining
+// mask is named for the exact switch input rather than guessed.
+enum SNIPE_SPAWN_TEAM_MASK_2005 : uint32_t {
+    SnipeSpawnTeam_Deathmatch = 0x01,
+    SnipeSpawnTeam_German = 0x02,
+    SnipeSpawnTeam_Russian = 0x04,
+    SnipeSpawnTeam_Camera = 0x08
+};
+
+// SupportsGameModeMask performs a raw bitwise intersection.
+enum SNIPE_SPAWN_GAME_MODE_MASK_2005 : uint32_t {
+    SnipeSpawnGameMode_SinglePlayer = 0x01,
+    SnipeSpawnGameMode_LocalCooperative = 0x02,
+    SnipeSpawnGameMode_Deathmatch = 0x08,
+    SnipeSpawnGameMode_TeamDeathmatch = 0x10,
+    SnipeSpawnGameMode_Manhunt = 0x20,
+    SnipeSpawnGameMode_Assassination = 0x40
+};
+
 // Item ID stored by Snipe_ServerEntity_PickupObject. These are gameplay item
 // classifications, separate from the inherited physical object's resource IDs.
 enum SNIPE_ITEM_ID_2005 : uint8_t {
@@ -323,19 +345,15 @@ enum SNIPE_ITEM_ID_2005 : uint8_t {
     SnipeItem_MedKit = 0x0D,
     SnipeItem_Bandage = 0x0E,
     SnipeItem_TnT = 0x0F,
-    SnipeItem_Binoculars = 0x11,
     SnipeItem_Gewehr43 = 0x13,
     SnipeItem_Mosin91 = 0x14,
     SnipeItem_SVT40 = 0x15,
-    SnipeItem_Luger = 0x16,
-    SnipeItem_P38 = 0x17,
     SnipeItem_PPSH = 0x18,
     SnipeItem_MP40 = 0x19,
     SnipeItem_MG42 = 0x1A,
     SnipeItem_DP28 = 0x1B,
     SnipeItem_TimeBomb = 0x1C,
     SnipeItem_Panzerschreck = 0x1D,
-    SnipeItem_TripWire = 0x1E,
     SnipeItem_PanzerschreckAmmo = 0x26
 };
 
@@ -351,4 +369,19 @@ enum ASURA_LIGHT_FLAGS_PC_2005 : uint32_t {
     ASURA_LIGHT_FLAG_IS_VOLUMETRIC = 0x10,
     ASURA_LIGHT_FLAG_USE_BOUNDING_BOX = 0x20,
     ASURA_LIGHT_FLAG_IS_SHADOW_VOLUME = 0x40
+};
+
+// PHON v9 wire masks confirmed by the 2005 loader and phonon update path.
+// Flags 0x02 and 0x80 are serialized and used by the target, but their public
+// source names are not recoverable with enough confidence; callers must retain
+// them when editing a record.
+enum ASURA_PHONON_FLAGS_PC_V9 : uint32_t {
+    ASURA_PHONON_FLAG_REPEAT = 0x01,
+    ASURA_PHONON_FLAG_UNKNOWN_02 = 0x02,
+    ASURA_PHONON_FLAG_USE_CUBOID_FALLOFF = 0x04,
+    ASURA_PHONON_FLAG_USE_OCCLUSION = 0x08,
+    ASURA_PHONON_FLAG_STARTS_ACTIVE = 0x10,
+    ASURA_PHONON_FLAG_USE_RETRIGGER_BOUNDING_BOX = 0x20,
+    ASURA_PHONON_FLAG_USE_ORIENTATION = 0x40,
+    ASURA_PHONON_FLAG_V9_UNKNOWN_80 = 0x80
 };

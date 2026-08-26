@@ -1,57 +1,14 @@
-#include "asura_base.hpp"
-#include "AsuraStructs.h"
+#include "AsuraLevelCore.h"
 
 using namespace asura;
 
-namespace {
+namespace asura::level {
 
-constexpr uint8_t kAsuraMagic[8] = {'A', 's', 'u', 'r', 'a', ' ', ' ', ' '};
-constexpr uint32_t kMaxAabbTreeObjects = 65535;
-constexpr uint32_t kToolCreatedGuidFirst = 0x186a0;
-constexpr uint32_t kToolCreatedGuidLast = 0x30d3f;
-constexpr uint32_t kSoundControllerGuidBase = 0x18c40;
 // sub_4836C0 shares one 0x4000-byte buffer between AABB
 // traversal frames (28 bytes each) and returned object IDs (4 bytes each).
 // Keep a complete module query comfortably below that workspace limit.
 constexpr uint32_t kDefaultMaxCollisionPolys = 3000;
 constexpr uint16_t kCollisionPolyFlagBulletIgnore = 0x240;
-
-constexpr uint32_t fourcc(char a, char b, char c, char d) {
-    return static_cast<uint32_t>(static_cast<uint8_t>(a)) | (static_cast<uint32_t>(static_cast<uint8_t>(b)) << 8) |
-           (static_cast<uint32_t>(static_cast<uint8_t>(c)) << 16) |
-           (static_cast<uint32_t>(static_cast<uint8_t>(d)) << 24);
-}
-
-inline uint32_t read_u32(const void* p) {
-    uint32_t v;
-    memcpy(&v, p, sizeof(v));
-    return v;
-}
-inline uint16_t read_u16(const void* p) {
-    uint16_t v;
-    memcpy(&v, p, sizeof(v));
-    return v;
-}
-inline float read_f32(const void* p) {
-    float v;
-    memcpy(&v, p, sizeof(v));
-    return v;
-}
-
-struct ChunkRef {
-    const uint8_t* data;
-    uint32_t size;
-    uint32_t cid;
-    uint32_t version;
-    uint32_t flags;
-    uint32_t index;
-};
-
-struct ChunkList {
-    MappedFile file;
-    ChunkRef* chunks;
-    uint32_t count;
-};
 
 bool parse_chunks(const char* path, ChunkList* out, Arena* arena, Error* err) {
     memset(out, 0, sizeof(*out));
@@ -98,14 +55,6 @@ Str padded_string_at(const uint8_t* data, uint32_t size, uint32_t at) {
     return {reinterpret_cast<const char*>(data + at), end - at};
 }
 
-struct RscfInfo {
-    uint32_t type;
-    uint32_t subtype;
-    uint32_t payload_size;
-    Str name;
-    const uint8_t* payload;
-};
-
 bool rscf_info(const ChunkRef& ch, RscfInfo* out) {
     if (ch.cid != ASURA_CHUNK_RESOURCEFILE || ch.size < 32)
         return false;
@@ -121,10 +70,6 @@ bool rscf_info(const ChunkRef& ch, RscfInfo* out) {
     *out = {read_u32(p), read_u32(p + 4), payload_size, name, p + payload_at};
     return true;
 }
-
-struct ChunkMark {
-    uint64_t start;
-};
 
 ChunkMark begin_chunk(Buffer* out, ASURA_CHUNKID cid, uint32_t version, uint32_t flags, Error* err) {
     ChunkMark mark{out->size};
@@ -168,58 +113,6 @@ bool append_rscf_zero(Buffer* out, Str name, uint32_t type, uint32_t subtype, ui
         return false;
     return end_chunk(out, mark, err);
 }
-
-struct Config {
-    const char* obj;
-    const char* out;
-    const char* env_name;
-    const char* axis_map;
-    bool flip_x, flip_y, flip_z;
-    bool allow_unknown_materials;
-    uint32_t diffuse_abgr;
-    bool force_material;
-    uint32_t force_material_index;
-    uint32_t max_prim_count;
-    uint32_t max_collision_polys;
-    float auto_block_xz_cell;
-    float module_pad_min;
-    float module_pad_scale;
-    const char* material_map;
-    const char* texture_dir;
-    const char* texture_prefix;
-    const char* sky_texture_dir;
-    Str sky_flip_faces;
-    const char* import_tex_from_pc;
-    const char* import_mtrl_from_pc;
-    const char* rsfl_from_pc;
-    Str rsfl_names;
-    const char* smsg_from_pc;
-    const char* lite_from_pc;
-    const char* lite_json;
-    const char* enti_from_pc;
-    bool enti_keep_spawnpoints;
-    Str enti_types;
-    const char* rscf_from_pc;
-    Str rscf_types;
-    Str rscf_name_filter;
-    Str rscf_names;
-    uint32_t rscf_skip;
-    bool rscf_limit_set;
-    uint32_t rscf_limit;
-    const char* rscf_bootstrap_name;
-    uint32_t rscf_bootstrap_subtype;
-    uint32_t rscf_bootstrap_payload_size;
-    const char* weapon_from_pc;
-    const char* spawnpoints_json;
-    const char* sounds_json;
-    const char* ambient_stream_path;
-    float ambient_volume;
-    const char* shade_from;
-    const char* shade_align_from_obj;
-    Asura_Vector_3 shade_offset;
-    uint64_t arena_reserve;
-    uint64_t output_reserve;
-};
 
 bool parse_option_u32(const char* text, uint32_t* out) {
     uint64_t v = 0;
@@ -513,24 +406,6 @@ uint8_t clamp_u8(double v) {
     return static_cast<uint8_t>(floor(v + 0.5));
 }
 
-struct ObjIndex {
-    int32_t v, vt, vn;
-};
-struct ObjFace {
-    ObjIndex a, b, c;
-    Str material;
-    uint32_t order;
-};
-struct ObjData {
-    Asura_Vector_3* positions;
-    uint32_t* colors;
-    uint8_t* has_color;
-    Asura_Vector_2* texcoords;
-    Asura_Vector_3* normals;
-    ObjFace* faces;
-    uint32_t position_count, texcoord_count, normal_count, face_count;
-};
-
 bool parse_decimal_token(Str token, float* out) {
     double v = 0;
     if (!parse_f64(token, &v) || !isfinite(v))
@@ -725,12 +600,7 @@ bool parse_obj(MappedFile* file, ObjData* obj, Arena* arena, Error* err) {
 
 } // namespace
 
-namespace {
-
-struct MaterialMap {
-    MappedFile file;
-    Json* root;
-};
+namespace asura::level {
 
 Json* json_get_i(Json* object, Str key) {
     if (!object || object->kind != JsonKind::Object)
@@ -899,9 +769,6 @@ bool work_less_group(const FaceWork& a, const FaceWork& b) {
     return a.order < b.order;
 }
 
-struct VertexKey {
-    uint32_t v, vt, vn, shade_material;
-};
 inline bool vertex_key_eq(const VertexKey& a, const VertexKey& b) {
     return a.v == b.v && a.vt == b.vt && a.vn == b.vn && a.shade_material == b.shade_material;
 }
@@ -965,13 +832,6 @@ uint32_t next_pow2(uint32_t v) {
     return v + 1;
 }
 
-struct EnvBuild {
-    Buffer payload;
-    uint32_t modules;
-    uint32_t strip_count;
-};
-
-struct ShadeSource;
 bool shade_pick(const ShadeSource* shade, Asura_Vector_3 position, Asura_Vector_3 normal, uint32_t material, uint32_t* out_color);
 
 bool build_env(const Config& cfg, const ObjData& obj, const MaterialMap& materials, const ShadeSource* shade,
@@ -1149,7 +1009,8 @@ bool build_env(const Config& cfg, const ObjData& obj, const MaterialMap& materia
                     }
                     if (seg_len & 1)
                         put(last);
-                    if (!tb.push({seg_len >= 2 ? seg_len - 2 : 0, seg_start, tris[run].material, min_i,
+                    if (!tb.push({seg_len >= 2 ? seg_len - 2 : 0, seg_start,
+                                  static_cast<int32_t>(tris[run].material), min_i,
                                   max_i - min_i + 1})) {
                         buffer_release(&blocks);
                         return false;
@@ -1189,17 +1050,7 @@ bool build_env(const Config& cfg, const ObjData& obj, const MaterialMap& materia
 
 } // namespace
 
-namespace {
-
-struct EnvView {
-    const uint8_t* data;
-    uint32_t size;
-    const Asura_PC_EnvironmentRenderer_Module* modules;
-    const Asura_PC_EnvironmentRenderer_Strip* strips;
-    uint32_t module_count, strip_count, block_count;
-    const uint8_t** blocks;
-    uint32_t* block_sizes;
-};
+namespace asura::level {
 
 bool env_view(const Buffer& payload, EnvView* v, Arena* arena, Error* err) {
     memset(v, 0, sizeof(*v));
@@ -1240,23 +1091,6 @@ bool env_view(const Buffer& payload, EnvView* v, Arena* arena, Error* err) {
     v->block_sizes = sizes;
     return true;
 }
-
-struct ShadeSample {
-    Asura_Vector_3 position, normal;
-    uint32_t color, material;
-};
-struct ShadeBucket {
-    int32_t x, y, z;
-    uint32_t head;
-    uint8_t used;
-};
-struct ShadeSource {
-    ShadeSample* samples;
-    uint32_t* next;
-    ShadeBucket* buckets;
-    uint32_t count, bucket_mask;
-    float cell_size;
-};
 
 uint64_t shade_cell_hash(int32_t x, int32_t y, int32_t z) {
     uint64_t h = static_cast<uint32_t>(x) * 0x9e3779b1u;
@@ -1421,7 +1255,7 @@ bool load_shade_source(const Config& cfg, const ObjData& target, ShadeSource* ou
                 samples[written++] = {{read_f32(v) + offset.x, read_f32(v + 4) + offset.y, read_f32(v + 8) + offset.z},
                                       {read_f32(v + 12), read_f32(v + 16), read_f32(v + 20)},
                                       read_u32(v + 24),
-                                      b.m_uMaterialResponseHashID};
+                                      static_cast<uint32_t>(b.m_iOriginalMaterialIndex)};
             }
         }
     }
@@ -1554,11 +1388,6 @@ bool shade_pick(const ShadeSource* shade, Asura_Vector_3 p, Asura_Vector_3 norma
 struct CollTri {
     uint16_t a, b, c, flags, material;
 };
-struct ModuleMetric {
-    Asura_Vector_3 translation;
-    uint32_t vertex_count, triangle_count, link_count;
-};
-
 bool append_minimal_collision_v0(Buffer* out, Error* err) {
     const float bounds[6] = {-1, 1, -1, 1, -1, 1};
     const float radius = sqrt(12.0f) * 0.5f;
@@ -1623,7 +1452,9 @@ bool append_module_collision_v3(Buffer* out, const EnvView& env, uint32_t module
             if (x == 0xffff || y == 0xffff || z == 0xffff || x >= nv || y >= nv || z >= nv || x == y || y == z ||
                 x == z)
                 continue;
-            uint32_t m = seg.m_uMaterialResponseHashID;
+            uint32_t m = seg.m_iOriginalMaterialIndex < 0
+                             ? 0xffffu
+                             : static_cast<uint32_t>(seg.m_iOriginalMaterialIndex);
             if (m > 0xffff)
                 m = 0xffff;
             const uint32_t material_ordinal = m >= 1000 ? m - 1000 : m;
@@ -1768,16 +1599,18 @@ bool append_nav1(Buffer* out, uint32_t n, Error* err) {
 
 bool append_skyb(Buffer* out, Error* err) {
     ChunkMark ch = begin_chunk(out, ASURA_CHUNK_SKYBOX, 7, 0, err);
-    const float header[4] = {255.0f, 230.0f, 200.0f, 3.107175588607788f};
-    buffer_append(out, header, sizeof(header), err);
+    const Asura_Chunk_SkyBox_PayloadPrefixV7 prefix{255.0f, 230.0f, 200.0f, 3.107175588607788f};
+    buffer_append(out, &prefix, sizeof(prefix), err);
+    // Empty first path plus these seven padded strings is the exact v7 count.
     append_u32(out, 0, err);
     const char* names[] = {"\\sky\\fr.tga", "\\sky\\lf.tga",        "\\sky\\bk.tga",       "\\sky\\rt.tga",
                            "\\sky\\up.tga", "\\sky\\ch_04_sky.bmp", "\\sky\\ch_04_sky.bmp"};
+    static_assert(sizeof(names) / sizeof(names[0]) + 1 == ASURA_SKYBOX_V5_V7_TEXTURE_PATH_COUNT,
+                  "SKYB v7 path count changed");
     for (const char* name : names)
         append_padded_cstr(out, str_from_c(name), err);
-    append_u32(out, 1, err);
-    append_u32(out, 0, err);
-    append_u32(out, 0, err);
+    const Asura_Chunk_SkyBox_TrailingFlagsV7 flags{1, 0, 0};
+    buffer_append(out, &flags, sizeof(flags), err);
     return end_chunk(out, ch, err);
 }
 
@@ -1812,7 +1645,7 @@ bool append_fnfo(Buffer* out, Error* err) {
 
 } // namespace
 
-namespace {
+namespace asura::level {
 
 bool csv_has_u32(Str csv, uint32_t wanted) {
     if (!csv.size)
@@ -1878,11 +1711,6 @@ bool filter_name(Str name, Str filter) {
     return has_glob ? glob_i(name, filter) : str_contains_i(name, filter);
 }
 
-struct DiskFile {
-    char path[MAX_PATH];
-    char name[MAX_PATH];
-    uint64_t size;
-};
 bool disk_less(const DiskFile& a, const DiskFile& b) {
     return _stricmp(a.name, b.name) < 0;
 }
@@ -2065,9 +1893,6 @@ bool append_file_rscf(Buffer* out, Str name, uint32_t type, uint32_t subtype, co
     return ok;
 }
 
-struct TextureSet {
-    Vec<DiskFile> files;
-};
 bool append_textures(Buffer* out, const Config& cfg, const EnvView& env, const MaterialMap& map, Arena* arena,
                      Arena* scratch, TextureSet* set, Error* err) {
     memset(set, 0, sizeof(*set));
@@ -2117,12 +1942,16 @@ bool append_textures(Buffer* out, const Config& cfg, const EnvView& env, const M
                               scratch, false, err))
             return false;
     }
-    // Global material table indexed exactly as the renderer expects (1000-based
-    // exported material handles are folded back to their ordinal).
+    // Global material table indexed by each Env strip's serialized original
+    // material ordinal. Keep accepting legacy tool output that wrote a
+    // 1000-based runtime handle into this slot, and fold it back to an ordinal.
     uint32_t max_ord = 0;
     bool any = false;
     for (uint32_t i = 0; i < env.strip_count; ++i) {
-        uint32_t m = env.strips[i].m_uMaterialResponseHashID, ord = m >= 1000 ? m - 1000 : m;
+        const int32_t original = env.strips[i].m_iOriginalMaterialIndex;
+        if (original < 0)
+            continue;
+        const uint32_t m = static_cast<uint32_t>(original), ord = m >= 1000 ? m - 1000 : m;
         max_ord = ord > max_ord ? ord : max_ord;
         any = true;
     }
@@ -2148,7 +1977,10 @@ bool append_textures(Buffer* out, const Config& cfg, const EnvView& env, const M
         names[i] = str_from_c(joined);
     }
     for (uint32_t i = 0; i < env.strip_count; ++i) {
-        uint32_t m = env.strips[i].m_uMaterialResponseHashID, ord = m >= 1000 ? m - 1000 : m;
+        const int32_t original = env.strips[i].m_iOriginalMaterialIndex;
+        if (original < 0)
+            continue;
+        const uint32_t m = static_cast<uint32_t>(original), ord = m >= 1000 ? m - 1000 : m;
         Str wanted = path_basename(material_texture_name(map, ord));
         for (uint32_t j = 0; j < set->files.count; ++j) {
             Str file = str_from_c(set->files.data[j].name);
@@ -2203,7 +2035,7 @@ bool append_sky_resources(Buffer* out, const Config& cfg, Arena* scratch, Error*
 
 } // namespace
 
-namespace {
+namespace asura::level {
 
 bool append_rsfl(Buffer* out, const Config& cfg, Arena* scratch, Error* err) {
     if (cfg.rsfl_from_pc) {
@@ -2715,10 +2547,11 @@ bool append_spawnpoints(Buffer* out, const char* path, Arena* scratch, Error* er
             static_cast<uint16_t>(json_integer(it, "entity_padding", json_integer(it, "u16_unk", 0)));
         data.m_iSpawnIndex = static_cast<int32_t>(json_integer(it, "spawn_index", i));
         data.m_iPosture = static_cast<int32_t>(json_integer(it, "posture", 0));
-        data.m_uTeamMask =
-            static_cast<uint32_t>(json_integer(it, "team_mask", json_integer(it, "team", 1)));
-        data.m_uGameModeMask = static_cast<uint32_t>(
-            json_integer(it, "game_mode_mask", json_integer(it, "gamemode", 24)));
+        data.m_uTeamMask = static_cast<uint32_t>(json_integer(
+            it, "team_mask", json_integer(it, "team", SnipeSpawnTeam_Deathmatch)));
+        data.m_uGameModeMask = static_cast<uint32_t>(json_integer(
+            it, "game_mode_mask",
+            json_integer(it, "gamemode", SnipeSpawnGameMode_Deathmatch | SnipeSpawnGameMode_TeamDeathmatch)));
         data.m_fSpawnTimer = 5.0f;
         ChunkMark ch = begin_chunk(out, ASURA_CHUNK_ENTITY, 0, 0, err);
         buffer_append(out, &data, sizeof(data), err);
@@ -2735,25 +2568,7 @@ bool append_spawnpoints(Buffer* out, const char* path, Arena* scratch, Error* er
 
 } // namespace
 
-namespace {
-
-struct SoundEntry {
-    Str name;
-    const char* file;
-    Asura_Vector_3 position;
-    float inner_radius, outer_radius;
-    float legacy_volume_parameters[7];
-    Asura_Vector_3 inner_cuboid_radius, outer_cuboid_radius;
-    Asura_Bounding_Box retrigger_bounding_box;
-    Asura_Quat orientation;
-    uint32_t sound_resource_id, controller_guid, phonon_guid, flags;
-    uint16_t controller_padding;
-    bool emit_enti, active;
-};
-struct Sounds {
-    SoundEntry* items;
-    uint32_t count;
-};
+namespace asura::level {
 
 Json* json_first(Json* object, const char* a, const char* b = nullptr, const char* c = nullptr,
                  const char* d = nullptr) {
@@ -2922,7 +2737,10 @@ bool load_sounds(const Config& cfg, Sounds* out, Arena* arena, Error* err) {
         s.controller_padding = static_cast<uint16_t>(json_integer(
             it, "controller_padding", json_integer(it, "controller_u16_unk", json_integer(it, "u16_unk", 0x4974))));
         s.phonon_guid = static_cast<uint32_t>(json_integer(it, "phonon_guid", kToolCreatedGuidFirst + i));
-        s.flags = static_cast<uint32_t>(json_integer(it, "flags", s.emit_enti ? (loop ? 3 : 2) : (loop ? 0x13 : 0x12)));
+        const uint32_t default_flags = ASURA_PHONON_FLAG_UNKNOWN_02 |
+                                       (s.emit_enti ? 0u : ASURA_PHONON_FLAG_STARTS_ACTIVE) |
+                                       (loop ? ASURA_PHONON_FLAG_REPEAT : 0u);
+        s.flags = static_cast<uint32_t>(json_integer(it, "flags", default_flags));
         Json* id = json_get(it, "sound_id");
         uint32_t requested = id ? static_cast<uint32_t>(json_integer(it, "sound_id", 0)) : 0;
         if (!requested) {
@@ -3013,6 +2831,8 @@ bool append_sound_entities(Buffer* out, const Sounds& s, Error* err) {
 } // namespace
 
 #ifndef ASURA_CONSTRUCT_NO_MAIN
+using namespace asura::level;
+
 int main(int argc, char** argv) {
     Error err{};
     Config cfg{};

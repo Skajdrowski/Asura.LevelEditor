@@ -1,19 +1,26 @@
-#define ASURA_CONSTRUCT_NO_MAIN
-#include "Construct.cpp"
+#include "LevelEditorGeometry.h"
+#include "LevelEditorHistory.h"
+#include "LevelEditorProject.h"
+#include "LevelEditorRaycast.h"
 
 #include <commdlg.h>
 #include <d3d11.h>
 #include <d3dcompiler.h>
 #include <DirectXMath.h>
+#include <mmsystem.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <windowsx.h>
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <fstream>
 #include <string>
 #include <vector>
+
+using namespace asura;
+using namespace asura::level;
 
 #pragma comment(lib, "Comdlg32.lib")
 #pragma comment(lib, "d3d11.lib")
@@ -21,620 +28,78 @@
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "Ole32.lib")
 #pragma comment(lib, "Shell32.lib")
+#pragma comment(lib, "Winmm.lib")
 
 namespace editor {
 
-constexpr char kProjectMagic[8] = {'A', 'L', 'E', 'V', '2', '0', '0', '5'};
-constexpr uint32_t kProjectVersion = 9;
-constexpr size_t kPhysicalObjectBodySize = sizeof(Snipe_ServerEntity_PhysicalPickup_ChunkDataV0);
 constexpr float kSpawnCollisionHalfWidth = 0.3f;
 constexpr float kSpawnCollisionHeight = 1.8f;
 constexpr float kSpawnCollisionVerticalOffset = 0.1f;
 
-enum class EntityKind : uint32_t {
-    SpawnPoint,
-    Light,
-    Sound,
-    PhysicalObject,
-    AssassinationTarget,
-    PositionMarker,
-};
-
-struct Entity {
-    EntityKind kind = EntityKind::SpawnPoint;
-    std::string name;
-    Asura_Vector_3 position{};
-    Asura_Vector_3 rotation{}; // pitch, yaw, roll in degrees
-    uint32_t guid = 0;
-    float value_a = 0;
-    float value_b = 0;
-    uint32_t value_u32_a = 0;
-    uint32_t value_u32_b = 0;
-    std::string sound_name;
-    std::string sound_file;
-    bool sound_loop = true;
-    Asura_Light light{};
-    bool spawn_source_record = false;
-    int32_t spawn_index = 0;
-    int32_t spawn_posture = 0;
-    float spawn_timer = 5.0f;
-    Asura_Vector_3 spawn_direction{0, 0, 1};
-    uint16_t entity_padding = 0;
-    bool sound_source_record = false;
-    bool sound_has_controller = false;
-    bool sound_controller_active = true;
-    uint16_t sound_controller_padding = 0x4974;
-    Asura_Chunk_Phonons_PhononDataV9 sound_phonon{};
-    // Source-backed ENTI classes whose transforms are patched in-place during
-    // export. Their unreversed fields remain byte-for-byte from the source PC.
-    bool source_entity_record = false;
-    uint16_t source_entity_classification = 0;
-    Asura_Bounding_Box source_bounds{};
-    // Physical-object ENTI payload used both to resolve its embedded model and
-    // as a byte-exact template when the editor creates another pickup.
-    bool pickup_has_template = false;
-    uint32_t pickup_skin_id = 0;
-    uint32_t pickup_anim_id = 0;
-    uint32_t pickup_anim_file_id = 0;
-    std::array<uint8_t, kPhysicalObjectBodySize> pickup_body{};
-};
-
-struct PickupTemplate {
-    uint32_t item_id = 0;
-    float health = 0;
-    uint32_t file_id = 0;
-    uint32_t skin_id = 0;
-    uint32_t anim_id = 0;
-    uint32_t anim_file_id = 0;
-    uint16_t entity_padding = 0;
-    std::array<uint8_t, kPhysicalObjectBodySize> body{};
-};
-
-struct Document {
-    std::string project_path;
-    std::string obj_path;
-    std::string source_pc_path;
-    std::string output_path;
-    std::string material_map;
-    std::string texture_dir;
-    std::string weapons_donor;
-    std::string sky_texture_dir;
-    std::vector<Entity> entities;
-    std::vector<PickupTemplate> pickup_templates;
-    uint32_t next_guid = kToolCreatedGuidFirst;
-    Asura_Vector_3 light_header_a{80, 80, 80};
-    Asura_Vector_3 light_header_b{.3f, .3f, .3f};
-    Asura_Vector_3 light_header_c{130, 100, 50};
-    uint32_t light_header_flag = 1;
-    // True only when every source physical-object ENTI was imported. This
-    // makes absence from entities an intentional deletion during export.
-    bool source_pickup_inventory_complete = false;
-    bool dirty = false;
-};
-
-struct Mesh {
-    std::vector<Asura_Vector_3> positions;
-    std::vector<std::array<uint32_t, 3>> faces;
-    Asura_Vector_3 min{}, max{}, center{};
-    float radius = 25.0f;
-};
-
-struct SpawnPuppetVertex {
-    Asura_Vector_3 position{};
-    Asura_Vector_3 normal{};
-};
-
-struct SpawnPuppet {
-    std::string resource_name;
-    std::vector<SpawnPuppetVertex> vertices;
-    std::vector<std::array<uint16_t, 3>> faces;
-    Asura_Vector_3 min{}, max{};
-};
-
-struct PickupModel {
-    uint32_t skin_id = 0;
-    SpawnPuppet mesh;
-};
-
-struct BinaryWriter {
-    std::vector<uint8_t> bytes;
-    void raw(const void* p, size_t n) {
-        const size_t at = bytes.size();
-        bytes.resize(at + n);
-        if (n)
-            memcpy(bytes.data() + at, p, n);
-    }
-    void u32(uint32_t v) { raw(&v, sizeof(v)); }
-    void f32(float v) { raw(&v, sizeof(v)); }
-    void str(const std::string& s) {
-        u32(static_cast<uint32_t>(s.size()));
-        raw(s.data(), s.size());
-    }
-};
-
-struct BinaryReader {
-    const uint8_t* data = nullptr;
-    size_t size = 0, at = 0;
-    bool ok = true;
-    bool raw(void* out, size_t n) {
-        if (!ok || n > size - at) {
-            ok = false;
-            return false;
-        }
-        if (n)
-            memcpy(out, data + at, n);
-        at += n;
-        return true;
-    }
-    uint32_t u32() {
-        uint32_t v = 0;
-        raw(&v, sizeof(v));
-        return v;
-    }
-    float f32() {
-        float v = 0;
-        raw(&v, sizeof(v));
-        return v;
-    }
-    std::string str() {
-        const uint32_t n = u32();
-        if (!ok || n > 64 * MiB || n > size - at) {
-            ok = false;
-            return {};
-        }
-        std::string s(reinterpret_cast<const char*>(data + at), n);
-        at += n;
-        return s;
-    }
-};
-
-void write_vec3(BinaryWriter& w, const Asura_Vector_3& v) {
-    w.f32(v.x);
-    w.f32(v.y);
-    w.f32(v.z);
-}
-
-Asura_Vector_3 read_vec3(BinaryReader& r) { return {r.f32(), r.f32(), r.f32()}; }
-
-Asura_Vector_3 light_direction_from_rotation(const Asura_Vector_3& degrees) {
-    constexpr float d2r = 3.14159265358979323846f / 180.0f;
-    const float yaw = degrees.y * d2r;
-    const float pitch = degrees.x * d2r;
-    return {cosf(pitch) * sinf(yaw), sinf(pitch), cosf(pitch) * cosf(yaw)};
-}
-
-Asura_Light legacy_editor_light(const Entity& e) {
-    Asura_Light light{};
-    light.Position = light.OldPosition = e.position;
-    light.Direction = light_direction_from_rotation(e.rotation);
-    light.R = 255.0f;
-    light.G = 244.0f;
-    light.B = 220.0f;
-    light.Brightness = e.value_a;
-    light.Range = light.OldRange = e.value_b;
-    light.Angle = 360.0f;
-    light.m_uFlags = ASURA_LIGHT_FLAG_AFFECTS_ENTITIES;
-    return light;
-}
-
-void write_light(BinaryWriter& w, const Asura_Light& light) {
-    write_vec3(w, light.Position);
-    write_vec3(w, light.Direction);
-    w.f32(light.R);
-    w.f32(light.G);
-    w.f32(light.B);
-    w.f32(light.Brightness);
-    w.f32(light.Range);
-    w.f32(light.m_fInnerRange);
-    w.f32(light.Angle);
-    w.f32(light.ShadowStrength);
-    w.f32(light.m_xBoundingBox.MinX);
-    w.f32(light.m_xBoundingBox.MaxX);
-    w.f32(light.m_xBoundingBox.MinY);
-    w.f32(light.m_xBoundingBox.MaxY);
-    w.f32(light.m_xBoundingBox.MinZ);
-    w.f32(light.m_xBoundingBox.MaxZ);
-    w.u32(light.m_uFlags);
-    w.f32(light.BrightnessOverRange);
-    write_vec3(w, light.OldPosition);
-    w.f32(light.OldRange);
-    w.u32(light.HasChanged ? 1u : 0u);
-}
-
-Asura_Light read_light(BinaryReader& r) {
-    Asura_Light light{};
-    light.Position = read_vec3(r);
-    light.Direction = read_vec3(r);
-    light.R = r.f32();
-    light.G = r.f32();
-    light.B = r.f32();
-    light.Brightness = r.f32();
-    light.Range = r.f32();
-    light.m_fInnerRange = r.f32();
-    light.Angle = r.f32();
-    light.ShadowStrength = r.f32();
-    light.m_xBoundingBox.MinX = r.f32();
-    light.m_xBoundingBox.MaxX = r.f32();
-    light.m_xBoundingBox.MinY = r.f32();
-    light.m_xBoundingBox.MaxY = r.f32();
-    light.m_xBoundingBox.MinZ = r.f32();
-    light.m_xBoundingBox.MaxZ = r.f32();
-    light.m_uFlags = r.u32();
-    light.BrightnessOverRange = r.f32();
-    light.OldPosition = read_vec3(r);
-    light.OldRange = r.f32();
-    light.HasChanged = r.u32() != 0;
-    return light;
-}
-
-void write_phonon(BinaryWriter& w, const Asura_Chunk_Phonons_PhononDataV9& phonon) {
-    w.u32(phonon.m_uSoundResourceID);
-    write_vec3(w, phonon.m_xPosition);
-    w.f32(phonon.m_fInnerRadius);
-    w.f32(phonon.m_fOuterRadius);
-    for (float value : phonon.m_afLegacyVolumeParameters)
-        w.f32(value);
-    w.u32(phonon.m_uFlags);
-    write_vec3(w, phonon.m_xInnerCuboidRadius);
-    write_vec3(w, phonon.m_xOuterCuboidRadius);
-    w.u32(phonon.m_uGuid);
-    w.f32(phonon.m_xRetriggerBoundingBox.MinX);
-    w.f32(phonon.m_xRetriggerBoundingBox.MaxX);
-    w.f32(phonon.m_xRetriggerBoundingBox.MinY);
-    w.f32(phonon.m_xRetriggerBoundingBox.MaxY);
-    w.f32(phonon.m_xRetriggerBoundingBox.MinZ);
-    w.f32(phonon.m_xRetriggerBoundingBox.MaxZ);
-    w.f32(phonon.m_xOrient.x);
-    w.f32(phonon.m_xOrient.y);
-    w.f32(phonon.m_xOrient.z);
-    w.f32(phonon.m_xOrient.w);
-}
-
-Asura_Chunk_Phonons_PhononDataV9 read_phonon(BinaryReader& r) {
-    Asura_Chunk_Phonons_PhononDataV9 phonon{};
-    phonon.m_uSoundResourceID = r.u32();
-    phonon.m_xPosition = read_vec3(r);
-    phonon.m_fInnerRadius = r.f32();
-    phonon.m_fOuterRadius = r.f32();
-    for (float& value : phonon.m_afLegacyVolumeParameters)
-        value = r.f32();
-    phonon.m_uFlags = r.u32();
-    phonon.m_xInnerCuboidRadius = read_vec3(r);
-    phonon.m_xOuterCuboidRadius = read_vec3(r);
-    phonon.m_uGuid = r.u32();
-    phonon.m_xRetriggerBoundingBox.MinX = r.f32();
-    phonon.m_xRetriggerBoundingBox.MaxX = r.f32();
-    phonon.m_xRetriggerBoundingBox.MinY = r.f32();
-    phonon.m_xRetriggerBoundingBox.MaxY = r.f32();
-    phonon.m_xRetriggerBoundingBox.MinZ = r.f32();
-    phonon.m_xRetriggerBoundingBox.MaxZ = r.f32();
-    phonon.m_xOrient = {r.f32(), r.f32(), r.f32(), r.f32()};
-    return phonon;
-}
-
-bool save_project(const Document& doc, const char* path, std::string* why) {
-    BinaryWriter w;
-    w.raw(kProjectMagic, sizeof(kProjectMagic));
-    w.u32(kProjectVersion);
-    w.str(doc.obj_path);
-    w.str(doc.source_pc_path);
-    w.str(doc.output_path);
-    w.str(doc.material_map);
-    w.str(doc.texture_dir);
-    w.str(doc.weapons_donor);
-    w.str(doc.sky_texture_dir);
-    w.u32(doc.next_guid);
-    write_vec3(w, doc.light_header_a);
-    write_vec3(w, doc.light_header_b);
-    write_vec3(w, doc.light_header_c);
-    w.u32(doc.light_header_flag);
-    w.u32(doc.source_pickup_inventory_complete ? 1u : 0u);
-    w.u32(static_cast<uint32_t>(doc.pickup_templates.size()));
-    for (const PickupTemplate& pickup : doc.pickup_templates) {
-        w.u32(pickup.item_id);
-        w.f32(pickup.health);
-        w.u32(pickup.file_id);
-        w.u32(pickup.skin_id);
-        w.u32(pickup.anim_id);
-        w.u32(pickup.anim_file_id);
-        w.u32(pickup.entity_padding);
-        w.raw(pickup.body.data(), pickup.body.size());
-    }
-    w.u32(static_cast<uint32_t>(doc.entities.size()));
-    for (const Entity& e : doc.entities) {
-        w.u32(static_cast<uint32_t>(e.kind));
-        w.str(e.name);
-        write_vec3(w, e.position);
-        write_vec3(w, e.rotation);
-        w.u32(e.guid);
-        w.f32(e.value_a);
-        w.f32(e.value_b);
-        w.u32(e.value_u32_a);
-        w.u32(e.value_u32_b);
-        w.str(e.sound_name);
-        w.str(e.sound_file);
-        if (e.kind == EntityKind::Sound)
-            w.u32(e.sound_loop ? 1u : 0u);
-        if (e.kind == EntityKind::Light) {
-            Asura_Light light = e.light;
-            light.Position = e.position;
-            write_light(w, light);
-        }
-        if (e.kind == EntityKind::SpawnPoint) {
-            w.u32(e.spawn_source_record ? 1u : 0u);
-            w.u32(static_cast<uint32_t>(e.spawn_index));
-            w.u32(static_cast<uint32_t>(e.spawn_posture));
-            w.f32(e.spawn_timer);
-            write_vec3(w, e.spawn_direction);
-            w.u32(e.entity_padding);
-        }
-        if (e.kind == EntityKind::Sound) {
-            w.u32(e.sound_source_record ? 1u : 0u);
-            w.u32(e.sound_has_controller ? 1u : 0u);
-            w.u32(e.sound_controller_active ? 1u : 0u);
-            w.u32(e.sound_controller_padding);
-            write_phonon(w, e.sound_phonon);
-        }
-        if (e.kind == EntityKind::PhysicalObject || e.kind == EntityKind::AssassinationTarget ||
-            e.kind == EntityKind::PositionMarker) {
-            w.u32(e.source_entity_record ? 1u : 0u);
-            w.u32(e.source_entity_classification);
-            w.f32(e.source_bounds.MinX);
-            w.f32(e.source_bounds.MaxX);
-            w.f32(e.source_bounds.MinY);
-            w.f32(e.source_bounds.MaxY);
-            w.f32(e.source_bounds.MinZ);
-            w.f32(e.source_bounds.MaxZ);
-        }
-        if (e.kind == EntityKind::PhysicalObject) {
-            w.u32(e.pickup_has_template ? 1u : 0u);
-            w.u32(e.pickup_skin_id);
-            w.u32(e.pickup_anim_id);
-            w.u32(e.pickup_anim_file_id);
-            w.raw(e.pickup_body.data(), e.pickup_body.size());
-        }
-    }
-    Error err{};
-    if (!write_entire_file(path, w.bytes.data(), w.bytes.size(), &err)) {
-        if (why)
-            *why = err.message;
-        return false;
-    }
-    return true;
-}
-
-void skip_legacy_project_records(BinaryReader& r) {
-    const uint32_t count = r.u32();
-    if (count > 4096) {
-        r.ok = false;
-        return;
-    }
-    for (uint32_t i = 0; i < count && r.ok; ++i) {
-        r.str();
-        r.str();
-        r.u32();
-        r.u32();
-        r.u32();
-        r.u32();
-        const uint32_t size = r.u32();
-        if (!r.ok || size > 32 * MiB || size > r.size - r.at) {
-            r.ok = false;
-            return;
-        }
-        r.at += size;
-    }
-}
-
-bool load_project(Document* doc, const char* path, std::string* why) {
-    std::ifstream file(path, std::ios::binary | std::ios::ate);
-    if (!file) {
-        if (why)
-            *why = "Could not open the editor project.";
-        return false;
-    }
-    const std::streamoff end = file.tellg();
-    if (end < 12 || end > static_cast<std::streamoff>(512 * MiB)) {
-        if (why)
-            *why = "The editor project has an invalid size.";
-        return false;
-    }
-    std::vector<uint8_t> bytes(static_cast<size_t>(end));
-    file.seekg(0);
-    file.read(reinterpret_cast<char*>(bytes.data()), end);
-    BinaryReader r{bytes.data(), bytes.size()};
-    char magic[8]{};
-    r.raw(magic, sizeof(magic));
-    const uint32_t project_version = r.u32();
-    if (memcmp(magic, kProjectMagic, sizeof(magic)) != 0 || project_version < 1 ||
-        project_version > kProjectVersion) {
-        if (why)
-            *why = "This is not a supported Asura Level Editor project.";
-        return false;
-    }
-    Document next;
-    next.project_path = path;
-    next.obj_path = r.str();
-    if (project_version >= 7)
-        next.source_pc_path = r.str();
-    next.output_path = r.str();
-    next.material_map = r.str();
-    next.texture_dir = r.str();
-    if (project_version >= 4)
-        next.weapons_donor = r.str();
-    if (project_version >= 6)
-        next.sky_texture_dir = r.str();
-    next.next_guid = r.u32();
-    if (project_version >= 7) {
-        next.light_header_a = read_vec3(r);
-        next.light_header_b = read_vec3(r);
-        next.light_header_c = read_vec3(r);
-        next.light_header_flag = r.u32();
-        if (project_version >= 9) {
-            next.source_pickup_inventory_complete = r.u32() != 0;
-            const uint32_t pickup_template_count = r.u32();
-            if (pickup_template_count > 256)
-                r.ok = false;
-            next.pickup_templates.reserve(r.ok ? pickup_template_count : 0);
-            for (uint32_t i = 0; i < pickup_template_count && r.ok; ++i) {
-                PickupTemplate pickup;
-                pickup.item_id = r.u32();
-                pickup.health = r.f32();
-                pickup.file_id = r.u32();
-                pickup.skin_id = r.u32();
-                pickup.anim_id = r.u32();
-                pickup.anim_file_id = r.u32();
-                pickup.entity_padding = static_cast<uint16_t>(r.u32());
-                r.raw(pickup.body.data(), pickup.body.size());
-                next.pickup_templates.push_back(std::move(pickup));
-            }
-        }
-    }
-    if (project_version <= 4)
-        skip_legacy_project_records(r);
-    const uint32_t entity_count = r.u32();
-    if (entity_count > 100000)
-        r.ok = false;
-    next.entities.reserve(r.ok ? entity_count : 0);
-    bool skipped_legacy_entities = false;
-    for (uint32_t i = 0; i < entity_count && r.ok; ++i) {
-        Entity e;
-        const uint32_t kind = r.u32();
-        const uint32_t maximum_kind = project_version <= 4
-                                          ? 3u
-                                          : project_version <= 7
-                                                ? static_cast<uint32_t>(EntityKind::Sound)
-                                                : static_cast<uint32_t>(EntityKind::PositionMarker);
-        if (kind > maximum_kind)
-            r.ok = false;
-        const bool supported = kind <= (project_version <= 7 ? static_cast<uint32_t>(EntityKind::Sound)
-                                                             : static_cast<uint32_t>(EntityKind::PositionMarker));
-        if (supported)
-            e.kind = static_cast<EntityKind>(kind);
-        e.name = r.str();
-        e.position = read_vec3(r);
-        e.rotation = read_vec3(r);
-        e.guid = r.u32();
-        if (project_version <= 4)
-            r.u32();
-        e.value_a = r.f32();
-        e.value_b = r.f32();
-        e.value_u32_a = r.u32();
-        e.value_u32_b = r.u32();
-        e.sound_name = r.str();
-        e.sound_file = r.str();
-        if (kind == static_cast<uint32_t>(EntityKind::Sound))
-            e.sound_loop = project_version >= 3 ? r.u32() != 0 : true;
-        if (kind == static_cast<uint32_t>(EntityKind::Light))
-            e.light = project_version >= 2 ? read_light(r) : legacy_editor_light(e);
-        if (project_version >= 7 && kind == static_cast<uint32_t>(EntityKind::SpawnPoint)) {
-            e.spawn_source_record = r.u32() != 0;
-            e.spawn_index = static_cast<int32_t>(r.u32());
-            e.spawn_posture = static_cast<int32_t>(r.u32());
-            e.spawn_timer = r.f32();
-            e.spawn_direction = read_vec3(r);
-            e.entity_padding = static_cast<uint16_t>(r.u32());
-        }
-        if (project_version >= 7 && kind == static_cast<uint32_t>(EntityKind::Sound)) {
-            e.sound_source_record = r.u32() != 0;
-            e.sound_has_controller = r.u32() != 0;
-            e.sound_controller_active = r.u32() != 0;
-            e.sound_controller_padding = static_cast<uint16_t>(r.u32());
-            e.sound_phonon = read_phonon(r);
-        }
-        if (project_version >= 8 && kind >= static_cast<uint32_t>(EntityKind::PhysicalObject)) {
-            e.source_entity_record = r.u32() != 0;
-            e.source_entity_classification = static_cast<uint16_t>(r.u32());
-            e.source_bounds.MinX = r.f32();
-            e.source_bounds.MaxX = r.f32();
-            e.source_bounds.MinY = r.f32();
-            e.source_bounds.MaxY = r.f32();
-            e.source_bounds.MinZ = r.f32();
-            e.source_bounds.MaxZ = r.f32();
-        }
-        if (project_version >= 9 && kind == static_cast<uint32_t>(EntityKind::PhysicalObject)) {
-            e.pickup_has_template = r.u32() != 0;
-            e.pickup_skin_id = r.u32();
-            e.pickup_anim_id = r.u32();
-            e.pickup_anim_file_id = r.u32();
-            r.raw(e.pickup_body.data(), e.pickup_body.size());
-        }
-        if (supported)
-            next.entities.push_back(std::move(e));
-        else
-            skipped_legacy_entities = true;
-    }
-    if (!r.ok || r.at != r.size) {
-        if (why)
-            *why = "The editor project is truncated or corrupt.";
-        return false;
-    }
-    next.dirty = skipped_legacy_entities;
-    *doc = std::move(next);
-    return true;
-}
-
-void finish_mesh_bounds(Mesh* mesh) {
-    if (mesh->positions.empty()) {
-        mesh->min = mesh->max = mesh->center = {};
-        mesh->radius = 25.0f;
-        return;
-    }
-    mesh->min = mesh->max = mesh->positions[0];
-    for (const Asura_Vector_3& p : mesh->positions) {
-        mesh->min.x = fminf(mesh->min.x, p.x);
-        mesh->min.y = fminf(mesh->min.y, p.y);
-        mesh->min.z = fminf(mesh->min.z, p.z);
-        mesh->max.x = fmaxf(mesh->max.x, p.x);
-        mesh->max.y = fmaxf(mesh->max.y, p.y);
-        mesh->max.z = fmaxf(mesh->max.z, p.z);
-    }
-    mesh->center = {(mesh->min.x + mesh->max.x) * .5f, (mesh->min.y + mesh->max.y) * .5f,
-                    (mesh->min.z + mesh->max.z) * .5f};
-    const float dx = mesh->max.x - mesh->min.x, dy = mesh->max.y - mesh->min.y,
-                dz = mesh->max.z - mesh->min.z;
-    mesh->radius = fmaxf(5.0f, sqrtf(dx * dx + dy * dy + dz * dz) * .5f);
-}
-
-bool load_preview_mesh(const std::string& path, Mesh* mesh, std::string* why) {
+bool load_preview_mesh(const std::string& path, const std::string& material_map_path, Mesh* mesh, std::string* why) {
     Error err{};
     Arena arena{};
     MappedFile file{};
     ObjData obj{};
+    MaterialMap materials{};
     Config cfg{};
     char editor_arg[] = "LevelEditor";
     char out_arg[] = "preview.pc";
     char* args[] = {editor_arg, const_cast<char*>(path.c_str()), out_arg};
     bool ok = arena_init(&arena, sizeof(void*) == 4 ? 256 * MiB : 2 * GiB, &err) &&
-               parse_cli(3, args, &cfg, &err) && map_file(path.c_str(), &file, &err) &&
-               parse_obj(&file, &obj, &arena, &err);
+              parse_cli(3, args, &cfg, &err) && map_file(path.c_str(), &file, &err) &&
+              parse_obj(&file, &obj, &arena, &err);
+    cfg.material_map = material_map_path.empty() ? nullptr : material_map_path.c_str();
+    if (ok)
+        ok = load_material_map(cfg, &materials, &arena, &err);
     // Game Env vertices are Y/Z-flipped. Keep the authored Blender Y axis
     // upright in the viewport; pack_document still uses the game default.
     cfg.flip_y = false;
     Mesh next;
     if (ok) {
-        next.positions.reserve(obj.position_count);
-        for (uint32_t i = 0; i < obj.position_count; ++i)
-            next.positions.push_back(transform_vec(obj.positions[i], cfg));
+        const size_t maximum_vertices = static_cast<size_t>(obj.face_count) * 3;
+        next.positions.reserve(maximum_vertices);
+        next.normals.reserve(maximum_vertices);
+        next.texcoords.reserve(maximum_vertices);
+        next.diffuse_abgr.reserve(maximum_vertices);
         next.faces.reserve(obj.face_count);
+        next.face_materials.reserve(obj.face_count);
         for (uint32_t i = 0; i < obj.face_count; ++i) {
             const ObjFace& f = obj.faces[i];
-            const int32_t a = resolve_obj_index(f.a.v, obj.position_count);
-            const int32_t b = resolve_obj_index(f.b.v, obj.position_count);
-            const int32_t c = resolve_obj_index(f.c.v, obj.position_count);
-            if (a >= 0 && b >= 0 && c >= 0) {
-                if (transform_reverses_winding(cfg))
-                    next.faces.push_back(
-                        {static_cast<uint32_t>(a), static_cast<uint32_t>(c), static_cast<uint32_t>(b)});
-                else
-                    next.faces.push_back(
-                        {static_cast<uint32_t>(a), static_cast<uint32_t>(b), static_cast<uint32_t>(c)});
+            VertexKey keys[3]{};
+            uint32_t material = 0;
+            if (!face_keys(obj, f, keys, &err) ||
+                !resolve_material(materials, f.material, true, &material, &err)) {
+                ok = false;
+                break;
             }
+            if (transform_reverses_winding(cfg))
+                std::swap(keys[1], keys[2]);
+            const uint32_t first = static_cast<uint32_t>(next.positions.size());
+            for (const VertexKey& key : keys) {
+                next.positions.push_back(transform_vec(obj.positions[key.v], cfg));
+                Asura_Vector_3 normal{};
+                if (key.vn != 0xffffffffu)
+                    normal = transform_vec(obj.normals[key.vn], cfg);
+                next.normals.push_back(normal);
+                Asura_Vector_2 uv{};
+                if (key.vt != 0xffffffffu) {
+                    uv = obj.texcoords[key.vt];
+                    uv.y = 1.0f - uv.y;
+                }
+                next.texcoords.push_back(uv);
+                next.diffuse_abgr.push_back(obj.has_color[key.v] ? obj.colors[key.v] : cfg.diffuse_abgr);
+            }
+            next.faces.push_back({first, first + 1, first + 2});
+            next.face_materials.push_back(material == 0xffffffffu ? 0u : material);
         }
-        finish_mesh_bounds(&next);
+        if (ok)
+            finish_mesh_bounds(&next);
     }
     if (!ok && why)
         *why = err.set ? err.message : "Could not load the OBJ preview.";
     unmap_file(&file);
+    unmap_file(&materials.file);
     arena_release(&arena);
     if (ok)
         *mesh = std::move(next);
@@ -735,7 +200,11 @@ bool decode_pc_environment(const RscfInfo& resource, Mesh* mesh, Arena* arena, E
     if (total_triangles > static_cast<uint64_t>(SIZE_MAX))
         return fail(err, "PC environment has too many triangles for the editor");
     next.positions.reserve(static_cast<size_t>(total_vertices));
+    next.normals.reserve(static_cast<size_t>(total_vertices));
+    next.texcoords.reserve(static_cast<size_t>(total_vertices));
+    next.diffuse_abgr.reserve(static_cast<size_t>(total_vertices));
     next.faces.reserve(static_cast<size_t>(total_triangles));
+    next.face_materials.reserve(static_cast<size_t>(total_triangles));
     for (uint32_t block_index = 0; block_index < env.block_count; ++block_index) {
         const uint8_t* block = env.blocks[block_index];
         const uint32_t vertex_count = read_u32(block);
@@ -743,9 +212,16 @@ bool decode_pc_environment(const RscfInfo& resource, Mesh* mesh, Arena* arena, E
         for (uint32_t vertex_index = 0; vertex_index < vertex_count; ++vertex_index) {
             const uint8_t* source = vertices + static_cast<uint64_t>(vertex_index) * sizeof(Asura_PC_EnvironmentRenderer_Vertex);
             const Asura_Vector_3 position{read_f32(source), -read_f32(source + 4), read_f32(source + 8)};
-            if (!isfinite(position.x) || !isfinite(position.y) || !isfinite(position.z))
+            const Asura_Vector_3 normal{read_f32(source + 12), -read_f32(source + 16), read_f32(source + 20)};
+            const Asura_Vector_2 uv{read_f32(source + 28), read_f32(source + 32)};
+            if (!isfinite(position.x) || !isfinite(position.y) || !isfinite(position.z) ||
+                !isfinite(normal.x) || !isfinite(normal.y) || !isfinite(normal.z) ||
+                !isfinite(uv.x) || !isfinite(uv.y))
                 return fail(err, "PC environment contains a non-finite vertex");
             next.positions.push_back(position);
+            next.normals.push_back(normal);
+            next.diffuse_abgr.push_back(read_u32(source + 24));
+            next.texcoords.push_back(uv);
         }
     }
     for (uint32_t module_index = 0; module_index < env.module_count; ++module_index) {
@@ -769,6 +245,7 @@ bool decode_pc_environment(const RscfInfo& resource, Mesh* mesh, Arena* arena, E
                     continue;
                 // Negating the target's negative-up Y axis reverses handedness.
                 next.faces.push_back({vertex_base + a, vertex_base + c, vertex_base + b});
+                next.face_materials.push_back(strip.m_iOriginalMaterialIndex);
             }
         }
     }
@@ -829,19 +306,15 @@ const char* snipe_item_name(uint32_t item_id) {
     case SnipeItem_MedKit: return "MedKit";
     case SnipeItem_Bandage: return "Bandage";
     case SnipeItem_TnT: return "TnT";
-    case SnipeItem_Binoculars: return "Binoculars";
     case SnipeItem_Gewehr43: return "Gewehr 43";
     case SnipeItem_Mosin91: return "Mosin 91";
     case SnipeItem_SVT40: return "SVT-40";
-    case SnipeItem_Luger: return "Luger";
-    case SnipeItem_P38: return "P-38";
     case SnipeItem_PPSH: return "PPSh";
     case SnipeItem_MP40: return "MP 40";
     case SnipeItem_MG42: return "MG42";
     case SnipeItem_DP28: return "DP 28";
     case SnipeItem_TimeBomb: return "Time Bomb";
     case SnipeItem_Panzerschreck: return "Panzerschreck";
-    case SnipeItem_TripWire: return "Trip Wire";
     case SnipeItem_PanzerschreckAmmo: return "Panzerschreck Ammo";
     default: return nullptr;
     }
@@ -964,20 +437,16 @@ constexpr PickupResourceDefinition kPickupResourceDefinitions[] = {
     {SnipeItem_MedKit, "smallmedkit"},
     {SnipeItem_Bandage, "bandage"},
     {SnipeItem_TnT, "tnt"},
-    {SnipeItem_Binoculars, "Binoculars"},
     {SnipeItem_Gewehr43, "springfield"},
     {SnipeItem_Mosin91, "nagan_scope"},
     {SnipeItem_SVT40, "mauser_scope"},
-    {SnipeItem_Luger, "Luger"},
-    {SnipeItem_P38, "p38"},
     {SnipeItem_PPSH, "machgun"},
     {SnipeItem_MP40, "mp40"},
     {SnipeItem_MG42, "MG42"},
     {SnipeItem_DP28, "dp28"},
     {SnipeItem_TimeBomb, "tbomb"},
     {SnipeItem_Panzerschreck, "panzerschreck"},
-    {SnipeItem_TripWire, "tripbomb"},
-    {SnipeItem_PanzerschreckAmmo, "schreckrocket"},
+    {SnipeItem_PanzerschreckAmmo, "schreckrocket"}
 };
 
 uint32_t pickup_initial_state_bits(uint32_t item_id) {
@@ -988,7 +457,6 @@ uint32_t pickup_initial_state_bits(uint32_t item_id) {
     case SnipeItem_SmokeGrenade:
     case SnipeItem_TnT:
     case SnipeItem_TimeBomb:
-    case SnipeItem_TripWire:
     case SnipeItem_PanzerschreckAmmo:
         return 0xc1u;
     default:
@@ -1492,6 +960,78 @@ bool import_pc_entities(const ChunkList& chunks, Document* document, Error* err)
     return true;
 }
 
+struct PcSkyboxInfo {
+    uint32_t chunk_version = 7;
+    float red = 255.0f;
+    float green = 255.0f;
+    float blue = 255.0f;
+    float orientation = 0.0f;
+    Str names[ASURA_SKYBOX_V5_V7_TEXTURE_PATH_COUNT]{};
+    bool draw_clouds = false;
+    bool back_texture_is_front_upside_down = false;
+    bool right_texture_is_left_upside_down = false;
+};
+
+bool pc_skybox_info(const ChunkList& chunks, PcSkyboxInfo* info, Error* err) {
+    for (uint32_t chunk_index = 0; chunk_index < chunks.count; ++chunk_index) {
+        const ChunkRef& chunk = chunks.chunks[chunk_index];
+        if (chunk.cid != ASURA_CHUNK_SKYBOX)
+            continue;
+        if ((chunk.version != 6 && chunk.version != 7) ||
+            chunk.size < sizeof(Asura_Chunk_Header) + sizeof(Asura_Chunk_SkyBox_PayloadPrefixV7) +
+                             ASURA_SKYBOX_V5_V7_TEXTURE_PATH_COUNT * 4 +
+                             (chunk.version == 7 ? 12u : 8u))
+            return fail(err, "the .PC SKYB chunk has an unsupported version or size");
+        const uint8_t* payload = chunk.data + sizeof(Asura_Chunk_Header);
+        const uint32_t payload_size = chunk.size - sizeof(Asura_Chunk_Header);
+        Asura_Chunk_SkyBox_PayloadPrefixV7 prefix{};
+        memcpy(&prefix, payload, sizeof(prefix));
+        info->chunk_version = chunk.version;
+        info->red = prefix.m_fRed;
+        info->green = prefix.m_fGreen;
+        info->blue = prefix.m_fBlue;
+        info->orientation = prefix.m_fOrientationAroundYAxis;
+        if (!isfinite(info->red) || !isfinite(info->green) || !isfinite(info->blue) ||
+            !isfinite(info->orientation))
+            return fail(err, "the .PC SKYB colour or orientation is invalid");
+        uint64_t at = sizeof(prefix);
+        for (uint32_t slot = 0; slot < ASURA_SKYBOX_V5_V7_TEXTURE_PATH_COUNT; ++slot) {
+            if (at > 0xffffffffull)
+                return fail(err, "the .PC SKYB texture table is invalid");
+            info->names[slot] = padded_string_at(payload, payload_size, static_cast<uint32_t>(at));
+            if (!info->names[slot].data)
+                return fail(err, "the .PC SKYB texture table is truncated");
+            at = align_up(at + info->names[slot].size + 1, 4);
+            if (at > payload_size)
+                return fail(err, "the .PC SKYB texture table is truncated");
+        }
+        const uint32_t flag_bytes = chunk.version == 7 ? 12u : 8u;
+        if (at + flag_bytes > payload_size)
+            return fail(err, "the .PC SKYB flags are truncated");
+        Asura_Chunk_SkyBox_TrailingFlagsV7 flags{};
+        memcpy(&flags, payload + at, flag_bytes);
+        info->draw_clouds = flags.m_bDrawClouds != 0;
+        info->back_texture_is_front_upside_down = flags.m_bBackTextureIsFrontUpsideDown != 0;
+        info->right_texture_is_left_upside_down = flags.m_bRightTextureIsLeftUpsideDown != 0;
+        return true;
+    }
+    return fail(err, "the .PC contains no SKYB chunk");
+}
+
+void import_pc_skybox_settings(const PcSkyboxInfo& info, SkyboxSettings* skybox) {
+    skybox->chunk_version = info.chunk_version;
+    skybox->red = info.red;
+    skybox->green = info.green;
+    skybox->blue = info.blue;
+    skybox->orientation_radians = info.orientation;
+    for (uint32_t slot = 0; slot < ASURA_SKYBOX_V5_V7_TEXTURE_PATH_COUNT; ++slot)
+        skybox->texture_paths[slot].assign(info.names[slot].data, info.names[slot].size);
+    skybox->draw_clouds = info.draw_clouds;
+    skybox->back_texture_is_front_upside_down = info.back_texture_is_front_upside_down;
+    skybox->right_texture_is_left_upside_down = info.right_texture_is_left_upside_down;
+    skybox->source_record = true;
+}
+
 bool load_pc_level(const std::string& path, Document* document, Mesh* mesh, std::string* why,
                    std::vector<PickupModel>* pickup_models = nullptr) {
     Error err{};
@@ -1501,6 +1041,22 @@ bool load_pc_level(const std::string& path, Document* document, Mesh* mesh, std:
     Mesh next_mesh;
     std::vector<PickupModel> next_pickup_models;
     bool ok = arena_init(&arena, 64 * MiB, &err) && parse_chunks(path.c_str(), &chunks, &arena, &err);
+    bool source_has_skybox = false;
+    for (uint32_t chunk_index = 0; ok && chunk_index < chunks.count; ++chunk_index)
+        source_has_skybox |= chunks.chunks[chunk_index].cid == ASURA_CHUNK_SKYBOX;
+    PcSkyboxInfo skybox_info{};
+    if (ok && source_has_skybox)
+        ok = pc_skybox_info(chunks, &skybox_info, &err);
+    if (ok && source_has_skybox)
+        import_pc_skybox_settings(skybox_info, &next_document.skybox);
+    for (uint32_t chunk_index = 0; ok && chunk_index < chunks.count; ++chunk_index) {
+        const ChunkRef& chunk = chunks.chunks[chunk_index];
+        if (chunk.cid == ASURA_CHUNK_WEATHERSYSTEM && chunk.version >= 5 &&
+            chunk.version <= 6 && chunk.size > 21) {
+            next_document.weather_source_record = true;
+            next_document.rain_enabled = chunk.data[21] != 0;
+        }
+    }
     RscfInfo environment{};
     if (ok && !find_pc_environment(chunks, &environment))
         ok = fail(&err, "the .PC contains no PC environment RSCF");
@@ -1549,6 +1105,50 @@ bool append_editor_lights(Buffer* out, const Document& doc, Error* err) {
     return end_chunk(out, ch, err);
 }
 
+bool append_editor_skybox(Buffer* out, const SkyboxSettings& skybox, Error* err) {
+    if (skybox.chunk_version < 6 || skybox.chunk_version > 7)
+        return fail(err, "SKYB chunk version must be 6 or 7");
+    if (skybox.chunk_version < 7 && skybox.right_texture_is_left_upside_down)
+        return fail(err, "the right-face compatibility flag requires SKYB version 7");
+    if (!isfinite(skybox.red) || !isfinite(skybox.green) || !isfinite(skybox.blue) ||
+        !isfinite(skybox.orientation_radians))
+        return fail(err, "SKYB colour and orientation values must be finite");
+    ChunkMark chunk = begin_chunk(out, ASURA_CHUNK_SKYBOX, skybox.chunk_version, 0, err);
+    const Asura_Chunk_SkyBox_PayloadPrefixV7 prefix{
+        skybox.red, skybox.green, skybox.blue, skybox.orientation_radians};
+    buffer_append(out, &prefix, sizeof(prefix), err);
+    for (const std::string& texture_path : skybox.texture_paths) {
+        if (texture_path.size() > 4096 || texture_path.find('\0') != std::string::npos)
+            return fail(err, "SKYB texture paths must contain at most 4096 non-NUL bytes");
+        append_padded_cstr(out, {texture_path.data(), static_cast<uint32_t>(texture_path.size())}, err);
+    }
+    const Asura_Chunk_SkyBox_TrailingFlagsV7 flags{
+        skybox.draw_clouds ? 1u : 0u,
+        skybox.back_texture_is_front_upside_down ? 1u : 0u,
+        skybox.right_texture_is_left_upside_down ? 1u : 0u};
+    const size_t flag_bytes = skybox.chunk_version == 7 ? sizeof(flags) : sizeof(flags) - sizeof(uint32_t);
+    return buffer_append(out, &flags, flag_bytes, err) != ~0ull && end_chunk(out, chunk, err);
+}
+
+bool append_editor_weather(Buffer* out, const Document& document, Error* err) {
+    const uint64_t start = out->size;
+    if (!append_wthr(out, err))
+        return false;
+    const uint8_t enabled = document.rain_enabled ? 1u : 0u;
+    return buffer_patch(out, start + 21, &enabled, sizeof(enabled), err);
+}
+
+bool append_editor_weather_copy(Buffer* out, const ChunkRef& chunk, const Document& document,
+                                Error* err) {
+    if (chunk.size <= 21)
+        return fail(err, "the source WTHR rain flag is truncated");
+    const uint64_t start = out->size;
+    if (!append_chunk_copy(out, chunk, err))
+        return false;
+    const uint8_t enabled = document.rain_enabled ? 1u : 0u;
+    return buffer_patch(out, start + 21, &enabled, sizeof(enabled), err);
+}
+
 bool append_editor_spawnpoints(Buffer* out, const Document& doc, Error* err) {
     uint32_t index = 0;
     for (const Entity& e : doc.entities) {
@@ -1559,14 +1159,8 @@ bool append_editor_spawnpoints(Buffer* out, const Document& doc, Error* err) {
         data.m_xEntity.Classification = SnipeEntityClass_SpawnPoint;
         data.m_xEntity.m_usPadding = e.entity_padding;
         data.m_xPosition = e.position;
-        if (e.spawn_source_record) {
-            data.m_xDirection = e.spawn_direction;
-        } else {
-            const float yaw = e.rotation.y * 3.14159265358979323846f / 180.0f;
-            const float pitch = e.rotation.x * 3.14159265358979323846f / 180.0f;
-            data.m_xDirection = {cosf(pitch) * sinf(yaw), sinf(pitch), cosf(pitch) * cosf(yaw)};
-        }
-        data.m_iSpawnIndex = e.spawn_source_record ? e.spawn_index : static_cast<int32_t>(index);
+        data.m_xDirection = e.spawn_direction;
+        data.m_iSpawnIndex = e.spawn_source_record ? e.spawn_index : index;
         data.m_iPosture = e.spawn_source_record ? e.spawn_posture : 0;
         data.m_uTeamMask = e.value_u32_a;
         data.m_uGameModeMask = e.value_u32_b;
@@ -1977,6 +1571,7 @@ bool pack_pc_document(const Document& doc, const char* output_path, std::string*
         }
     }
     bool wrote_lights = false, wrote_phonons = false, wrote_entities = false, wrote_sound_resources = false;
+    bool wrote_skybox = false;
     auto write_lights = [&]() {
         if (!wrote_lights) {
             wrote_lights = true;
@@ -2003,6 +1598,21 @@ bool pack_pc_document(const Document& doc, const char* output_path, std::string*
 
     for (uint32_t i = 0; ok && i < source.count; ++i) {
         const ChunkRef& chunk = source.chunks[i];
+        if (chunk.cid == ASURA_CHUNK_SKYBOX && doc.skybox.source_record) {
+            if (!wrote_skybox) {
+                wrote_skybox = true;
+                ok = append_editor_skybox(&output, doc.skybox, &err);
+            }
+            continue;
+        }
+        // The target updates its global weather state whenever it encounters a
+        // supported WTHR. Keep every source record consistent so a duplicate
+        // or reordered chunk cannot restore the level's authored rain value.
+        if (chunk.cid == ASURA_CHUNK_WEATHERSYSTEM && doc.weather_source_record &&
+            chunk.version >= 5 && chunk.version <= 6 && chunk.size > 21) {
+            ok = append_editor_weather_copy(&output, chunk, doc, &err);
+            continue;
+        }
         if (chunk.cid == ASURA_CHUNK_RESOURCEFILE) {
             RscfInfo resource{};
             if (rscf_info(chunk, &resource) && replaced_pc_sound_resource(doc, resource))
@@ -2131,9 +1741,9 @@ bool pack_document(Document& doc, const char* output_path, std::string* why) {
              append_mlin(&output, metrics, view.module_count, &err) &&
              append_mrvb(&output, view.module_count, &err) && append_nav1(&output, view.module_count, &err) &&
              append_sound_entities(&output, sounds, &err) && append_editor_spawnpoints(&output, doc, &err) &&
-             append_editor_pickups(&output, doc, &err) &&
-             append_skyb(&output, &err) &&
-             append_fog(&output, &err) && append_wthr(&output, &err) &&
+              append_editor_pickups(&output, doc, &err) &&
+              append_editor_skybox(&output, doc.skybox, &err) &&
+             append_fog(&output, &err) && append_editor_weather(&output, doc, &err) &&
              buffer_append(&output, nullptr, sizeof(Asura_Chunk_Header), &err) != ~0ull &&
              write_entire_file(output_path, output.base, output.size, &err);
     }
@@ -2162,12 +1772,17 @@ enum ControlId : int {
     ID_TEXTURE_DIR,
     ID_WEAPONS_DONOR,
     ID_SKYBOX_TEXTURES,
+    ID_TOGGLE_RAIN,
     ID_ENTITY_LIST,
     ID_ADD_SPAWN,
     ID_ADD_LIGHT,
     ID_ADD_SOUND,
     ID_ADD_PICKUP,
     ID_DELETE_ENTITY,
+    ID_UNDO,
+    ID_REDO,
+    ID_COPY_ENTITY,
+    ID_PASTE_ENTITY,
     ID_APPLY_INSPECTOR,
     ID_BROWSE_SOUND,
     ID_NAME,
@@ -2179,8 +1794,14 @@ enum ControlId : int {
     ID_ROT_Z,
     ID_VALUE_A,
     ID_VALUE_B,
+    ID_PICKUP_ITEM,
     ID_LIGHT_PROPERTIES,
     ID_SOUND_LOOP,
+    ID_SOUND_PREVIEW,
+    ID_SPAWN_TEAM_FIRST,
+    ID_SPAWN_TEAM_LAST = ID_SPAWN_TEAM_FIRST + 3,
+    ID_SPAWN_GAME_MODE_FIRST,
+    ID_SPAWN_GAME_MODE_LAST = ID_SPAWN_GAME_MODE_FIRST + 5,
     ID_STATUS,
     ID_VIEWPORT,
 };
@@ -2200,17 +1821,28 @@ struct AppState {
     HWND rot[3]{};
     HWND value[2]{};
     HWND value_label[2]{};
+    HWND pickup_item = nullptr;
+    HWND rain_toggle = nullptr;
     HWND sound_browse = nullptr;
     HWND sound_loop = nullptr;
+    HWND sound_preview = nullptr;
+    HWND spawn_team_label = nullptr;
+    HWND spawn_game_mode_label = nullptr;
+    HWND spawn_team_checks[4]{};
+    HWND spawn_game_mode_checks[6]{};
     HWND light_properties = nullptr;
     HWND status = nullptr;
     HWND viewport = nullptr;
     HFONT font = nullptr;
     Document document;
+    LevelEditorHistory history;
     Mesh mesh;
+    EnvironmentRaycast environment_raycast;
     std::array<SpawnPuppet, 3> spawn_puppets;
     std::string spawn_puppet_source;
     std::vector<PickupModel> pickup_models;
+    std::vector<uint8_t> sound_preview_bytes;
+    int sound_preview_entity = -1;
     Camera camera;
     int selected = -1;
     int pending_kind = -1;
@@ -2224,9 +1856,19 @@ struct AppState {
     bool environment_cache_valid = false;
     bool environment_cache_fast = false;
     POINT last_mouse{};
+    POINT entity_drag_last_mouse{};
 };
 
 AppState g;
+
+void stop_sound_preview() {
+    if (g.sound_preview_entity >= 0)
+        PlaySoundA(nullptr, nullptr, 0);
+    g.sound_preview_entity = -1;
+    g.sound_preview_bytes.clear();
+    if (g.sound_preview)
+        SetWindowTextA(g.sound_preview, "Play preview");
+}
 
 void invalidate_environment_cache() { g.environment_cache_valid = false; }
 
@@ -2307,22 +1949,17 @@ Asura_Vector_3 spawn_puppet_view_position(Asura_Vector_3 local_position, const E
     return add(entity_view_position(entity.position), spawn_puppet_view_vector(local_position, entity));
 }
 
-enum class LightGizmoPart { Range, Direction };
-
 struct LightGizmoLine {
     Asura_Vector_3 a{};
     Asura_Vector_3 b{};
-    LightGizmoPart part = LightGizmoPart::Range;
 };
 
 constexpr int kLightRangeSegments = 48;
-constexpr int kLightConeMeridians = 8;
-constexpr size_t kMaximumLightGizmoLines = kLightRangeSegments * 12 + kLightConeMeridians + 5;
+constexpr size_t kMaximumLightGizmoLines = kLightRangeSegments * 3;
 constexpr float kMaximumLightGizmoRange = 10000000.0f;
 
-void append_light_gizmo_line(std::vector<LightGizmoLine>* lines, Asura_Vector_3 a, Asura_Vector_3 b,
-                             LightGizmoPart part) {
-    lines->push_back({a, b, part});
+void append_light_gizmo_line(std::vector<LightGizmoLine>* lines, Asura_Vector_3 a, Asura_Vector_3 b) {
+    lines->push_back({a, b});
 }
 
 void append_range_globe(Asura_Vector_3 center, float range, std::vector<LightGizmoLine>* lines) {
@@ -2344,7 +1981,7 @@ void append_range_globe(Asura_Vector_3 center, float range, std::vector<LightGiz
                 p0 = {0, c0, s0};
                 p1 = {0, c1, s1};
             }
-            append_light_gizmo_line(lines, add(center, p0), add(center, p1), LightGizmoPart::Range);
+            append_light_gizmo_line(lines, add(center, p0), add(center, p1));
         }
     }
 }
@@ -2357,87 +1994,13 @@ void append_sound_gizmo(const Entity& entity, std::vector<LightGizmoLine>* lines
         append_range_globe(entity_view_position(entity.position), range, lines);
 }
 
-void append_light_gizmo(const Entity& entity, float marker_size, std::vector<LightGizmoLine>* lines) {
+void append_light_gizmo(const Entity& entity, std::vector<LightGizmoLine>* lines) {
     if (entity.kind != EntityKind::Light)
         return;
     const Asura_Vector_3 center = entity_view_position(entity.position);
     const float range = fabsf(entity.light.Range);
-    const Asura_Vector_3 direction = normalized(entity_view_direction(entity.light.Direction));
-    const bool has_direction = dot(direction, direction) > .5f;
-    const float angle = isfinite(entity.light.Angle) ? std::clamp(entity.light.Angle, 0.0f, 360.0f) : 360.0f;
-    if (isfinite(range) && range > .00001f && range <= kMaximumLightGizmoRange) {
-        constexpr float tau = 6.28318530717958647692f;
-        if (angle >= 359.999f) {
-            append_range_globe(center, range, lines);
-        } else if (has_direction && angle > .001f) {
-            Asura_Vector_3 side = cross(direction, {0, 1, 0});
-            if (dot(side, side) < .01f)
-                side = cross(direction, {1, 0, 0});
-            side = normalized(side);
-            const Asura_Vector_3 cap_up = normalized(cross(direction, side));
-            constexpr float d2r = 3.14159265358979323846f / 180.0f;
-            const float half_angle = angle * .5f * d2r;
-            const int latitude_rings = std::max(1, static_cast<int>(ceilf(angle / 45.0f)));
-            const int arc_segments = std::max(2, static_cast<int>(ceilf(kLightRangeSegments * angle / 720.0f)));
-
-            for (int latitude = 1; latitude <= latitude_rings; ++latitude) {
-                const float theta = half_angle * latitude / latitude_rings;
-                const float axial = cosf(theta) * range;
-                const float radial = sinf(theta) * range;
-                const Asura_Vector_3 ring_center = add(center, mul(direction, axial));
-                for (int segment = 0; segment < kLightRangeSegments; ++segment) {
-                    const float a0 = tau * segment / kLightRangeSegments;
-                    const float a1 = tau * (segment + 1) / kLightRangeSegments;
-                    const Asura_Vector_3 radial0 =
-                        add(mul(side, cosf(a0) * radial), mul(cap_up, sinf(a0) * radial));
-                    const Asura_Vector_3 radial1 =
-                        add(mul(side, cosf(a1) * radial), mul(cap_up, sinf(a1) * radial));
-                    append_light_gizmo_line(lines, add(ring_center, radial0), add(ring_center, radial1),
-                                            LightGizmoPart::Range);
-                }
-            }
-
-            for (int meridian = 0; meridian < kLightConeMeridians; ++meridian) {
-                const float around = tau * meridian / kLightConeMeridians;
-                const Asura_Vector_3 radial_axis =
-                    add(mul(side, cosf(around)), mul(cap_up, sinf(around)));
-                Asura_Vector_3 previous = add(center, mul(direction, range));
-                for (int segment = 1; segment <= arc_segments; ++segment) {
-                    const float theta = half_angle * segment / arc_segments;
-                    const Asura_Vector_3 point =
-                        add(center, add(mul(direction, cosf(theta) * range),
-                                        mul(radial_axis, sinf(theta) * range)));
-                    append_light_gizmo_line(lines, previous, point, LightGizmoPart::Range);
-                    previous = point;
-                }
-                append_light_gizmo_line(lines, center, previous, LightGizmoPart::Range);
-            }
-        } else if (has_direction) {
-            append_light_gizmo_line(lines, center, add(center, mul(direction, range)), LightGizmoPart::Range);
-        }
-    }
-
-    if (!has_direction)
-        return;
-    const float maximum_length = fmaxf(marker_size * 8.0f, g.mesh.radius * .2f);
-    const float arrow_length = isfinite(range) && range > 0
-                                   ? std::clamp(range * .2f, marker_size * 5.0f, maximum_length)
-                                   : maximum_length;
-    const Asura_Vector_3 tip = add(center, mul(direction, arrow_length));
-    append_light_gizmo_line(lines, center, tip, LightGizmoPart::Direction);
-
-    Asura_Vector_3 side = cross(direction, {0, 1, 0});
-    if (dot(side, side) < .01f)
-        side = cross(direction, {1, 0, 0});
-    side = normalized(side);
-    const Asura_Vector_3 arrow_up = normalized(cross(direction, side));
-    const float head_length = arrow_length * .22f;
-    const float head_width = head_length * .45f;
-    const Asura_Vector_3 head_base = sub(tip, mul(direction, head_length));
-    append_light_gizmo_line(lines, tip, add(head_base, mul(side, head_width)), LightGizmoPart::Direction);
-    append_light_gizmo_line(lines, tip, sub(head_base, mul(side, head_width)), LightGizmoPart::Direction);
-    append_light_gizmo_line(lines, tip, add(head_base, mul(arrow_up, head_width)), LightGizmoPart::Direction);
-    append_light_gizmo_line(lines, tip, sub(head_base, mul(arrow_up, head_width)), LightGizmoPart::Direction);
+    if (isfinite(range) && range > .00001f && range <= kMaximumLightGizmoRange)
+        append_range_globe(center, range, lines);
 }
 
 RECT viewport_rect() {
@@ -2480,27 +2043,54 @@ bool project_point(const Asura_Vector_3& p, POINT* screen, float* depth = nullpt
     return true;
 }
 
-bool ground_point_from_screen(int x, int y, Asura_Vector_3* point) {
+bool screen_ray(int x, int y, EnvironmentRay* ray) {
+    if (!ray)
+        return false;
     const RECT vr = viewport_rect();
     Asura_Vector_3 cam, right, up, forward;
     camera_axes(&cam, &right, &up, &forward);
     const float f = .85f * static_cast<float>(std::min(vr.right - vr.left, vr.bottom - vr.top));
+    if (f <= 0.0f)
+        return false;
     const float sx = (x - (vr.left + vr.right) * .5f) / f;
     const float sy = -(y - (vr.top + vr.bottom) * .5f) / f;
-    const Asura_Vector_3 ray = normalized(add(forward, add(mul(right, sx), mul(up, sy))));
-    if (fabsf(ray.y) < .00001f)
+    ray->origin = cam;
+    ray->direction = normalized(add(forward, add(mul(right, sx), mul(up, sy))));
+    return dot(ray->direction, ray->direction) > .5f;
+}
+
+bool environment_point_from_screen(int x, int y, Asura_Vector_3* game_point) {
+    EnvironmentRay ray{};
+    EnvironmentRayHit hit{};
+    if (!game_point || !screen_ray(x, y, &ray) || !g.environment_raycast.intersect(g.mesh, ray, &hit))
         return false;
-    const float t = -cam.y / ray.y;
-    if (t <= 0)
-        return false;
-    *point = add(cam, mul(ray, t));
+    // Mesh vertices are in editor/view coordinates; gameplay entities retain
+    // the target's negative-up Y convention.
+    *game_point = entity_view_position(hit.position);
     return true;
+}
+
+bool environment_occludes_view_position(const Asura_Vector_3& view_position) {
+    Asura_Vector_3 camera_position{}, right{}, up{}, forward{};
+    camera_axes(&camera_position, &right, &up, &forward);
+    const Asura_Vector_3 to_position = sub(view_position, camera_position);
+    const float distance_squared = dot(to_position, to_position);
+    if (distance_squared <= 1.0e-8f)
+        return false;
+    const float distance = sqrtf(distance_squared);
+    EnvironmentRayHit hit{};
+    const EnvironmentRay ray{camera_position, mul(to_position, 1.0f / distance)};
+    if (!g.environment_raycast.intersect(g.mesh, ray, &hit))
+        return false;
+    const float surface_epsilon = fmaxf(.01f, distance * 1.0e-4f);
+    return hit.distance + surface_epsilon < distance;
 }
 
 struct GpuVertex {
     DirectX::XMFLOAT3 position;
     DirectX::XMFLOAT3 normal;
     DirectX::XMFLOAT4 color;
+    DirectX::XMFLOAT2 uv;
 };
 
 struct SkyboxVertex {
@@ -2513,6 +2103,38 @@ struct SkyboxAnimationConstants {
     DirectX::XMFLOAT2 offset_b;
     DirectX::XMFLOAT4 tint;
 };
+
+struct EnvironmentMaterialConstants {
+    DirectX::XMFLOAT4 fallback_color;
+    float has_texture;
+    float has_material_color;
+    float render_mode;
+    float auxiliary_mode;
+};
+
+static_assert(sizeof(EnvironmentMaterialConstants) == 0x20,
+              "environment material constants must preserve HLSL register packing");
+
+EnvironmentMaterialConstants environment_material_constants(
+    DirectX::XMFLOAT4 fallback_color, bool has_texture, bool has_material_color,
+    float render_mode, float auxiliary_mode, bool alpha_test) {
+    (void)alpha_test;
+    return {fallback_color,
+            has_texture ? 1.0f : 0.0f,
+            has_material_color ? 1.0f : 0.0f,
+            render_mode,
+            auxiliary_mode};
+}
+
+struct EnvironmentViewConstants {
+    DirectX::XMFLOAT4 camera_position;
+    DirectX::XMFLOAT4 camera_right;
+    DirectX::XMFLOAT4 camera_up;
+    DirectX::XMFLOAT4 camera_forward;
+};
+
+static_assert(sizeof(EnvironmentViewConstants) == 0x40,
+              "environment view constants must preserve HLSL register packing");
 
 struct DdsPixelFormat {
     uint32_t size;
@@ -2550,6 +2172,38 @@ struct DdsHeaderDx10 {
     uint32_t misc_flags2;
 };
 
+struct GpuMaterialRange {
+    int32_t original_material_index = -1;
+    uint32_t start_index = 0;
+    uint32_t index_count = 0;
+    ID3D11ShaderResourceView* texture = nullptr;
+    uint32_t material_flags = 0;
+    uint32_t texture_flags = 0;
+    DirectX::XMFLOAT4 fallback_color{.32f, .39f, .43f, 1.0f};
+    bool has_material_color = false;
+    bool source_pc_material = false;
+};
+
+bool gpu_material_uses_alpha(const GpuMaterialRange& range) {
+    return range.texture && (range.material_flags & 0x2u) != 0;
+}
+
+bool gpu_material_is_solid_cutout(const GpuMaterialRange& range) {
+    // MCP2 ObjectHierarchy rendering uses TXFL bit 0x8 to distinguish a
+    // background-blended material from an opaque alpha-tested cutout. Keep
+    // target Env's genuinely composited passes out of this preview-only path:
+    // wet roads, additive surfaces, and sphere-map surfaces still need their
+    // original equations. Flag-0x4 solid fences stay cutouts; their target
+    // detail multipass is precisely what makes them blow out in this viewport.
+    constexpr uint32_t composited_material_flags = 0x1u | 0x80u | 0x4000u;
+    return range.source_pc_material && gpu_material_uses_alpha(range) &&
+           (range.texture_flags & 0x8u) == 0 &&
+           (range.material_flags & composited_material_flags) == 0;
+}
+
+constexpr float kEnvironmentRenderModeAlphaPrelight = 2.0f;
+constexpr float kEnvironmentRenderModeSolidCutout = 5.0f;
+
 struct GpuRenderer {
     ID3D11Device* device = nullptr;
     ID3D11DeviceContext* context = nullptr;
@@ -2559,6 +2213,8 @@ struct GpuRenderer {
     ID3D11DepthStencilView* depth_view = nullptr;
     ID3D11VertexShader* vertex_shader = nullptr;
     ID3D11PixelShader* pixel_shader = nullptr;
+    ID3D11PixelShader* environment_pixel_shader = nullptr;
+    ID3D11PixelShader* rain_pixel_shader = nullptr;
     ID3D11InputLayout* input_layout = nullptr;
     ID3D11VertexShader* skybox_vertex_shader = nullptr;
     ID3D11PixelShader* skybox_pixel_shader = nullptr;
@@ -2566,33 +2222,64 @@ struct GpuRenderer {
     ID3D11InputLayout* skybox_input_layout = nullptr;
     ID3D11Buffer* camera_buffer = nullptr;
     ID3D11Buffer* skybox_animation_buffer = nullptr;
+    ID3D11Buffer* environment_material_buffer = nullptr;
+    ID3D11Buffer* environment_view_buffer = nullptr;
     ID3D11Buffer* skybox_vertices = nullptr;
     ID3D11Buffer* skybox_cloud_vertices = nullptr;
     ID3D11Buffer* mesh_vertices = nullptr;
     ID3D11Buffer* mesh_indices = nullptr;
     ID3D11Buffer* puppet_vertices = nullptr;
     ID3D11Buffer* overlay_vertices = nullptr;
+    ID3D11Buffer* rain_vertices = nullptr;
     ID3D11RasterizerState* rasterizer = nullptr;
     ID3D11DepthStencilState* depth_enabled = nullptr;
     ID3D11DepthStencilState* depth_disabled = nullptr;
+    ID3D11DepthStencilState* depth_equal = nullptr;
     ID3D11DepthStencilState* skybox_depth = nullptr;
-    ID3D11BlendState* skybox_cloud_blend = nullptr;
+    ID3D11BlendState* alpha_blend = nullptr;
+    ID3D11BlendState* modulate2x_blend = nullptr;
+    ID3D11BlendState* additive_blend = nullptr;
+    ID3D11BlendState* reflection_blend = nullptr;
     ID3D11SamplerState* skybox_sampler = nullptr;
     ID3D11SamplerState* skybox_cloud_sampler = nullptr;
+    ID3D11SamplerState* environment_sampler = nullptr;
     ID3D11ShaderResourceView* skybox_faces[6]{};
     ID3D11ShaderResourceView* skybox_cloud = nullptr;
     ID3D11ShaderResourceView* white_texture = nullptr;
+    ID3D11ShaderResourceView* environment_splash = nullptr;
+    ID3D11ShaderResourceView* environment_detail = nullptr;
+    ID3D11ShaderResourceView* environment_spheremap = nullptr;
+    ID3D11ShaderResourceView* rain_texture = nullptr;
     uint32_t mesh_index_count = 0;
     uint32_t skybox_cloud_vertex_count = 0;
     uint32_t puppet_capacity = 0;
     uint32_t overlay_capacity = 0;
+    uint32_t rain_capacity = 0;
+    uint32_t rain_vertex_count = 0;
+    std::vector<GpuMaterialRange> material_ranges;
     uint32_t width = 0, height = 0;
     DirectX::XMFLOAT4 skybox_tint{1, 1, 1, 1};
+    bool environment_wet_weather = false;
+    bool alpha_tested_prelight_drawn = false;
+    bool solid_cutout_prelight_drawn = false;
+    bool composited_alpha_prelight_drawn = false;
+    bool rain_frame_drawn = false;
     bool skybox_active = false;
     bool ready = false;
 };
 
 GpuRenderer gpu;
+
+void refresh_scene_animation_timer() {
+    if (!g.window)
+        return;
+    const bool animated_clouds = g.document.skybox.draw_clouds && gpu.skybox_cloud;
+    const bool animated_rain = g.document.rain_enabled && gpu.rain_texture && gpu.rain_pixel_shader;
+    if (animated_clouds || animated_rain)
+        SetTimer(g.window, 2, 33, nullptr);
+    else
+        KillTimer(g.window, 2);
+}
 
 template <typename T> void gpu_release(T*& object) {
     if (object)
@@ -2605,6 +2292,18 @@ void gpu_release_skybox_textures() {
         gpu_release(face);
     gpu_release(gpu.skybox_cloud);
     gpu.skybox_active = false;
+}
+
+void gpu_release_environment_textures() {
+    for (GpuMaterialRange& range : gpu.material_ranges)
+        gpu_release(range.texture);
+    gpu_release(gpu.environment_splash);
+    gpu_release(gpu.environment_detail);
+    gpu_release(gpu.environment_spheremap);
+    gpu_release(gpu.rain_texture);
+    gpu.environment_wet_weather = false;
+    gpu.rain_vertex_count = 0;
+    gpu.rain_frame_drawn = false;
 }
 
 bool dds_format_layout(DXGI_FORMAT format, uint32_t* block_bytes, uint32_t* bytes_per_pixel) {
@@ -2634,15 +2333,15 @@ bool dds_format_layout(DXGI_FORMAT format, uint32_t* block_bytes, uint32_t* byte
 bool gpu_create_dds_view_from_memory(const uint8_t* bytes, size_t byte_count, const char* label,
                                      ID3D11ShaderResourceView** output, std::string* why) {
     *output = nullptr;
-    const char* source = label ? label : "embedded .PC skybox texture";
+    const char* source = label ? label : "embedded .PC texture";
     if (!bytes || byte_count < 4 + sizeof(DdsHeader) || byte_count > 512 * MiB) {
         if (why)
-            *why = std::string("Skybox texture is not a valid DDS file: ") + source;
+            *why = std::string("Texture is not a valid DDS file: ") + source;
         return false;
     }
     if (memcmp(bytes, "DDS ", 4) != 0) {
         if (why)
-            *why = std::string("Skybox texture does not contain DDS data: ") + source;
+            *why = std::string("Texture does not contain DDS data: ") + source;
         return false;
     }
     DdsHeader header{};
@@ -2650,7 +2349,7 @@ bool gpu_create_dds_view_from_memory(const uint8_t* bytes, size_t byte_count, co
     if (header.size != sizeof(DdsHeader) || header.pixel_format.size != sizeof(DdsPixelFormat) || !header.width ||
         !header.height || header.width > 16384 || header.height > 16384) {
         if (why)
-            *why = std::string("Skybox texture has an unsupported DDS header: ") + source;
+            *why = std::string("Texture has an unsupported DDS header: ") + source;
         return false;
     }
 
@@ -2661,7 +2360,7 @@ bool gpu_create_dds_view_from_memory(const uint8_t* bytes, size_t byte_count, co
     if ((header.pixel_format.flags & dds_four_cc) && header.pixel_format.four_cc == fourcc('D', 'X', '1', '0')) {
         if (byte_count < data_at + sizeof(DdsHeaderDx10)) {
             if (why)
-                *why = std::string("Skybox DDS DX10 header is truncated: ") + source;
+                *why = std::string("DDS DX10 header is truncated: ") + source;
             return false;
         }
         DdsHeaderDx10 dx10{};
@@ -2670,7 +2369,7 @@ bool gpu_create_dds_view_from_memory(const uint8_t* bytes, size_t byte_count, co
         if (dx10.resource_dimension != D3D11_RESOURCE_DIMENSION_TEXTURE2D || dx10.array_size != 1 ||
             (dx10.misc_flag & D3D11_RESOURCE_MISC_TEXTURECUBE)) {
             if (why)
-                *why = std::string("Skybox DDS must contain one 2D texture: ") + source;
+                *why = std::string("DDS must contain one 2D texture: ") + source;
             return false;
         }
         format = static_cast<DXGI_FORMAT>(dx10.format);
@@ -2699,7 +2398,7 @@ bool gpu_create_dds_view_from_memory(const uint8_t* bytes, size_t byte_count, co
     uint32_t block_bytes = 0, bytes_per_pixel = 0;
     if (!dds_format_layout(format, &block_bytes, &bytes_per_pixel)) {
         if (why)
-            *why = std::string("Skybox DDS pixel format is unsupported: ") + source;
+            *why = std::string("DDS pixel format is unsupported: ") + source;
         return false;
     }
     const uint32_t mip_count = std::clamp(header.mip_count ? header.mip_count : 1u, 1u, 15u);
@@ -2712,7 +2411,7 @@ bool gpu_create_dds_view_from_memory(const uint8_t* bytes, size_t byte_count, co
         const uint64_t size = row_pitch * rows;
         if (data_at > byte_count || row_pitch > 0xffffffffu || size > byte_count - data_at) {
             if (why)
-                *why = std::string("Skybox DDS mip data is truncated: ") + source;
+                *why = std::string("DDS mip data is truncated: ") + source;
             return false;
         }
         initial[mip].pSysMem = bytes + data_at;
@@ -2740,7 +2439,7 @@ bool gpu_create_dds_view_from_memory(const uint8_t* bytes, size_t byte_count, co
     gpu_release(texture);
     if (FAILED(view_result)) {
         if (why)
-            *why = std::string("Direct3D could not create the skybox texture: ") + source;
+            *why = std::string("Direct3D could not create the texture: ") + source;
         return false;
     }
     return true;
@@ -2751,13 +2450,13 @@ bool gpu_create_dds_view(const char* path, ID3D11ShaderResourceView** output, st
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file) {
         if (why)
-            *why = std::string("Could not open skybox texture: ") + path;
+            *why = std::string("Could not open DDS texture: ") + path;
         return false;
     }
     const std::streamoff end = file.tellg();
     if (end < 0 || end > static_cast<std::streamoff>(512 * MiB)) {
         if (why)
-            *why = std::string("Skybox texture is not a valid DDS file: ") + path;
+            *why = std::string("Texture is not a valid DDS file: ") + path;
         return false;
     }
     std::vector<uint8_t> bytes(static_cast<size_t>(end));
@@ -2765,10 +2464,484 @@ bool gpu_create_dds_view(const char* path, ID3D11ShaderResourceView** output, st
     file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
     if (!file) {
         if (why)
-            *why = std::string("Could not read skybox texture: ") + path;
+            *why = std::string("Could not read DDS texture: ") + path;
         return false;
     }
     return gpu_create_dds_view_from_memory(bytes.data(), bytes.size(), path, output, why);
+}
+
+struct PcEnvironmentMaterialBinding {
+    Str texture_name{};
+    int32_t texture_index = -1;
+    uint32_t flags = 0;
+    uint32_t texture_flags = 0;
+    uint32_t surface_type = 0;
+};
+
+DirectX::XMFLOAT4 material_map_color(uint32_t key) {
+    // Stable, high-contrast debug colours. Equal material/surface types keep
+    // equal colours while unrelated types remain distinguishable without a
+    // texture. The shader still multiplies this diagnostic tint by the exact
+    // baked vertex diffuse so authored prelighting remains visible.
+    uint32_t mixed = key + 0x9e3779b9u;
+    mixed ^= mixed >> 16;
+    mixed *= 0x7feb352du;
+    mixed ^= mixed >> 15;
+    mixed *= 0x846ca68bu;
+    mixed ^= mixed >> 16;
+    constexpr float scale = 0.45f / 255.0f;
+    return {.45f + ((mixed >> 16) & 0xff) * scale,
+            .45f + ((mixed >> 8) & 0xff) * scale,
+            .45f + (mixed & 0xff) * scale, 1.0f};
+}
+
+bool pc_environment_material_bindings(const ChunkList& chunks,
+                                      std::vector<PcEnvironmentMaterialBinding>* output, Error* err) {
+    output->clear();
+    RscfInfo environment{};
+    if (!find_pc_environment(chunks, &environment))
+        return fail(err, "the .PC contains no PC environment RSCF");
+
+    std::vector<Str> texture_names;
+    std::vector<uint32_t> texture_flags;
+    bool reached_environment = false;
+    for (uint32_t chunk_index = 0; chunk_index < chunks.count; ++chunk_index) {
+        const ChunkRef& chunk = chunks.chunks[chunk_index];
+        if (chunk.cid == ASURA_CHUNK_TEXTURENAMES) {
+            if (chunk.version > 3)
+                return fail(err, "the active PC TEXT chunk uses unsupported version %u", chunk.version);
+            if (chunk.size < sizeof(Asura_Chunk_TextureNames))
+                return fail(err, "the active PC TEXT chunk is truncated");
+            const uint32_t count = read_u32(chunk.data + sizeof(Asura_Chunk_Header));
+            if (count > chunk.size - sizeof(Asura_Chunk_TextureNames))
+                return fail(err, "the active PC TEXT count exceeds its chunk");
+            texture_names.clear();
+            texture_names.reserve(count);
+            texture_flags.assign(count, 0);
+            uint64_t at = sizeof(Asura_Chunk_TextureNames);
+            for (uint32_t texture_index = 0; texture_index < count; ++texture_index) {
+                if (at > chunk.size)
+                    return fail(err, "the active PC TEXT string table is truncated");
+                const Str name = padded_string_at(chunk.data, chunk.size, static_cast<uint32_t>(at));
+                if (!name.data)
+                    return fail(err, "the active PC TEXT string table is unterminated");
+                texture_names.push_back(name);
+                at = align_up(at + name.size + 1, 4);
+            }
+            // MCP2 0x441CE0 creates one implicit material per TEXT entry for
+            // v0-v2. TEXT v3 only replaces the texture conversion table and
+            // relies on a following MTRL chunk.
+            if (chunk.version < 3) {
+                output->assign(count, {});
+                for (uint32_t texture_index = 0; texture_index < count; ++texture_index) {
+                    (*output)[texture_index].texture_index = static_cast<int32_t>(texture_index);
+                    (*output)[texture_index].texture_name = texture_names[texture_index];
+                }
+            }
+        } else if (chunk.cid == ASURA_CHUNK_TEXTUREFLAGS) {
+            if (chunk.version > 1)
+                return fail(err, "the active PC TXFL chunk uses unsupported version %u", chunk.version);
+            const uint64_t values_at = sizeof(Asura_Chunk_Header) + sizeof(uint32_t);
+            if (chunk.size < values_at)
+                return fail(err, "the active PC TXFL chunk is truncated");
+            const uint32_t count = read_u32(chunk.data + sizeof(Asura_Chunk_Header));
+            if (count > (chunk.size - values_at) / sizeof(uint32_t) || count > texture_flags.size())
+                return fail(err, "the active PC TXFL table exceeds the active TEXT table");
+            for (uint32_t texture_index = 0; texture_index < count; ++texture_index) {
+                uint32_t value = read_u32(chunk.data + values_at + texture_index * sizeof(uint32_t));
+                if (!chunk.version) {
+                    if (texture_index < output->size())
+                        (*output)[texture_index].flags |= value & 0xDE87u;
+                    value &= 0xFFFF2178u;
+                }
+                texture_flags[texture_index] |= value;
+            }
+            for (PcEnvironmentMaterialBinding& binding : *output)
+                if (binding.texture_index >= 0 &&
+                    static_cast<uint32_t>(binding.texture_index) < texture_flags.size())
+                    binding.texture_flags = texture_flags[binding.texture_index];
+        } else if (chunk.cid == ASURA_CHUNK_MATERIAL) {
+            if (chunk.version > 1)
+                return fail(err, "the active PC MTRL chunk uses unsupported version %u", chunk.version);
+            if (chunk.size < sizeof(Asura_Chunk_Header) + sizeof(uint32_t))
+                return fail(err, "the active PC MTRL chunk is truncated");
+            const uint32_t count = read_u32(chunk.data + sizeof(Asura_Chunk_Header));
+            const uint32_t stride = chunk.version ? sizeof(Asura_PC_Material_V1) : 8u;
+            const uint64_t records_at = sizeof(Asura_Chunk_Header) + sizeof(uint32_t);
+            if (count > (chunk.size - records_at) / stride)
+                return fail(err, "the active PC MTRL record table is truncated");
+            output->assign(count, {});
+            for (uint32_t material_index = 0; material_index < count; ++material_index) {
+                const uint8_t* record = chunk.data + records_at + static_cast<uint64_t>(material_index) * stride;
+                PcEnvironmentMaterialBinding& binding = (*output)[material_index];
+                const int32_t texture_index = static_cast<int32_t>(read_u32(record));
+                binding.texture_index = texture_index;
+                binding.flags = read_u32(record + 4);
+                binding.surface_type = chunk.version ? read_u32(record + 8) : 0;
+                if (texture_index >= 0 && static_cast<uint32_t>(texture_index) < texture_names.size()) {
+                    binding.texture_name = texture_names[texture_index];
+                    binding.texture_flags = texture_flags[texture_index];
+                }
+            }
+        }
+
+        RscfInfo resource{};
+        if (rscf_info(chunk, &resource) && resource.payload == environment.payload) {
+            reached_environment = true;
+            break;
+        }
+    }
+    if (!reached_environment)
+        return fail(err, "the PC environment resource is absent from the chunk stream");
+    return true;
+}
+
+bool pc_texture_resource(const ChunkList& chunks, Str texture_name, RscfInfo* output);
+
+std::string parent_folder_of(const std::string& path) {
+    const size_t slash = path.find_last_of("\\/");
+    return slash == std::string::npos ? std::string{} : path.substr(0, slash);
+}
+
+bool gpu_load_global_texture(const char* relative_path, const std::string& level_path,
+                             ID3D11ShaderResourceView** output, std::string* why) {
+    if (*output)
+        return true;
+    char module_path[MAX_PATH * 4]{};
+    GetModuleFileNameA(nullptr, module_path, static_cast<DWORD>(sizeof(module_path)));
+    const std::string module_folder = parent_folder_of(module_path);
+    const std::string editor_root = parent_folder_of(parent_folder_of(module_folder));
+    const std::string level_folder = parent_folder_of(level_path);
+    const std::string level_parent = parent_folder_of(level_folder);
+    const std::string roots[] = {"", module_folder, editor_root, level_folder, level_parent};
+    std::string last_error;
+    for (const std::string& root : roots) {
+        const std::string candidate = root.empty() ? relative_path : root + "\\" + relative_path;
+        if (!file_exists(candidate.c_str()))
+            continue;
+        if (gpu_create_dds_view(candidate.c_str(), output, &last_error))
+            return true;
+    }
+    if (why)
+        *why = last_error.empty() ? std::string("Required target texture was not found: ") + relative_path
+                                  : last_error;
+    return false;
+}
+
+bool gpu_load_rain_sprite(const ChunkList* chunks, const std::string& level_path, std::string* why) {
+    const auto parent_folder = [](const std::string& path) {
+        const size_t slash = path.find_last_of("\\/");
+        return slash == std::string::npos ? std::string{} : path.substr(0, slash);
+    };
+    const size_t slash = level_path.find_last_of("\\/");
+    const std::string basename =
+        slash == std::string::npos ? level_path : level_path.substr(slash + 1);
+    std::vector<std::string> stems;
+    const auto append_stem = [&stems](std::string stem) {
+        if (!stem.empty() && std::find(stems.begin(), stems.end(), stem) == stems.end())
+            stems.push_back(std::move(stem));
+    };
+    for (size_t at = 0; at + 1 < basename.size(); ++at) {
+        const char first = basename[at], second = basename[at + 1];
+        if (first < '0' || first > '9' || second < '0' || second > '9')
+            continue;
+        std::string prefix = "rn_p" + basename.substr(at, 2);
+        if (at + 2 < basename.size()) {
+            char suffix = basename[at + 2];
+            if (suffix >= 'A' && suffix <= 'Z')
+                suffix += 'a' - 'A';
+            if (suffix >= 'a' && suffix <= 'z')
+                append_stem(prefix + suffix);
+        }
+        append_stem(prefix + 'a');
+        break;
+    }
+    append_stem("rn_p01a");
+    append_stem("droplet1");
+
+    char module_path[MAX_PATH * 4]{};
+    GetModuleFileNameA(nullptr, module_path, static_cast<DWORD>(sizeof(module_path)));
+    const std::string module_folder = parent_folder(module_path);
+    const std::string editor_root = parent_folder(parent_folder(module_folder));
+    const std::string level_folder = parent_folder(level_path);
+    const std::string level_parent = parent_folder(level_folder);
+    const std::string roots[] = {"", module_folder, editor_root, level_folder, level_parent};
+    std::string last_error;
+    for (const std::string& stem : stems) {
+        if (chunks) {
+            for (const char* extension : {".tga", ".dds"}) {
+                const std::string resource_name = "\\specialfx\\" + stem + extension;
+                RscfInfo resource{};
+                if (!pc_texture_resource(*chunks, str_from_c(resource_name.c_str()), &resource))
+                    continue;
+                if (gpu_create_dds_view_from_memory(resource.payload, resource.payload_size,
+                                                    resource_name.c_str(), &gpu.rain_texture,
+                                                    &last_error))
+                    return true;
+            }
+        }
+        for (const std::string& root : roots) {
+            const std::string candidate =
+                root.empty() ? "SpecialFX\\" + stem + ".dds"
+                             : root + "\\SpecialFX\\" + stem + ".dds";
+            if (file_exists(candidate.c_str()) &&
+                gpu_create_dds_view(candidate.c_str(), &gpu.rain_texture, &last_error))
+                return true;
+        }
+    }
+    if (why && why->empty())
+        *why = last_error.empty() ? "Rain is enabled, but no SpecialFX\\rn_p*.dds sprite was found."
+                                  : last_error;
+    return false;
+}
+
+bool gpu_load_pc_environment_textures(const std::string& pc_path, uint32_t* loaded_count,
+                                      uint32_t* missing_count, std::string* why) {
+    Error err{};
+    Arena arena{};
+    ChunkList chunks{};
+    std::vector<PcEnvironmentMaterialBinding> materials;
+    bool ok = arena_init(&arena, 8 * MiB, &err) && parse_chunks(pc_path.c_str(), &chunks, &arena, &err) &&
+              pc_environment_material_bindings(chunks, &materials, &err);
+    uint32_t loaded = 0, missing = 0;
+    std::string last_texture_error;
+    if (ok) {
+        // MCP2 0x442077 takes rain/wet weather from WTHR +0x15. Import
+        // resolves the last supported chunk; the editable document may now
+        // intentionally override its original value before export.
+        gpu.environment_wet_weather = g.document.rain_enabled;
+        if (gpu.environment_wet_weather) {
+            gpu_load_rain_sprite(&chunks, pc_path, &last_texture_error);
+            RscfInfo splash{};
+            if (pc_texture_resource(chunks, str_lit("\\specialfx\\splash.bmp"), &splash) ||
+                pc_texture_resource(chunks, str_lit("specialfx\\splash.bmp"), &splash)) {
+                std::string texture_error;
+                if (!gpu_create_dds_view_from_memory(splash.payload, splash.payload_size,
+                                                     "\\specialfx\\splash.bmp", &gpu.environment_splash,
+                                                     &texture_error))
+                    last_texture_error = std::move(texture_error);
+            }
+            // splash.bmp is a globally registered game-root asset and need not
+            // be packed into an individual level. The copied SpecialFX asset is
+            // DDS data, just like target type-2 texture resources, despite the
+            // original engine path retaining its .bmp extension.
+            if (!gpu.environment_splash) {
+                const auto parent_folder = [](const std::string& path) {
+                    const size_t slash = path.find_last_of("\\/");
+                    return slash == std::string::npos ? std::string{} : path.substr(0, slash);
+                };
+                char module_path[MAX_PATH * 4]{};
+                GetModuleFileNameA(nullptr, module_path, static_cast<DWORD>(sizeof(module_path)));
+                const std::string module_folder = parent_folder(module_path);
+                const std::string editor_root = parent_folder(parent_folder(module_folder));
+                const std::string pc_folder = parent_folder(pc_path);
+                const std::string pc_parent = parent_folder(pc_folder);
+                const std::string candidates[] = {
+                    "SpecialFX\\splash.dds",
+                    "SpecialFX\\splash.bmp",
+                    module_folder + "\\SpecialFX\\splash.dds",
+                    editor_root + "\\SpecialFX\\splash.dds",
+                    pc_folder + "\\SpecialFX\\splash.dds",
+                    pc_parent + "\\SpecialFX\\splash.dds",
+                };
+                for (const std::string& candidate : candidates) {
+                    if (candidate.empty() || !file_exists(candidate.c_str()))
+                        continue;
+                    std::string texture_error;
+                    if (gpu_create_dds_view(candidate.c_str(), &gpu.environment_splash, &texture_error)) {
+                        last_texture_error.clear();
+                        break;
+                    }
+                    last_texture_error = std::move(texture_error);
+                }
+            }
+            if (!gpu.environment_splash && last_texture_error.empty())
+                last_texture_error = "Wet WTHR is enabled, but SpecialFX\\splash.dds was not found.";
+        }
+        for (GpuMaterialRange& range : gpu.material_ranges) {
+            if (range.original_material_index < 0 ||
+                static_cast<uint32_t>(range.original_material_index) >= materials.size()) {
+                ++missing;
+                continue;
+            }
+            const PcEnvironmentMaterialBinding& material = materials[range.original_material_index];
+            range.source_pc_material = true;
+            range.material_flags = material.flags;
+            range.texture_flags = material.texture_flags;
+            if (!material.texture_name.size) {
+                ++missing;
+                continue;
+            }
+            RscfInfo resource{};
+            if (!pc_texture_resource(chunks, material.texture_name, &resource)) {
+                ++missing;
+                continue;
+            }
+            const std::string label(material.texture_name.data, material.texture_name.size);
+            std::string texture_error;
+            if (gpu_create_dds_view_from_memory(resource.payload, resource.payload_size, label.c_str(),
+                                                &range.texture, &texture_error)) {
+                ++loaded;
+            } else {
+                ++missing;
+                last_texture_error = std::move(texture_error);
+            }
+        }
+        const bool needs_detail = std::any_of(
+            gpu.material_ranges.begin(), gpu.material_ranges.end(),
+            [](const GpuMaterialRange& range) { return range.texture && (range.material_flags & 0x4u) != 0; });
+        const bool needs_spheremap = std::any_of(
+            gpu.material_ranges.begin(), gpu.material_ranges.end(),
+            [](const GpuMaterialRange& range) { return range.texture && (range.material_flags & 0x80u) != 0; });
+        std::string global_error;
+        if (needs_detail &&
+            !gpu_load_global_texture("GraphicNovel\\detail.dds", pc_path,
+                                     &gpu.environment_detail, &global_error))
+            last_texture_error = global_error;
+        global_error.clear();
+        if (needs_spheremap &&
+            !gpu_load_global_texture("SpecialFX\\spheremap1.dds", pc_path,
+                                     &gpu.environment_spheremap, &global_error))
+            last_texture_error = global_error;
+    }
+    if (loaded_count)
+        *loaded_count = loaded;
+    if (missing_count)
+        *missing_count = missing;
+    if (!ok && why)
+        *why = err.set ? err.message : "Could not resolve embedded PC environment materials.";
+    else if (!last_texture_error.empty() && why)
+        *why = last_texture_error;
+    unmap_file(&chunks.file);
+    arena_release(&arena);
+    return ok;
+}
+
+void gpu_apply_material_map_colors(const MaterialMap& materials) {
+    for (GpuMaterialRange& range : gpu.material_ranges) {
+        if (range.original_material_index < 0)
+            continue;
+        const uint32_t original = static_cast<uint32_t>(range.original_material_index);
+        const uint32_t ordinal = original >= 1000 ? original - 1000 : original;
+        constexpr uint32_t absent = 0xffffffffu;
+        const uint32_t surface_type =
+            material_override(materials, "surface_type_by_material_index", ordinal, absent);
+        range.material_flags =
+            material_override(materials, "transparency_flag_by_material_index", ordinal, 0);
+        // External maps have no target TXFL table. Their explicit flag-2
+        // entries still enter the common target Env alpha composition.
+        range.texture_flags = 0;
+        // Rich maps colour equal surface types alike. A simple name/index map
+        // still receives one stable colour per mapped material.
+        const uint32_t color_key = surface_type == absent ? ordinal ^ 0xa511e9b3u : surface_type;
+        range.fallback_color = material_map_color(color_key);
+        range.has_material_color = true;
+    }
+}
+
+bool gpu_reload_environment_textures(std::string* why = nullptr, uint32_t* loaded_count = nullptr,
+                                     uint32_t* missing_count = nullptr) {
+    gpu_release_environment_textures();
+    if (loaded_count)
+        *loaded_count = 0;
+    if (missing_count)
+        *missing_count = 0;
+    if (!gpu.ready || gpu.material_ranges.empty()) {
+        refresh_scene_animation_timer();
+        return true;
+    }
+    gpu.environment_wet_weather = g.document.rain_enabled;
+    for (GpuMaterialRange& range : gpu.material_ranges) {
+        range.material_flags = 0;
+        range.texture_flags = 0;
+        range.fallback_color = {.32f, .39f, .43f, 1.0f};
+        range.has_material_color = false;
+        range.source_pc_material = false;
+    }
+
+    const bool use_external_textures =
+        !g.document.material_map.empty() && !g.document.texture_dir.empty();
+    if (!use_external_textures && !g.document.source_pc_path.empty()) {
+        const bool loaded =
+            gpu_load_pc_environment_textures(g.document.source_pc_path, loaded_count, missing_count, why);
+        refresh_scene_animation_timer();
+        return loaded;
+    }
+    if (g.document.rain_enabled) {
+        const std::string& level_path = g.document.source_pc_path.empty()
+                                            ? g.document.obj_path
+                                            : g.document.source_pc_path;
+        gpu_load_rain_sprite(nullptr, level_path, why);
+    }
+    if (g.document.material_map.empty()) {
+        if (missing_count)
+            *missing_count = static_cast<uint32_t>(gpu.material_ranges.size());
+        refresh_scene_animation_timer();
+        return true;
+    }
+
+    Error err{};
+    Arena arena{};
+    MaterialMap materials{};
+    Config config{};
+    config.material_map = g.document.material_map.c_str();
+    Vec<DiskFile> files{};
+    bool ok = arena_init(&arena, 64 * MiB, &err) && load_material_map(config, &materials, &arena, &err);
+    bool texture_files_ready = false;
+    std::string last_texture_error;
+    if (ok)
+        gpu_apply_material_map_colors(materials);
+    if (ok && use_external_textures) {
+        texture_files_ready = list_files(g.document.texture_dir.c_str(), &arena, &files, &err);
+        if (!texture_files_ready)
+            last_texture_error = err.set ? err.message : "Could not enumerate the environment texture folder.";
+    }
+    uint32_t loaded = 0, missing = 0;
+    if (ok) {
+        for (GpuMaterialRange& range : gpu.material_ranges) {
+            if (!use_external_textures || !texture_files_ready || range.original_material_index < 0) {
+                ++missing;
+                continue;
+            }
+            const uint32_t original = static_cast<uint32_t>(range.original_material_index);
+            // Keep parity with append_textures: older editor output sometimes
+            // serialized the 1000-based runtime handle in this original-index
+            // slot, while the final target uses the zero-based ordinal.
+            const uint32_t ordinal = original >= 1000 ? original - 1000 : original;
+            const Str wanted = path_basename(material_texture_name(materials, ordinal));
+            const DiskFile* selected = nullptr;
+            for (uint32_t file_index = 0; file_index < files.count; ++file_index) {
+                const Str candidate = str_from_c(files.data[file_index].name);
+                if (str_ieq(wanted, candidate) || str_ieq(path_stem(wanted), path_stem(candidate))) {
+                    selected = &files.data[file_index];
+                    break;
+                }
+            }
+            if (!selected) {
+                ++missing;
+                continue;
+            }
+            std::string texture_error;
+            if (gpu_create_dds_view(selected->path, &range.texture, &texture_error))
+                ++loaded;
+            else {
+                ++missing;
+                last_texture_error = std::move(texture_error);
+            }
+        }
+    }
+    if (loaded_count)
+        *loaded_count = loaded;
+    if (missing_count)
+        *missing_count = missing;
+    if (!ok && why)
+        *why = err.set ? err.message : "Could not resolve environment materials.";
+    else if (!last_texture_error.empty() && why)
+        *why = last_texture_error;
+    unmap_file(&materials.file);
+    arena_release(&arena);
+    refresh_scene_animation_timer();
+    return ok;
 }
 
 bool find_skybox_texture(const std::string& directory, const char* stem, char* output, uint32_t output_size) {
@@ -2812,13 +2985,20 @@ bool find_skybox_texture(const std::string& directory, const char* stem, char* o
     return found;
 }
 
-bool gpu_rebuild_skybox_vertices(float orientation, bool back_uses_front_upside_down,
-                                 bool right_uses_left_upside_down, std::string* why);
+std::string skybox_texture_stem(const std::string& path) {
+    if (path.empty())
+        return {};
+    const Str source{path.data(), static_cast<uint32_t>(path.size())};
+    const Str stem = path_stem(path_basename(source));
+    return {stem.data, stem.size};
+}
+
+bool gpu_rebuild_skybox_vertices(float orientation, bool back_texture_is_front_upside_down,
+                                 bool right_texture_is_left_upside_down, std::string* why);
 
 bool gpu_load_skybox(const std::string& directory, std::string* why) {
-    if (g.window)
-        KillTimer(g.window, 2);
     gpu_release_skybox_textures();
+    refresh_scene_animation_timer();
     if (directory.empty())
         return true;
     if (!gpu.ready) {
@@ -2826,98 +3006,60 @@ bool gpu_load_skybox(const std::string& directory, std::string* why) {
             *why = "The Direct3D viewport is unavailable.";
         return false;
     }
-    if (!gpu_rebuild_skybox_vertices(3.107175588607788f, false, false, why))
+    if (!gpu_rebuild_skybox_vertices(g.document.skybox.orientation_radians,
+                                     g.document.skybox.back_texture_is_front_upside_down,
+                                     g.document.skybox.right_texture_is_left_upside_down, why))
         return false;
     gpu.skybox_tint = {1, 1, 1, 1};
-    // SKYB v7 slots: 0 is the empty lower face, 1..5 are the five
-    // static images, and 6..7 are the animated cloud textures.
-    const char* stems[] = {"fr", "lf", "bk", "rt", "up"};
+    // Resolve the document's own path stems first. Newer-permutation SKYBs
+    // commonly repeat three files with level-specific names instead of using
+    // the constructor's fr/lf/bk/rt/up convention.
+    constexpr const char* default_stems[] = {"", "fr", "lf", "bk", "rt", "up"};
     ID3D11ShaderResourceView* next[6]{};
     ID3D11ShaderResourceView* next_cloud = nullptr;
     uint32_t found = 0;
-    for (uint32_t i = 0; i < _countof(stems); ++i) {
+    for (uint32_t slot = 0; slot < _countof(next); ++slot) {
+        std::string stem = skybox_texture_stem(g.document.skybox.texture_paths[slot]);
+        if (stem.empty())
+            stem = default_stems[slot];
+        if (stem.empty())
+            continue;
         char path[MAX_PATH * 4]{};
-        if (!find_skybox_texture(directory, stems[i], path, sizeof(path)))
+        if (!find_skybox_texture(directory, stem.c_str(), path, sizeof(path)))
             continue;
         ++found;
-        if (!gpu_create_dds_view(path, &next[i + 1], why)) {
+        if (!gpu_create_dds_view(path, &next[slot], why)) {
             for (ID3D11ShaderResourceView*& face : next)
                 gpu_release(face);
             return false;
         }
     }
-    char cloud_path[MAX_PATH * 4]{};
-    if (find_skybox_texture(directory, "ch_04_sky", cloud_path, sizeof(cloud_path))) {
-        ++found;
-        if (!gpu_create_dds_view(cloud_path, &next_cloud, why)) {
-            for (ID3D11ShaderResourceView*& face : next)
-                gpu_release(face);
-            return false;
+    for (uint32_t slot = 6; slot < ASURA_SKYBOX_V5_V7_TEXTURE_PATH_COUNT && !next_cloud; ++slot) {
+        std::string stem = skybox_texture_stem(g.document.skybox.texture_paths[slot]);
+        if (stem.empty())
+            stem = "ch_04_sky";
+        char cloud_path[MAX_PATH * 4]{};
+        if (find_skybox_texture(directory, stem.c_str(), cloud_path, sizeof(cloud_path))) {
+            ++found;
+            if (!gpu_create_dds_view(cloud_path, &next_cloud, why)) {
+                for (ID3D11ShaderResourceView*& face : next)
+                    gpu_release(face);
+                return false;
+            }
         }
     }
     if (!found) {
         if (why)
-            *why = "The selected folder contains none of the expected DDS skybox textures "
-                   "(fr, lf, bk, rt, up, ch_04_sky; filename extensions are ignored).";
+            *why = "The selected folder contains no DDS files matching the SKYB path basenames or "
+                   "the default fr/lf/bk/rt/up/ch_04_sky names.";
         return false;
     }
     for (uint32_t i = 0; i < _countof(next); ++i)
         gpu.skybox_faces[i] = next[i];
     gpu.skybox_cloud = next_cloud;
     gpu.skybox_active = true;
-    if (gpu.skybox_cloud && g.window)
-        SetTimer(g.window, 2, 33, nullptr);
+    refresh_scene_animation_timer();
     return true;
-}
-
-struct PcSkyboxInfo {
-    float red = 255.0f;
-    float green = 255.0f;
-    float blue = 255.0f;
-    float orientation = 0.0f;
-    Str names[8]{};
-    bool draw_clouds = false;
-    bool back_uses_front_upside_down = false;
-    bool right_uses_left_upside_down = false;
-};
-
-bool pc_skybox_info(const ChunkList& chunks, PcSkyboxInfo* info, Error* err) {
-    for (uint32_t chunk_index = 0; chunk_index < chunks.count; ++chunk_index) {
-        const ChunkRef& chunk = chunks.chunks[chunk_index];
-        if (chunk.cid != ASURA_CHUNK_SKYBOX)
-            continue;
-        if (chunk.version != 7 || chunk.size < sizeof(Asura_Chunk_Header) + 16 + 8 * 4 + 12)
-            return fail(err, "the .PC SKYB chunk has an unsupported version or size");
-        const uint8_t* payload = chunk.data + sizeof(Asura_Chunk_Header);
-        const uint32_t payload_size = chunk.size - sizeof(Asura_Chunk_Header);
-        memcpy(&info->red, payload, sizeof(float));
-        memcpy(&info->green, payload + 4, sizeof(float));
-        memcpy(&info->blue, payload + 8, sizeof(float));
-        memcpy(&info->orientation, payload + 12, sizeof(float));
-        if (!isfinite(info->red) || !isfinite(info->green) || !isfinite(info->blue) ||
-            !isfinite(info->orientation))
-            return fail(err, "the .PC SKYB colour or orientation is invalid");
-        uint64_t at = 16;
-        for (uint32_t slot = 0; slot < 8; ++slot) {
-            if (at > 0xffffffffull)
-                return fail(err, "the .PC SKYB texture table is invalid");
-            info->names[slot] = padded_string_at(payload, payload_size, static_cast<uint32_t>(at));
-            if (!info->names[slot].data)
-                return fail(err, "the .PC SKYB texture table is truncated");
-            at = align_up(at + info->names[slot].size + 1, 4);
-            if (at > payload_size)
-                return fail(err, "the .PC SKYB texture table is truncated");
-        }
-        if (at + 12 > payload_size)
-            return fail(err, "the .PC SKYB flags are truncated");
-        uint32_t flags[3]{};
-        memcpy(flags, payload + at, sizeof(flags));
-        info->draw_clouds = flags[0] != 0;
-        info->back_uses_front_upside_down = flags[1] != 0;
-        info->right_uses_left_upside_down = flags[2] != 0;
-        return true;
-    }
-    return fail(err, "the .PC contains no SKYB chunk");
 }
 
 bool pc_texture_resource(const ChunkList& chunks, Str skybox_name, RscfInfo* output) {
@@ -2936,9 +3078,8 @@ bool pc_texture_resource(const ChunkList& chunks, Str skybox_name, RscfInfo* out
 }
 
 bool gpu_load_pc_skybox(const std::string& pc_path, std::string* why) {
-    if (g.window)
-        KillTimer(g.window, 2);
     gpu_release_skybox_textures();
+    refresh_scene_animation_timer();
     if (!gpu.ready) {
         if (why)
             *why = "The Direct3D viewport is unavailable.";
@@ -2952,8 +3093,9 @@ bool gpu_load_pc_skybox(const std::string& pc_path, std::string* why) {
     if (ok)
         ok = pc_skybox_info(chunks, &info, &err);
     if (ok)
-        ok = gpu_rebuild_skybox_vertices(info.orientation, info.back_uses_front_upside_down,
-                                         info.right_uses_left_upside_down, why);
+        ok = gpu_rebuild_skybox_vertices(info.orientation,
+                                         info.back_texture_is_front_upside_down,
+                                         info.right_texture_is_left_upside_down, why);
 
     ID3D11ShaderResourceView* next_faces[6]{};
     ID3D11ShaderResourceView* next_cloud = nullptr;
@@ -2994,8 +3136,7 @@ bool gpu_load_pc_skybox(const std::string& pc_path, std::string* why) {
                            std::clamp(info.green / 255.0f, 0.0f, 1.0f),
                            std::clamp(info.blue / 255.0f, 0.0f, 1.0f), 1.0f};
         gpu.skybox_active = true;
-        if (gpu.skybox_cloud && g.window)
-            SetTimer(g.window, 2, 33, nullptr);
+        refresh_scene_animation_timer();
     } else {
         for (ID3D11ShaderResourceView*& face : next_faces)
             gpu_release(face);
@@ -3021,18 +3162,28 @@ void gpu_shutdown() {
         gpu.context->ClearState();
     gpu_release_targets();
     gpu_release_skybox_textures();
+    gpu_release_environment_textures();
+    gpu.material_ranges.clear();
     gpu_release(gpu.white_texture);
+    gpu_release(gpu.environment_sampler);
     gpu_release(gpu.skybox_cloud_sampler);
     gpu_release(gpu.skybox_sampler);
-    gpu_release(gpu.skybox_cloud_blend);
+    gpu_release(gpu.modulate2x_blend);
+    gpu_release(gpu.reflection_blend);
+    gpu_release(gpu.additive_blend);
+    gpu_release(gpu.alpha_blend);
     gpu_release(gpu.skybox_depth);
+    gpu_release(gpu.depth_equal);
     gpu_release(gpu.skybox_cloud_vertices);
     gpu_release(gpu.skybox_vertices);
     gpu_release(gpu.skybox_animation_buffer);
+    gpu_release(gpu.environment_view_buffer);
+    gpu_release(gpu.environment_material_buffer);
     gpu_release(gpu.skybox_input_layout);
     gpu_release(gpu.skybox_cloud_pixel_shader);
     gpu_release(gpu.skybox_pixel_shader);
     gpu_release(gpu.skybox_vertex_shader);
+    gpu_release(gpu.rain_vertices);
     gpu_release(gpu.overlay_vertices);
     gpu_release(gpu.puppet_vertices);
     gpu_release(gpu.mesh_indices);
@@ -3042,6 +3193,8 @@ void gpu_shutdown() {
     gpu_release(gpu.rasterizer);
     gpu_release(gpu.camera_buffer);
     gpu_release(gpu.input_layout);
+    gpu_release(gpu.rain_pixel_shader);
+    gpu_release(gpu.environment_pixel_shader);
     gpu_release(gpu.pixel_shader);
     gpu_release(gpu.vertex_shader);
     gpu_release(gpu.swap_chain);
@@ -3082,8 +3235,8 @@ bool gpu_resize(uint32_t width, uint32_t height) {
     return true;
 }
 
-bool gpu_rebuild_skybox_vertices(float orientation, bool back_uses_front_upside_down,
-                                 bool right_uses_left_upside_down, std::string* why) {
+bool gpu_rebuild_skybox_vertices(float orientation, bool back_texture_is_front_upside_down,
+                                 bool right_texture_is_left_upside_down, std::string* why) {
     if (!gpu.device || !isfinite(orientation)) {
         if (why)
             *why = "The .PC SKYB orientation is invalid.";
@@ -3091,7 +3244,7 @@ bool gpu_rebuild_skybox_vertices(float orientation, bool back_uses_front_upside_
     }
 
     // SniperElite.exe sub_49D000 uses these eight corners and six face
-    // quads. The two version-7 compatibility flags permute face vertices
+    // quads. Its version-gated compatibility flags permute face vertices
     // while retaining the fixed UVs; applying the equivalent UV flips here
     // preserves winding and reproduces the target mapping.
     const Asura_Vector_3 target_corners[] = {{-1, 1, -1}, {-1, 1, 1}, {1, 1, 1}, {1, 1, -1},
@@ -3105,11 +3258,11 @@ bool gpu_rebuild_skybox_vertices(float orientation, bool back_uses_front_upside_
     for (uint32_t face = 0; face < 6; ++face) {
         DirectX::XMFLOAT2 uv[4]{};
         memcpy(uv, base_uv, sizeof(uv));
-        if (right_uses_left_upside_down) {
+        if (right_texture_is_left_upside_down) {
             if (face == 2)
                 for (DirectX::XMFLOAT2& item : uv)
                     item.x = 1.0f - item.x;
-        } else if (back_uses_front_upside_down) {
+        } else if (back_texture_is_front_upside_down) {
             if (face == 0) {
                 for (DirectX::XMFLOAT2& item : uv)
                     item.x = 1.0f - item.x;
@@ -3175,13 +3328,21 @@ bool gpu_init(HWND viewport) {
     }
     static const char shader_source[] = R"(
 cbuffer CameraBuffer : register(b0) { float4x4 viewProjection; };
-struct VSInput { float3 position : POSITION; float3 normal : NORMAL; float4 color : COLOR; };
-struct VSOutput { float4 position : SV_POSITION; float3 normal : NORMAL; float4 color : COLOR; };
+struct VSInput { float3 position : POSITION; float3 normal : NORMAL; float4 color : COLOR; float2 uv : TEXCOORD; };
+struct VSOutput {
+    float4 position : SV_POSITION;
+    float3 normal : NORMAL;
+    float4 color : COLOR;
+    float2 uv : TEXCOORD0;
+    float3 worldPosition : TEXCOORD1;
+};
 VSOutput VSMain(VSInput input) {
     VSOutput output;
     output.position = mul(float4(input.position, 1.0), viewProjection);
     output.normal = input.normal;
     output.color = input.color;
+    output.uv = input.uv;
+    output.worldPosition = input.position;
     return output;
 }
 float4 PSMain(VSOutput input) : SV_TARGET {
@@ -3192,6 +3353,97 @@ float4 PSMain(VSOutput input) : SV_TARGET {
                            ? input.color.rgb
                            : float3(0.32, 0.39, 0.43);
     return float4(baseColor * light, 1.0);
+}
+Texture2D environmentTexture : register(t2);
+Texture2D environmentAuxiliary : register(t3);
+Texture2D rainTexture : register(t4);
+SamplerState environmentSampler : register(s2);
+cbuffer EnvironmentMaterialBuffer : register(b2) {
+    float4 materialFallbackColor;
+    float materialHasTexture;
+    float materialHasColor;
+    float materialRenderMode;
+    float materialAuxiliaryMode;
+};
+cbuffer EnvironmentViewBuffer : register(b3) {
+    float4 environmentCameraPosition;
+    float4 environmentCameraRight;
+    float4 environmentCameraUp;
+    float4 environmentCameraForward;
+};
+float4 EnvPSMain(VSOutput input) : SV_TARGET {
+    // The target's default gamma option (50) produces an identity hardware
+    // ramp. Baked prelight therefore reaches the texture combiner unchanged.
+    float3 diffuse = saturate(input.color.rgb);
+    float4 albedo = materialHasTexture > 0.5
+                        ? environmentTexture.Sample(environmentSampler, input.uv)
+                        : float4(1.0, 1.0, 1.0, 1.0);
+    if (materialHasTexture < 0.5)
+        return materialHasColor > 0.5
+                   ? float4(materialFallbackColor.rgb * diffuse, 1.0)
+                   : float4(diffuse, 1.0);
+    if (materialRenderMode < 0.5)
+        return float4(diffuse, 1.0);
+    if (materialRenderMode < 1.5) {
+        float3 source = albedo.rgb;
+        if (materialAuxiliaryMode > 1.5) {
+            // Material flag 0x4: the target samples GraphicNovel/detail.dds
+            // through a 32x texture matrix and applies stage-1 MODULATE2X.
+            float3 detail = environmentAuxiliary.Sample(environmentSampler, input.uv * 32.0).rgb;
+            source = saturate(2.0 * source * detail);
+        } else if (materialAuxiliaryMode > 0.5) {
+            // MCP2 mode 10: stage 1 MODULATE2X with the WTHR-gated splash
+            // texture, transformed as uv*2+offset. The existing framebuffer
+            // DESTCOLOR/SRCCOLOR blend supplies the second factor of two.
+            float3 splash = environmentAuxiliary.Sample(
+                environmentSampler, input.uv * 2.0 + materialFallbackColor.xy).rgb;
+            source = saturate(2.0 * source * splash);
+        }
+        return float4(source, 1.0);
+    }
+    // Mode 2 is target combiner 13: baked diffuse RGB and texture-only alpha.
+    // The alpha test rejects holes. Target-composited materials retain texture
+    // alpha for SRC_ALPHA/INV_SRC_ALPHA; plain solid cutouts use the same shader
+    // with blending disabled, so texture alpha acts only as the coverage mask.
+    // Mode 1 supplies texture RGB to the later equal-depth modulation pass.
+    if (materialRenderMode < 2.5) {
+        if (albedo.a <= 10.0 / 255.0)
+            discard;
+        return float4(diffuse, albedo.a);
+    }
+    // Material flag 0x1 replays the base texture with SRC_ALPHA/ONE.
+    if (materialRenderMode < 3.5)
+        return albedo;
+
+    if (materialRenderMode < 4.5) {
+        // Material flag 0x80 uses D3DTSS_TCI_CAMERASPACEREFLECTIONVECTOR and
+        // the target's (0.5,-0.5)+(0.5,0.5) sphere-map matrix. Combiner 12
+        // blends the sphere texture over white by the stage-0 base-texture
+        // alpha carried in CURRENT before DESTCOLOR/ZERO framebuffer blending.
+        float3 toEye = normalize(environmentCameraPosition.xyz - input.worldPosition);
+        float3 reflected = reflect(-toEye, normalize(input.normal));
+        float2 sphereUv = float2(dot(reflected, environmentCameraRight.xyz) * 0.5 + 0.5,
+                                 dot(reflected, environmentCameraUp.xyz) * -0.5 + 0.5);
+        float4 sphere = environmentAuxiliary.Sample(environmentSampler, sphereUv);
+        return float4(lerp(float3(1.0, 1.0, 1.0), sphere.rgb, albedo.a), 1.0);
+    }
+
+    // Mode 5 is the solid-cutout preview. MCP2's ObjectHierarchy path selects
+    // combiner 1 (MODULATE2X texture/diffuse), alpha-tests at 10/255, and keeps
+    // blending disabled. The equivalent Environment replay is combiner 8 with
+    // DESTCOLOR/SRCCOLOR. Both produce this exact 2*texture*prelight result.
+    if (albedo.a <= 10.0 / 255.0)
+        discard;
+    return float4(saturate(2.0 * albedo.rgb * diffuse), 1.0);
+}
+float4 RainPSMain(VSOutput input) : SV_TARGET {
+    // The original rn_p sprites contain horizontal streaks; the particle
+    // emitter rotates them into falling droplets when building its billboards.
+    float4 streak = rainTexture.Sample(environmentSampler,
+                                       float2(input.uv.y, input.uv.x));
+    float alpha = streak.a * input.color.a;
+    clip(alpha - 0.012);
+    return float4(streak.rgb * input.color.rgb, alpha);
 }
 Texture2D skyboxTexture : register(t0);
 Texture2D skyboxCloud : register(t1);
@@ -3224,7 +3476,8 @@ float4 SkyCloudPSMain(SkyVSOutput input) : SV_TARGET {
     return float4(cloudColour, horizonFade * 0.72);
 }
 )";
-    ID3DBlob *vs_blob = nullptr, *ps_blob = nullptr, *errors = nullptr;
+    ID3DBlob *vs_blob = nullptr, *ps_blob = nullptr, *environment_ps_blob = nullptr,
+             *rain_ps_blob = nullptr, *errors = nullptr;
     result = D3DCompile(shader_source, sizeof(shader_source) - 1, nullptr, nullptr, nullptr, "VSMain", "vs_4_0",
                         D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vs_blob, &errors);
     gpu_release(errors);
@@ -3236,12 +3489,29 @@ float4 SkyCloudPSMain(SkyVSOutput input) : SV_TARGET {
     result = D3DCompile(shader_source, sizeof(shader_source) - 1, nullptr, nullptr, nullptr, "PSMain", "ps_4_0",
                         D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &ps_blob, &errors);
     gpu_release(errors);
+    if (SUCCEEDED(result))
+        result = D3DCompile(shader_source, sizeof(shader_source) - 1, nullptr, nullptr, nullptr, "EnvPSMain", "ps_4_0",
+                            D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &environment_ps_blob, &errors);
+    gpu_release(errors);
+    if (SUCCEEDED(result))
+        result = D3DCompile(shader_source, sizeof(shader_source) - 1, nullptr, nullptr, nullptr,
+                            "RainPSMain", "ps_4_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
+                            &rain_ps_blob, &errors);
+    gpu_release(errors);
     if (FAILED(result) || FAILED(gpu.device->CreateVertexShader(vs_blob->GetBufferPointer(), vs_blob->GetBufferSize(),
                                                                 nullptr, &gpu.vertex_shader)) ||
         FAILED(gpu.device->CreatePixelShader(ps_blob->GetBufferPointer(), ps_blob->GetBufferSize(), nullptr,
-                                             &gpu.pixel_shader))) {
+                                             &gpu.pixel_shader)) ||
+        FAILED(gpu.device->CreatePixelShader(environment_ps_blob->GetBufferPointer(),
+                                             environment_ps_blob->GetBufferSize(), nullptr,
+                                             &gpu.environment_pixel_shader)) ||
+        FAILED(gpu.device->CreatePixelShader(rain_ps_blob->GetBufferPointer(),
+                                             rain_ps_blob->GetBufferSize(), nullptr,
+                                             &gpu.rain_pixel_shader))) {
         gpu_release(vs_blob);
         gpu_release(ps_blob);
+        gpu_release(environment_ps_blob);
+        gpu_release(rain_ps_blob);
         gpu_shutdown();
         return false;
     }
@@ -3249,11 +3519,14 @@ float4 SkyCloudPSMain(SkyVSOutput input) : SV_TARGET {
         {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, offsetof(GpuVertex, position), D3D11_INPUT_PER_VERTEX_DATA, 0},
         {"NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, offsetof(GpuVertex, normal), D3D11_INPUT_PER_VERTEX_DATA, 0},
         {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, offsetof(GpuVertex, color), D3D11_INPUT_PER_VERTEX_DATA, 0},
+        {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, offsetof(GpuVertex, uv), D3D11_INPUT_PER_VERTEX_DATA, 0},
     };
     result = gpu.device->CreateInputLayout(elements, _countof(elements), vs_blob->GetBufferPointer(),
                                            vs_blob->GetBufferSize(), &gpu.input_layout);
     gpu_release(vs_blob);
     gpu_release(ps_blob);
+    gpu_release(environment_ps_blob);
+    gpu_release(rain_ps_blob);
     if (FAILED(result)) {
         gpu_shutdown();
         return false;
@@ -3300,7 +3573,9 @@ float4 SkyCloudPSMain(SkyVSOutput input) : SV_TARGET {
         return false;
     }
 
-    if (!gpu_rebuild_skybox_vertices(3.107175588607788f, false, false, nullptr)) {
+    if (!gpu_rebuild_skybox_vertices(g.document.skybox.orientation_radians,
+                                     g.document.skybox.back_texture_is_front_upside_down,
+                                     g.document.skybox.right_texture_is_left_upside_down, nullptr)) {
         gpu_shutdown();
         return false;
     }
@@ -3371,6 +3646,10 @@ float4 SkyCloudPSMain(SkyVSOutput input) : SV_TARGET {
         gpu_shutdown();
         return false;
     }
+    if (FAILED(gpu.device->CreateSamplerState(&sampler_desc, &gpu.environment_sampler))) {
+        gpu_shutdown();
+        return false;
+    }
     D3D11_BUFFER_DESC constant_desc{};
     constant_desc.ByteWidth = sizeof(DirectX::XMFLOAT4X4);
     constant_desc.Usage = D3D11_USAGE_DEFAULT;
@@ -3381,6 +3660,16 @@ float4 SkyCloudPSMain(SkyVSOutput input) : SV_TARGET {
     }
     constant_desc.ByteWidth = sizeof(SkyboxAnimationConstants);
     if (FAILED(gpu.device->CreateBuffer(&constant_desc, nullptr, &gpu.skybox_animation_buffer))) {
+        gpu_shutdown();
+        return false;
+    }
+    constant_desc.ByteWidth = sizeof(EnvironmentMaterialConstants);
+    if (FAILED(gpu.device->CreateBuffer(&constant_desc, nullptr, &gpu.environment_material_buffer))) {
+        gpu_shutdown();
+        return false;
+    }
+    constant_desc.ByteWidth = sizeof(EnvironmentViewConstants);
+    if (FAILED(gpu.device->CreateBuffer(&constant_desc, nullptr, &gpu.environment_view_buffer))) {
         gpu_shutdown();
         return false;
     }
@@ -3402,6 +3691,12 @@ float4 SkyCloudPSMain(SkyVSOutput input) : SV_TARGET {
         return false;
     }
     depth_desc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+    depth_desc.DepthFunc = D3D11_COMPARISON_EQUAL;
+    if (FAILED(gpu.device->CreateDepthStencilState(&depth_desc, &gpu.depth_equal))) {
+        gpu_shutdown();
+        return false;
+    }
+    depth_desc.DepthFunc = D3D11_COMPARISON_LESS_EQUAL;
     if (FAILED(gpu.device->CreateDepthStencilState(&depth_desc, &gpu.skybox_depth))) {
         gpu_shutdown();
         return false;
@@ -3415,7 +3710,37 @@ float4 SkyCloudPSMain(SkyVSOutput input) : SV_TARGET {
     cloud_blend_desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
     cloud_blend_desc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
     cloud_blend_desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
-    if (FAILED(gpu.device->CreateBlendState(&cloud_blend_desc, &gpu.skybox_cloud_blend))) {
+    if (FAILED(gpu.device->CreateBlendState(&cloud_blend_desc, &gpu.alpha_blend))) {
+        gpu_shutdown();
+        return false;
+    }
+    D3D11_BLEND_DESC modulate_blend_desc{};
+    modulate_blend_desc.RenderTarget[0].BlendEnable = TRUE;
+    modulate_blend_desc.RenderTarget[0].SrcBlend = D3D11_BLEND_DEST_COLOR;
+    modulate_blend_desc.RenderTarget[0].DestBlend = D3D11_BLEND_SRC_COLOR;
+    modulate_blend_desc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+    modulate_blend_desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+    modulate_blend_desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
+    modulate_blend_desc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    modulate_blend_desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    if (FAILED(gpu.device->CreateBlendState(&modulate_blend_desc, &gpu.modulate2x_blend))) {
+        gpu_shutdown();
+        return false;
+    }
+    D3D11_BLEND_DESC additive_blend_desc = cloud_blend_desc;
+    additive_blend_desc.RenderTarget[0].DestBlend = D3D11_BLEND_ONE;
+    additive_blend_desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ONE;
+    if (FAILED(gpu.device->CreateBlendState(&additive_blend_desc, &gpu.additive_blend))) {
+        gpu_shutdown();
+        return false;
+    }
+    D3D11_BLEND_DESC reflection_blend_desc = modulate_blend_desc;
+    reflection_blend_desc.RenderTarget[0].SrcBlend = D3D11_BLEND_DEST_COLOR;
+    // Target blend mode 3 (sub_48F7A0): SRC=DESTCOLOR, DEST=ZERO.
+    // The sphere-map pass modulates the existing framebuffer; it does not add
+    // another copy of it.
+    reflection_blend_desc.RenderTarget[0].DestBlend = D3D11_BLEND_ZERO;
+    if (FAILED(gpu.device->CreateBlendState(&reflection_blend_desc, &gpu.reflection_blend))) {
         gpu_shutdown();
         return false;
     }
@@ -3431,30 +3756,58 @@ float4 SkyCloudPSMain(SkyVSOutput input) : SV_TARGET {
 }
 
 bool gpu_upload_mesh() {
+    gpu_release_environment_textures();
+    gpu.material_ranges.clear();
     gpu_release(gpu.mesh_indices);
     gpu_release(gpu.mesh_vertices);
     gpu.mesh_index_count = 0;
     if (!gpu.ready || g.mesh.positions.empty() || g.mesh.faces.empty())
         return gpu.ready;
-    std::vector<Asura_Vector_3> normals(g.mesh.positions.size());
+    std::vector<Asura_Vector_3> fallback_normals(g.mesh.positions.size());
+    std::vector<uint32_t> face_order(g.mesh.faces.size());
+    for (uint32_t face_index = 0; face_index < face_order.size(); ++face_index)
+        face_order[face_index] = face_index;
+    std::stable_sort(face_order.begin(), face_order.end(), [](uint32_t a, uint32_t b) {
+        const int32_t material_a = a < g.mesh.face_materials.size() ? g.mesh.face_materials[a] : -1;
+        const int32_t material_b = b < g.mesh.face_materials.size() ? g.mesh.face_materials[b] : -1;
+        return material_a < material_b;
+    });
     std::vector<uint32_t> indices;
     indices.reserve(g.mesh.faces.size() * 3);
-    for (const auto& face : g.mesh.faces) {
+    int32_t previous_material = INT32_MIN;
+    for (uint32_t face_index : face_order) {
+        const auto& face = g.mesh.faces[face_index];
         const Asura_Vector_3 ab = sub(g.mesh.positions[face[1]], g.mesh.positions[face[0]]);
         const Asura_Vector_3 ac = sub(g.mesh.positions[face[2]], g.mesh.positions[face[0]]);
         const Asura_Vector_3 n = cross(ab, ac);
-        normals[face[0]] = add(normals[face[0]], n);
-        normals[face[1]] = add(normals[face[1]], n);
-        normals[face[2]] = add(normals[face[2]], n);
+        fallback_normals[face[0]] = add(fallback_normals[face[0]], n);
+        fallback_normals[face[1]] = add(fallback_normals[face[1]], n);
+        fallback_normals[face[2]] = add(fallback_normals[face[2]], n);
+        const int32_t material = face_index < g.mesh.face_materials.size() ? g.mesh.face_materials[face_index] : -1;
+        if (gpu.material_ranges.empty() || material != previous_material) {
+            gpu.material_ranges.push_back(
+                {material, static_cast<uint32_t>(indices.size()), 0, nullptr});
+            previous_material = material;
+        }
         indices.push_back(face[0]);
         indices.push_back(face[1]);
         indices.push_back(face[2]);
+        gpu.material_ranges.back().index_count += 3;
     }
     std::vector<GpuVertex> vertices(g.mesh.positions.size());
     for (size_t i = 0; i < vertices.size(); ++i) {
-        const Asura_Vector_3 n = normalized(normals[i]);
+        Asura_Vector_3 n = i < g.mesh.normals.size() ? normalized(g.mesh.normals[i]) : Asura_Vector_3{};
+        if (dot(n, n) < .5f)
+            n = normalized(fallback_normals[i]);
+        const Asura_Vector_2 uv = i < g.mesh.texcoords.size() ? g.mesh.texcoords[i] : Asura_Vector_2{};
+        const uint32_t diffuse = i < g.mesh.diffuse_abgr.size() ? g.mesh.diffuse_abgr[i] : 0xff52636du;
+        constexpr float inverse_byte = 1.0f / 255.0f;
+        const DirectX::XMFLOAT4 color{((diffuse >> 16) & 0xff) * inverse_byte,
+                                      ((diffuse >> 8) & 0xff) * inverse_byte,
+                                      (diffuse & 0xff) * inverse_byte,
+                                      ((diffuse >> 24) & 0xff) * inverse_byte};
         vertices[i] = {{g.mesh.positions[i].x, g.mesh.positions[i].y, g.mesh.positions[i].z}, {n.x, n.y, n.z},
-                       {0, 0, 0, 0}};
+                       color, {uv.x, uv.y}};
     }
     if (vertices.size() > 0xffffffffu / sizeof(GpuVertex) || indices.size() > 0xffffffffu / sizeof(uint32_t))
         return false;
@@ -3475,6 +3828,9 @@ bool gpu_upload_mesh() {
         return false;
     }
     gpu.mesh_index_count = static_cast<uint32_t>(indices.size());
+    // Missing maps/folders/files deliberately leave null SRVs. The render path
+    // binds white in that case, exposing the exact prelit vertex diffuse.
+    gpu_reload_environment_textures();
     return true;
 }
 
@@ -3511,6 +3867,79 @@ bool gpu_update_dynamic_vertices(ID3D11Buffer** buffer, uint32_t* capacity,
     return true;
 }
 
+std::vector<GpuVertex> build_gpu_rain_vertices(const Asura_Vector_3& camera_position,
+                                               const Asura_Vector_3& right,
+                                               const Asura_Vector_3& up,
+                                               const Asura_Vector_3& forward,
+                                               float vertical_fov, float aspect,
+                                               float animation_seconds) {
+    constexpr uint32_t layer_count = 6;
+    const float nearest = fmaxf(g.camera.distance * .002f,
+                                std::clamp(g.camera.distance * .055f, 1.5f, 12.0f));
+    std::vector<GpuVertex> vertices;
+    vertices.reserve(layer_count * 6);
+    for (int layer = layer_count - 1; layer >= 0; --layer) {
+        // sub_41D4D0 doubles each camera-centered emitter layer's distance.
+        const float distance = nearest * static_cast<float>(1u << layer);
+        const Asura_Vector_3 center = add(camera_position, mul(forward, distance));
+        const float half_height = distance * tanf(vertical_fov * .5f) * 1.08f;
+        const float half_width = half_height * aspect;
+        const Asura_Vector_3 horizontal = mul(right, half_width);
+        const Asura_Vector_3 vertical = mul(up, half_height);
+        const Asura_Vector_3 top_left = add(sub(center, horizontal), vertical);
+        const Asura_Vector_3 top_right = add(add(center, horizontal), vertical);
+        const Asura_Vector_3 bottom_right = sub(add(center, horizontal), vertical);
+        const Asura_Vector_3 bottom_left = sub(sub(center, horizontal), vertical);
+        const float tile = 1.0f + static_cast<float>(layer) * .13f;
+        const float u = static_cast<float>(layer) * .173f;
+        const float v = static_cast<float>(layer) * .311f -
+                        animation_seconds * (.72f + static_cast<float>(layer) * .14f);
+        const DirectX::XMFLOAT4 color{.91f, .95f, 1.0f,
+                                     .68f - static_cast<float>(layer) * .055f};
+        const auto vertex = [color](Asura_Vector_3 position, float x, float y) {
+            return GpuVertex{{position.x, position.y, position.z},
+                             {0.0f, -1.0f, 0.0f}, color, {x, y}};
+        };
+        const GpuVertex a = vertex(top_left, u, v);
+        const GpuVertex b = vertex(top_right, u + tile, v);
+        const GpuVertex c = vertex(bottom_right, u + tile, v + tile);
+        const GpuVertex d = vertex(bottom_left, u, v + tile);
+        vertices.insert(vertices.end(), {a, b, c, a, c, d});
+    }
+    return vertices;
+}
+
+bool gpu_render_rain(const Asura_Vector_3& camera_position, const Asura_Vector_3& right,
+                     const Asura_Vector_3& up, const Asura_Vector_3& forward,
+                     float vertical_fov, float aspect, float animation_seconds) {
+    gpu.rain_vertex_count = 0;
+    gpu.rain_frame_drawn = false;
+    if (!g.document.rain_enabled || !gpu.rain_texture || !gpu.rain_pixel_shader)
+        return false;
+    const std::vector<GpuVertex> vertices =
+        build_gpu_rain_vertices(camera_position, right, up, forward,
+                                vertical_fov, aspect, animation_seconds);
+    if (!gpu_update_dynamic_vertices(&gpu.rain_vertices, &gpu.rain_capacity, vertices) ||
+        !gpu.rain_vertices)
+        return false;
+    const UINT stride = sizeof(GpuVertex), offset = 0;
+    gpu.context->IASetVertexBuffers(0, 1, &gpu.rain_vertices, &stride, &offset);
+    gpu.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    gpu.context->PSSetShader(gpu.rain_pixel_shader, nullptr, 0);
+    gpu.context->PSSetShaderResources(4, 1, &gpu.rain_texture);
+    gpu.context->PSSetSamplers(2, 1, &gpu.environment_sampler);
+    gpu.context->OMSetDepthStencilState(gpu.skybox_depth, 0);
+    gpu.context->OMSetBlendState(gpu.alpha_blend, nullptr, 0xffffffffu);
+    gpu.rain_vertex_count = static_cast<uint32_t>(vertices.size());
+    gpu.context->Draw(gpu.rain_vertex_count, 0);
+    ID3D11ShaderResourceView* none = nullptr;
+    gpu.context->PSSetShaderResources(4, 1, &none);
+    gpu.context->OMSetBlendState(nullptr, nullptr, 0xffffffffu);
+    gpu.context->OMSetDepthStencilState(gpu.depth_enabled, 0);
+    gpu.rain_frame_drawn = true;
+    return true;
+}
+
 bool gpu_update_overlay(const std::vector<GpuVertex>& vertices) {
     return gpu_update_dynamic_vertices(&gpu.overlay_vertices, &gpu.overlay_capacity, vertices);
 }
@@ -3541,12 +3970,12 @@ void gpu_render_skybox(const DirectX::XMFLOAT4X4& view_projection) {
         gpu.context->PSSetSamplers(0, 1, &gpu.skybox_sampler);
         gpu.context->Draw(6, face * 6);
     }
-    if (gpu.skybox_cloud && gpu.skybox_cloud_pixel_shader && gpu.skybox_cloud_sampler &&
+    if (g.document.skybox.draw_clouds && gpu.skybox_cloud && gpu.skybox_cloud_pixel_shader && gpu.skybox_cloud_sampler &&
         gpu.skybox_cloud_vertices && gpu.skybox_cloud_vertex_count) {
         gpu.context->PSSetShader(gpu.skybox_cloud_pixel_shader, nullptr, 0);
         gpu.context->PSSetShaderResources(1, 1, &gpu.skybox_cloud);
         gpu.context->PSSetSamplers(1, 1, &gpu.skybox_cloud_sampler);
-        gpu.context->OMSetBlendState(gpu.skybox_cloud_blend, nullptr, 0xffffffffu);
+        gpu.context->OMSetBlendState(gpu.alpha_blend, nullptr, 0xffffffffu);
         gpu.context->IASetVertexBuffers(0, 1, &gpu.skybox_cloud_vertices, &stride, &offset);
         gpu.context->Draw(gpu.skybox_cloud_vertex_count, 0);
         gpu.context->OMSetBlendState(nullptr, nullptr, 0xffffffffu);
@@ -3562,9 +3991,9 @@ void append_gpu_spawn_puppet(const Entity& entity, bool selected, std::vector<Gp
 
     DirectX::XMFLOAT4 color;
     if (entity.value_u32_a == 4 || entity.value_u32_a == 5) {
-        color = DirectX::XMFLOAT4{ .43f, .52f, .24f, 0 };
+        color = DirectX::XMFLOAT4{ .816f, .620f, .420f, 0 };
         if (selected)
-            color = DirectX::XMFLOAT4{ .72f, .82f, .34f, 0 };
+            color = DirectX::XMFLOAT4{ 1.f, .761f, .518f, 0 };
     }
     if (entity.value_u32_a == 2 || entity.value_u32_a == 3) {
         color = DirectX::XMFLOAT4{ .25f, .42f, .18f, 0 };
@@ -3606,6 +4035,9 @@ void append_gpu_pickup_model(const Entity& entity, bool selected, std::vector<Gp
 void gpu_render() {
     if (!gpu.ready || !g.viewport)
         return;
+    gpu.alpha_tested_prelight_drawn = false;
+    gpu.solid_cutout_prelight_drawn = false;
+    gpu.composited_alpha_prelight_drawn = false;
     RECT rect{};
     GetClientRect(g.viewport, &rect);
     const uint32_t width = std::max<LONG>(1, rect.right), height = std::max<LONG>(1, rect.bottom);
@@ -3650,7 +4082,6 @@ void gpu_render() {
     XMStoreFloat4x4(&view_projection, XMMatrixTranspose(XMMatrixLookAtLH(eye, target, world_up) * projection));
     gpu.context->IASetInputLayout(gpu.input_layout);
     gpu.context->VSSetShader(gpu.vertex_shader, nullptr, 0);
-    gpu.context->PSSetShader(gpu.pixel_shader, nullptr, 0);
     gpu.context->UpdateSubresource(gpu.camera_buffer, 0, nullptr, &view_projection, 0, 0);
     gpu.context->VSSetConstantBuffers(0, 1, &gpu.camera_buffer);
     const UINT stride = sizeof(GpuVertex), offset = 0;
@@ -3659,8 +4090,147 @@ void gpu_render() {
         gpu.context->IASetVertexBuffers(0, 1, &gpu.mesh_vertices, &stride, &offset);
         gpu.context->IASetIndexBuffer(gpu.mesh_indices, DXGI_FORMAT_R32_UINT, 0);
         gpu.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        gpu.context->DrawIndexed(gpu.mesh_index_count, 0, 0);
+        gpu.context->PSSetShader(gpu.environment_pixel_shader, nullptr, 0);
+        gpu.context->PSSetSamplers(2, 1, &gpu.environment_sampler);
+        gpu.context->PSSetConstantBuffers(2, 1, &gpu.environment_material_buffer);
+        const EnvironmentViewConstants environment_view{
+            {camera_position.x, camera_position.y, camera_position.z, 1.0f},
+            {right.x, right.y, right.z, 0.0f},
+            {up.x, up.y, up.z, 0.0f},
+            {forward.x, forward.y, forward.z, 0.0f}};
+        gpu.context->UpdateSubresource(gpu.environment_view_buffer, 0, nullptr,
+                                       &environment_view, 0, 0);
+        gpu.context->PSSetConstantBuffers(3, 1, &gpu.environment_view_buffer);
+        // Draw all opaque prelighting first. This small staging adjustment to
+        // the target's strip walk ensures authored underground mirror geometry
+        // is present before a puddle composites over it.
+        for (const GpuMaterialRange& range : gpu.material_ranges) {
+            if (gpu_material_uses_alpha(range))
+                continue;
+            ID3D11ShaderResourceView* texture = range.texture ? range.texture : gpu.white_texture;
+            const EnvironmentMaterialConstants material_constants =
+                environment_material_constants(range.fallback_color, range.texture != nullptr,
+                                               range.has_material_color, 0.0f, false, false);
+            gpu.context->UpdateSubresource(gpu.environment_material_buffer, 0, nullptr, &material_constants, 0, 0);
+            gpu.context->PSSetShaderResources(2, 1, &texture);
+            gpu.context->OMSetBlendState(nullptr, nullptr, 0xffffffffu);
+            gpu.context->DrawIndexed(range.index_count, range.start_index, 0);
+        }
+        // Plain flag-2/TXFL-bit-clear materials are solid cutouts. MCP2's
+        // ObjectHierarchy renderer selects opaque blending for this class, and
+        // MCP1 likewise keeps opaque and background-blended strips separate.
+        // Use opaque alpha-test coverage plus the exact one-pass MODULATE2X
+        // colour equation, avoiding background blending and nonlinear lifts.
+        gpu.context->OMSetDepthStencilState(gpu.depth_enabled, 0);
+        gpu.context->OMSetBlendState(nullptr, nullptr, 0xffffffffu);
+        for (const GpuMaterialRange& range : gpu.material_ranges) {
+            if (!gpu_material_is_solid_cutout(range))
+                continue;
+            const EnvironmentMaterialConstants material_constants =
+                environment_material_constants(range.fallback_color, true,
+                                               range.has_material_color,
+                                               kEnvironmentRenderModeSolidCutout, false, true);
+            gpu.context->UpdateSubresource(gpu.environment_material_buffer, 0, nullptr, &material_constants, 0, 0);
+            gpu.context->PSSetShaderResources(2, 1, &range.texture);
+            gpu.context->DrawIndexed(range.index_count, range.start_index, 0);
+            gpu.alpha_tested_prelight_drawn = true;
+            gpu.solid_cutout_prelight_drawn |=
+                material_constants.render_mode == kEnvironmentRenderModeSolidCutout;
+        }
+        // sub_48D14A/sub_48D15F: target Env's two flag-2 TXFL branches converge
+        // on blend mode 1 (SRC_ALPHA/INV_SRC_ALPHA). Retain that path for true
+        // blended and multipass materials such as wet roads and detail fences.
+        gpu.context->OMSetBlendState(gpu.alpha_blend, nullptr, 0xffffffffu);
+        for (const GpuMaterialRange& range : gpu.material_ranges) {
+            if (!gpu_material_uses_alpha(range) || gpu_material_is_solid_cutout(range))
+                continue;
+            const EnvironmentMaterialConstants material_constants =
+                environment_material_constants(range.fallback_color, true,
+                                               range.has_material_color,
+                                               kEnvironmentRenderModeAlphaPrelight, false, true);
+            gpu.context->UpdateSubresource(gpu.environment_material_buffer, 0, nullptr, &material_constants, 0, 0);
+            gpu.context->PSSetShaderResources(2, 1, &range.texture);
+            gpu.context->DrawIndexed(range.index_count, range.start_index, 0);
+            gpu.alpha_tested_prelight_drawn = true;
+            gpu.composited_alpha_prelight_drawn |=
+                material_constants.render_mode == kEnvironmentRenderModeAlphaPrelight;
+        }
+        // sub_48D2FC/sub_48D311/sub_48D326 disable alpha test and depth writes,
+        // select EQUAL depth, then the pass at 0x48DB52 applies texture RGB with
+        // D3DBLEND_DESTCOLOR/SRCCOLOR (modulate 2x). It includes flag-2 ranges,
+        // tinting both their diffuse contribution and the reflection already
+        // present behind it instead of leaving a sharp, raw mirror image.
+        gpu.context->OMSetDepthStencilState(gpu.depth_equal, 0);
+        gpu.context->OMSetBlendState(gpu.modulate2x_blend, nullptr, 0xffffffffu);
+        // The target refreshes the wet texture's offset from its renderer RNG.
+        // Use one deterministic per-frame offset for every wet range, matching
+        // the single shared texture matrix installed by sub_48C860.
+        const uint32_t wet_frame = static_cast<uint32_t>(GetTickCount64() / 33);
+        const auto wet_random = [](uint32_t value) {
+            value ^= value >> 16;
+            value *= 0x7feb352du;
+            value ^= value >> 15;
+            value *= 0x846ca68bu;
+            value ^= value >> 16;
+            return (value & 0xffffu) * (5.0f / 65535.0f);
+        };
+        const DirectX::XMFLOAT4 wet_transform{
+            wet_random(wet_frame ^ 0x51ed270bu), wet_random(wet_frame ^ 0xa3c59ac3u), 0.0f, 0.0f};
+        for (const GpuMaterialRange& range : gpu.material_ranges) {
+            if (!range.texture || gpu_material_is_solid_cutout(range))
+                continue;
+            const bool wet_splash = gpu.environment_wet_weather && gpu.environment_splash &&
+                                    (range.material_flags & 0x4000u) != 0;
+            const bool detail = !wet_splash && gpu.environment_detail &&
+                                (range.material_flags & 0x4u) != 0;
+            ID3D11ShaderResourceView* auxiliary =
+                wet_splash ? gpu.environment_splash : (detail ? gpu.environment_detail : nullptr);
+            gpu.context->PSSetShaderResources(3, 1, &auxiliary);
+            const EnvironmentMaterialConstants material_constants =
+                environment_material_constants(wet_splash ? wet_transform : range.fallback_color,
+                                               true, range.has_material_color, 1.0f,
+                                               wet_splash ? 1.0f : (detail ? 2.0f : 0.0f),
+                                               gpu_material_uses_alpha(range));
+            gpu.context->UpdateSubresource(gpu.environment_material_buffer, 0, nullptr, &material_constants, 0, 0);
+            gpu.context->PSSetShaderResources(2, 1, &range.texture);
+            gpu.context->DrawIndexed(range.index_count, range.start_index, 0);
+
+            if ((range.material_flags & 0x1u) != 0) {
+                // sub_48DD7D: flag 0x1 replays combiner 8 with blend mode 5
+                // (SRC_ALPHA/ONE) after the common material draw.
+                const EnvironmentMaterialConstants additive_constants =
+                    environment_material_constants(range.fallback_color, true,
+                                                   range.has_material_color, 3.0f, 0.0f, false);
+                gpu.context->UpdateSubresource(gpu.environment_material_buffer, 0, nullptr,
+                                               &additive_constants, 0, 0);
+                gpu.context->OMSetBlendState(gpu.additive_blend, nullptr, 0xffffffffu);
+                gpu.context->DrawIndexed(range.index_count, range.start_index, 0);
+                gpu.context->OMSetBlendState(gpu.modulate2x_blend, nullptr, 0xffffffffu);
+            }
+            if ((range.material_flags & 0x80u) != 0 && gpu.environment_spheremap) {
+                // sub_48DDE6..0x48DE86: generated reflection coordinates,
+                // combiner 12, then blend mode 3 (DESTCOLOR/ZERO).
+                ID3D11ShaderResourceView* sphere = gpu.environment_spheremap;
+                gpu.context->PSSetShaderResources(3, 1, &sphere);
+                const EnvironmentMaterialConstants reflection_constants =
+                    environment_material_constants(range.fallback_color, true,
+                                                   range.has_material_color, 4.0f, 0.0f, false);
+                gpu.context->UpdateSubresource(gpu.environment_material_buffer, 0, nullptr,
+                                               &reflection_constants, 0, 0);
+                gpu.context->OMSetBlendState(gpu.reflection_blend, nullptr, 0xffffffffu);
+                gpu.context->DrawIndexed(range.index_count, range.start_index, 0);
+                gpu.context->OMSetBlendState(gpu.modulate2x_blend, nullptr, 0xffffffffu);
+            }
+        }
+        gpu.context->OMSetBlendState(nullptr, nullptr, 0xffffffffu);
+        gpu.context->OMSetDepthStencilState(gpu.depth_enabled, 0);
+        ID3D11ShaderResourceView* no_environment_textures[] = {nullptr, nullptr};
+        gpu.context->PSSetShaderResources(2, _countof(no_environment_textures), no_environment_textures);
     }
+    const float rain_animation_time = static_cast<float>(fmod(GetTickCount64() * .001, 8192.0));
+    gpu_render_rain(camera_position, right, up, forward, fov_y,
+                    static_cast<float>(width) / height, rain_animation_time);
+    gpu.context->PSSetShader(gpu.pixel_shader, nullptr, 0);
     std::vector<GpuVertex> puppet_vertices;
     size_t puppet_vertex_count = 0;
     for (const Entity& entity : g.document.entities) {
@@ -3670,12 +4240,24 @@ void gpu_render() {
     }
     puppet_vertices.reserve(puppet_vertex_count);
     for (int i = 0; i < static_cast<int>(g.document.entities.size()); ++i) {
+        if (i == g.selected)
+            continue;
         const Entity& entity = g.document.entities[i];
         if (entity.kind == EntityKind::SpawnPoint)
-            append_gpu_spawn_puppet(entity, i == g.selected, &puppet_vertices);
+            append_gpu_spawn_puppet(entity, false, &puppet_vertices);
         else if (entity.kind == EntityKind::PhysicalObject)
-            append_gpu_pickup_model(entity, i == g.selected, &puppet_vertices);
+            append_gpu_pickup_model(entity, false, &puppet_vertices);
     }
+    const uint32_t unselected_puppet_count = static_cast<uint32_t>(puppet_vertices.size());
+    if (g.selected >= 0 && g.selected < static_cast<int>(g.document.entities.size())) {
+        const Entity& selected_entity = g.document.entities[g.selected];
+        if (selected_entity.kind == EntityKind::SpawnPoint)
+            append_gpu_spawn_puppet(selected_entity, true, &puppet_vertices);
+        else if (selected_entity.kind == EntityKind::PhysicalObject)
+            append_gpu_pickup_model(selected_entity, true, &puppet_vertices);
+    }
+    const uint32_t selected_puppet_count =
+        static_cast<uint32_t>(puppet_vertices.size()) - unselected_puppet_count;
     const bool puppets_ready =
         gpu_update_dynamic_vertices(&gpu.puppet_vertices, &gpu.puppet_capacity, puppet_vertices) &&
         gpu.puppet_vertices && !puppet_vertices.empty();
@@ -3702,10 +4284,15 @@ void gpu_render() {
         overlay.push_back(gpu_line_vertex({extent, 0, i * step}, color));
     }
     const uint32_t entity_start = static_cast<uint32_t>(overlay.size());
+    uint32_t selected_entity_start = entity_start;
     const float marker = fmaxf(.35f, g.mesh.radius * .008f);
     std::vector<LightGizmoLine> entity_gizmo;
     entity_gizmo.reserve(kMaximumLightGizmoLines);
-    for (int i = 0; i < static_cast<int>(g.document.entities.size()); ++i) {
+    for (int pass = 0; pass < 2; ++pass) {
+      for (int i = 0; i < static_cast<int>(g.document.entities.size()); ++i) {
+        const bool selected = i == g.selected;
+        if (selected != (pass == 1))
+            continue;
         const Entity& entity = g.document.entities[i];
         const Asura_Vector_3 view_position = entity_view_position(entity.position);
         DirectX::XMFLOAT4 color{1, .45f, .25f, 1};
@@ -3721,24 +4308,20 @@ void gpu_render() {
             color = {1, .15f, .25f, 1};
         else if (entity.kind == EntityKind::PositionMarker)
             color = {.75f, .35f, 1, 1};
-        const bool selected = i == g.selected;
         if (selected)
             color = {1, 1, 1, 1};
         if (selected && (entity.kind == EntityKind::Light || entity.kind == EntityKind::Sound)) {
             entity_gizmo.clear();
             if (entity.kind == EntityKind::Light)
-                append_light_gizmo(entity, marker, &entity_gizmo);
+                append_light_gizmo(entity, &entity_gizmo);
             else
                 append_sound_gizmo(entity, &entity_gizmo);
             const DirectX::XMFLOAT4 range_color = entity.kind == EntityKind::Light
                                                        ? DirectX::XMFLOAT4{1, .92f, .35f, 1}
                                                        : DirectX::XMFLOAT4{.25f, .8f, 1, 1};
-            const DirectX::XMFLOAT4 direction_color{1, 1, 1, 1};
             for (const LightGizmoLine& line : entity_gizmo) {
-                const DirectX::XMFLOAT4 line_color =
-                    line.part == LightGizmoPart::Range ? range_color : direction_color;
-                overlay.push_back(gpu_line_vertex(line.a, line_color));
-                overlay.push_back(gpu_line_vertex(line.b, line_color));
+                overlay.push_back(gpu_line_vertex(line.a, range_color));
+                overlay.push_back(gpu_line_vertex(line.b, range_color));
             }
         }
         if (entity_render_model(entity))
@@ -3750,30 +4333,407 @@ void gpu_render() {
         overlay.push_back(gpu_line_vertex(add(view_position, {0, size, 0}), color));
         overlay.push_back(gpu_line_vertex(add(view_position, {0, 0, -size}), color));
         overlay.push_back(gpu_line_vertex(add(view_position, {0, 0, size}), color));
+      }
+      if (pass == 0)
+          selected_entity_start = static_cast<uint32_t>(overlay.size());
     }
-    if (gpu_update_overlay(overlay) && gpu.overlay_vertices) {
+    const bool overlay_ready = gpu_update_overlay(overlay) && gpu.overlay_vertices;
+    if (overlay_ready) {
         gpu.context->IASetVertexBuffers(0, 1, &gpu.overlay_vertices, &stride, &offset);
         gpu.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_LINELIST);
         gpu.context->OMSetDepthStencilState(gpu.depth_enabled, 0);
         if (entity_start)
             gpu.context->Draw(entity_start, 0);
+    }
+    // Unselected models and markers retain the environment depth buffer and
+    // therefore disappear naturally behind walls and terrain.
+    if (puppets_ready && unselected_puppet_count) {
+        gpu.context->OMSetDepthStencilState(gpu.depth_enabled, 0);
+        gpu.context->IASetVertexBuffers(0, 1, &gpu.puppet_vertices, &stride, &offset);
+        gpu.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        gpu.context->Draw(unselected_puppet_count, 0);
+    }
+    if (overlay_ready && selected_entity_start > entity_start) {
+        gpu.context->OMSetDepthStencilState(gpu.depth_enabled, 0);
+        gpu.context->IASetVertexBuffers(0, 1, &gpu.overlay_vertices, &stride, &offset);
+        gpu.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_LINELIST);
+        gpu.context->Draw(selected_entity_start - entity_start, entity_start);
+    }
+    // Only the selected model discards scene depth. Drawing with depth enabled
+    // after the clear preserves the model's own self-occlusion.
+    if (puppets_ready && selected_puppet_count) {
+        gpu.context->ClearDepthStencilView(gpu.depth_view, D3D11_CLEAR_DEPTH, 1, 0);
+        gpu.context->OMSetDepthStencilState(gpu.depth_enabled, 0);
+        gpu.context->IASetVertexBuffers(0, 1, &gpu.puppet_vertices, &stride, &offset);
+        gpu.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        gpu.context->Draw(selected_puppet_count, unselected_puppet_count);
+    }
+    if (overlay_ready && overlay.size() > selected_entity_start) {
         gpu.context->OMSetDepthStencilState(gpu.depth_disabled, 0);
-        if (puppets_ready) {
-            // Discard only the environment/grid depth, then let the puppets
-            // depth-test and write against themselves and one another.
-            gpu.context->ClearDepthStencilView(gpu.depth_view, D3D11_CLEAR_DEPTH, 1, 0);
-            gpu.context->OMSetDepthStencilState(gpu.depth_enabled, 0);
-            gpu.context->IASetVertexBuffers(0, 1, &gpu.puppet_vertices, &stride, &offset);
-            gpu.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-            gpu.context->Draw(static_cast<UINT>(puppet_vertices.size()), 0);
-            gpu.context->OMSetDepthStencilState(gpu.depth_disabled, 0);
-            gpu.context->IASetVertexBuffers(0, 1, &gpu.overlay_vertices, &stride, &offset);
-            gpu.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_LINELIST);
-        }
-        if (overlay.size() > entity_start)
-            gpu.context->Draw(static_cast<UINT>(overlay.size() - entity_start), entity_start);
+        gpu.context->IASetVertexBuffers(0, 1, &gpu.overlay_vertices, &stride, &offset);
+        gpu.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_LINELIST);
+        gpu.context->Draw(static_cast<UINT>(overlay.size() - selected_entity_start), selected_entity_start);
     }
     gpu.swap_chain->Present(0, 0);
+}
+
+bool gpu_verify_environment_color_pipeline() {
+    if (!gpu.ready || !gpu.device || !gpu.context)
+        return false;
+    ID3D11Texture2D* target = nullptr;
+    ID3D11Texture2D* readback = nullptr;
+    ID3D11RenderTargetView* target_view = nullptr;
+    ID3D11Buffer* vertices = nullptr;
+    ID3D11Texture2D* alpha_texture = nullptr;
+    ID3D11ShaderResourceView* alpha_view = nullptr;
+    ID3D11Texture2D* cutout_hole_texture = nullptr;
+    ID3D11ShaderResourceView* cutout_hole_view = nullptr;
+    ID3D11Texture2D* reflection_texture = nullptr;
+    ID3D11ShaderResourceView* reflection_view = nullptr;
+    D3D11_TEXTURE2D_DESC target_desc{};
+    target_desc.Width = target_desc.Height = target_desc.MipLevels = target_desc.ArraySize = 1;
+    target_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    target_desc.SampleDesc.Count = 1;
+    target_desc.Usage = D3D11_USAGE_DEFAULT;
+    target_desc.BindFlags = D3D11_BIND_RENDER_TARGET;
+    bool ok = SUCCEEDED(gpu.device->CreateTexture2D(&target_desc, nullptr, &target)) &&
+              SUCCEEDED(gpu.device->CreateRenderTargetView(target, nullptr, &target_view));
+    if (ok) {
+        D3D11_TEXTURE2D_DESC staging_desc = target_desc;
+        staging_desc.Usage = D3D11_USAGE_STAGING;
+        staging_desc.BindFlags = 0;
+        staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        ok = SUCCEEDED(gpu.device->CreateTexture2D(&staging_desc, nullptr, &readback));
+    }
+    constexpr float authored_red = 75.0f / 255.0f;
+    constexpr float authored_green = 70.0f / 255.0f;
+    constexpr float authored_blue = 62.0f / 255.0f;
+    const DirectX::XMFLOAT4 authored_color{authored_red, authored_green, authored_blue, 1.0f};
+    const GpuVertex triangle[] = {
+        {{-1.0f, -1.0f, .5f}, {0.0f, 0.0f, 1.0f}, authored_color, {0.0f, 0.0f}},
+        {{-1.0f, 3.0f, .5f}, {0.0f, 0.0f, 1.0f}, authored_color, {0.0f, 0.0f}},
+        {{3.0f, -1.0f, .5f}, {0.0f, 0.0f, 1.0f}, authored_color, {0.0f, 0.0f}},
+    };
+    if (ok) {
+        D3D11_BUFFER_DESC vertex_desc{};
+        vertex_desc.ByteWidth = sizeof(triangle);
+        vertex_desc.Usage = D3D11_USAGE_IMMUTABLE;
+        vertex_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+        const D3D11_SUBRESOURCE_DATA data{triangle};
+        ok = SUCCEEDED(gpu.device->CreateBuffer(&vertex_desc, &data, &vertices));
+    }
+    if (ok) {
+        DirectX::XMFLOAT4X4 identity{};
+        DirectX::XMStoreFloat4x4(&identity, DirectX::XMMatrixIdentity());
+        const EnvironmentMaterialConstants material =
+            environment_material_constants({0, 0, 0, 0}, false, false, 0.0f, false, false);
+        const float clear[] = {0, 0, 0, 1};
+        const D3D11_VIEWPORT viewport{0, 0, 1, 1, 0, 1};
+        const UINT stride = sizeof(GpuVertex), offset = 0;
+        gpu.context->ClearRenderTargetView(target_view, clear);
+        gpu.context->OMSetRenderTargets(1, &target_view, nullptr);
+        gpu.context->OMSetDepthStencilState(gpu.depth_disabled, 0);
+        gpu.context->OMSetBlendState(nullptr, nullptr, 0xffffffffu);
+        gpu.context->RSSetViewports(1, &viewport);
+        gpu.context->RSSetState(gpu.rasterizer);
+        gpu.context->IASetInputLayout(gpu.input_layout);
+        gpu.context->IASetVertexBuffers(0, 1, &vertices, &stride, &offset);
+        gpu.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        gpu.context->VSSetShader(gpu.vertex_shader, nullptr, 0);
+        gpu.context->UpdateSubresource(gpu.camera_buffer, 0, nullptr, &identity, 0, 0);
+        gpu.context->VSSetConstantBuffers(0, 1, &gpu.camera_buffer);
+        gpu.context->PSSetShader(gpu.environment_pixel_shader, nullptr, 0);
+        gpu.context->PSSetSamplers(2, 1, &gpu.environment_sampler);
+        gpu.context->UpdateSubresource(gpu.environment_material_buffer, 0, nullptr, &material, 0, 0);
+        gpu.context->PSSetConstantBuffers(2, 1, &gpu.environment_material_buffer);
+        const EnvironmentViewConstants environment_view{
+            {0.0f, 0.0f, 2.0f, 1.0f}, {1.0f, 0.0f, 0.0f, 0.0f},
+            {0.0f, 1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, -1.0f, 0.0f}};
+        gpu.context->UpdateSubresource(gpu.environment_view_buffer, 0, nullptr,
+                                       &environment_view, 0, 0);
+        gpu.context->PSSetConstantBuffers(3, 1, &gpu.environment_view_buffer);
+        gpu.context->Draw(_countof(triangle), 0);
+        gpu.context->CopyResource(readback, target);
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        ok = SUCCEEDED(gpu.context->Map(readback, 0, D3D11_MAP_READ, 0, &mapped));
+        if (ok) {
+            const auto* actual = static_cast<const uint8_t*>(mapped.pData);
+            ok = abs(static_cast<int>(actual[0]) - 75) <= 1 &&
+                 abs(static_cast<int>(actual[1]) - 70) <= 1 &&
+                 abs(static_cast<int>(actual[2]) - 62) <= 1;
+            gpu.context->Unmap(readback, 0);
+        }
+    }
+    if (ok) {
+        // A one-pixel texture with fractional alpha verifies the target's
+        // genuinely composited flag-2 prelight blend, not merely shader output
+        // in isolation.
+        const uint32_t alpha_pixel = 0x80c08040u;
+        D3D11_TEXTURE2D_DESC alpha_desc{};
+        alpha_desc.Width = alpha_desc.Height = alpha_desc.MipLevels = alpha_desc.ArraySize = 1;
+        alpha_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        alpha_desc.SampleDesc.Count = 1;
+        alpha_desc.Usage = D3D11_USAGE_IMMUTABLE;
+        alpha_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        const D3D11_SUBRESOURCE_DATA alpha_data{&alpha_pixel, sizeof(alpha_pixel), sizeof(alpha_pixel)};
+        ok = SUCCEEDED(gpu.device->CreateTexture2D(&alpha_desc, &alpha_data, &alpha_texture)) &&
+             SUCCEEDED(gpu.device->CreateShaderResourceView(alpha_texture, nullptr, &alpha_view));
+    }
+    if (ok) {
+        const uint32_t hole_pixel = 0x00000000u;
+        D3D11_TEXTURE2D_DESC hole_desc{};
+        hole_desc.Width = hole_desc.Height = hole_desc.MipLevels = hole_desc.ArraySize = 1;
+        hole_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        hole_desc.SampleDesc.Count = 1;
+        hole_desc.Usage = D3D11_USAGE_IMMUTABLE;
+        hole_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        const D3D11_SUBRESOURCE_DATA hole_data{&hole_pixel, sizeof(hole_pixel), sizeof(hole_pixel)};
+        ok = SUCCEEDED(gpu.device->CreateTexture2D(&hole_desc, &hole_data, &cutout_hole_texture)) &&
+             SUCCEEDED(gpu.device->CreateShaderResourceView(cutout_hole_texture, nullptr,
+                                                            &cutout_hole_view));
+    }
+    if (ok) {
+        const EnvironmentMaterialConstants alpha_material =
+            environment_material_constants({0, 0, 0, 0}, true, false,
+                                           kEnvironmentRenderModeAlphaPrelight, 0.0f, true);
+        const float clear[] = {.2f, .4f, .6f, 1.0f};
+        gpu.context->ClearRenderTargetView(target_view, clear);
+        gpu.context->OMSetRenderTargets(1, &target_view, nullptr);
+        gpu.context->OMSetBlendState(gpu.alpha_blend, nullptr, 0xffffffffu);
+        gpu.context->UpdateSubresource(gpu.environment_material_buffer, 0, nullptr,
+                                       &alpha_material, 0, 0);
+        gpu.context->PSSetShaderResources(2, 1, &alpha_view);
+        gpu.context->Draw(_countof(triangle), 0);
+        gpu.context->CopyResource(readback, target);
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        ok = SUCCEEDED(gpu.context->Map(readback, 0, D3D11_MAP_READ, 0, &mapped));
+        if (ok) {
+            const auto* actual = static_cast<const uint8_t*>(mapped.pData);
+            constexpr float texture_alpha = 128.0f / 255.0f;
+            const int expected[] = {
+                static_cast<int>(255.0f * (authored_red * texture_alpha + .2f * (1.0f - texture_alpha)) + .5f),
+                static_cast<int>(255.0f * (authored_green * texture_alpha + .4f * (1.0f - texture_alpha)) + .5f),
+                static_cast<int>(255.0f * (authored_blue * texture_alpha + .6f * (1.0f - texture_alpha)) + .5f)};
+            ok = abs(static_cast<int>(actual[0]) - expected[0]) <= 2 &&
+                 abs(static_cast<int>(actual[1]) - expected[1]) <= 2 &&
+                 abs(static_cast<int>(actual[2]) - expected[2]) <= 2;
+            gpu.context->Unmap(readback, 0);
+        }
+    }
+    if (ok) {
+        // Plain solid cutouts use the target's exact opaque MODULATE2X equation
+        // after passing the alpha test. This guards against nonlinear texture
+        // lifts that flatten contrast or change apparent saturation.
+        const EnvironmentMaterialConstants cutout_material =
+            environment_material_constants({0, 0, 0, 0}, true, false,
+                                           kEnvironmentRenderModeSolidCutout, 0.0f, true);
+        const float clear[] = {.2f, .4f, .6f, 1.0f};
+        gpu.context->ClearRenderTargetView(target_view, clear);
+        gpu.context->OMSetRenderTargets(1, &target_view, nullptr);
+        gpu.context->OMSetBlendState(nullptr, nullptr, 0xffffffffu);
+        gpu.context->UpdateSubresource(gpu.environment_material_buffer, 0, nullptr,
+                                       &cutout_material, 0, 0);
+        gpu.context->PSSetShaderResources(2, 1, &alpha_view);
+        gpu.context->Draw(_countof(triangle), 0);
+        gpu.context->CopyResource(readback, target);
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        ok = SUCCEEDED(gpu.context->Map(readback, 0, D3D11_MAP_READ, 0, &mapped));
+        if (ok) {
+            const auto* actual = static_cast<const uint8_t*>(mapped.pData);
+            constexpr float albedo_red = 64.0f / 255.0f;
+            constexpr float albedo_green = 128.0f / 255.0f;
+            constexpr float albedo_blue = 192.0f / 255.0f;
+            const int expected[] = {
+                static_cast<int>(255.0f * std::min(1.0f, 2.0f * albedo_red * authored_red) + .5f),
+                static_cast<int>(255.0f * std::min(1.0f, 2.0f * albedo_green * authored_green) + .5f),
+                static_cast<int>(255.0f * std::min(1.0f, 2.0f * albedo_blue * authored_blue) + .5f)};
+            ok = abs(static_cast<int>(actual[0]) - expected[0]) <= 2 &&
+                 abs(static_cast<int>(actual[1]) - expected[1]) <= 2 &&
+                 abs(static_cast<int>(actual[2]) - expected[2]) <= 2;
+            gpu.context->Unmap(readback, 0);
+        }
+    }
+    if (ok) {
+        // Zero-alpha texels must still expose the already rendered sky/background.
+        const EnvironmentMaterialConstants cutout_material =
+            environment_material_constants({0, 0, 0, 0}, true, false,
+                                           kEnvironmentRenderModeSolidCutout, 0.0f, true);
+        const float clear[] = {.2f, .4f, .6f, 1.0f};
+        gpu.context->ClearRenderTargetView(target_view, clear);
+        gpu.context->UpdateSubresource(gpu.environment_material_buffer, 0, nullptr,
+                                       &cutout_material, 0, 0);
+        gpu.context->PSSetShaderResources(2, 1, &cutout_hole_view);
+        gpu.context->Draw(_countof(triangle), 0);
+        gpu.context->CopyResource(readback, target);
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        ok = SUCCEEDED(gpu.context->Map(readback, 0, D3D11_MAP_READ, 0, &mapped));
+        if (ok) {
+            const auto* actual = static_cast<const uint8_t*>(mapped.pData);
+            constexpr int expected[] = {51, 102, 153};
+            ok = abs(static_cast<int>(actual[0]) - expected[0]) <= 1 &&
+                 abs(static_cast<int>(actual[1]) - expected[1]) <= 1 &&
+                 abs(static_cast<int>(actual[2]) - expected[2]) <= 1;
+            gpu.context->Unmap(readback, 0);
+        }
+    }
+    if (ok) {
+        // Give the sphere map an alpha that deliberately differs from the base
+        // texture. Target combiner 12 must use CURRENT alpha carried from the
+        // base texture, not the sphere map's own alpha.
+        const uint32_t reflection_pixel = 0x11c08040u;
+        D3D11_TEXTURE2D_DESC reflection_desc{};
+        reflection_desc.Width = reflection_desc.Height = reflection_desc.MipLevels = reflection_desc.ArraySize = 1;
+        reflection_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        reflection_desc.SampleDesc.Count = 1;
+        reflection_desc.Usage = D3D11_USAGE_IMMUTABLE;
+        reflection_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        const D3D11_SUBRESOURCE_DATA reflection_data{
+            &reflection_pixel, sizeof(reflection_pixel), sizeof(reflection_pixel)};
+        ok = SUCCEEDED(gpu.device->CreateTexture2D(&reflection_desc, &reflection_data,
+                                                   &reflection_texture)) &&
+             SUCCEEDED(gpu.device->CreateShaderResourceView(reflection_texture, nullptr,
+                                                            &reflection_view));
+    }
+    if (ok) {
+        // Target blend mode 3 is SRC=DESTCOLOR, DEST=ZERO. This verifies the
+        // stage-0-alpha combiner and final framebuffer multiplication together.
+        const EnvironmentMaterialConstants reflection_material =
+            environment_material_constants({0, 0, 0, 0}, true, false, 4.0f, 0.0f, false);
+        const float clear[] = {.25f, .5f, .75f, 1.0f};
+        gpu.context->ClearRenderTargetView(target_view, clear);
+        gpu.context->OMSetRenderTargets(1, &target_view, nullptr);
+        gpu.context->OMSetBlendState(gpu.reflection_blend, nullptr, 0xffffffffu);
+        gpu.context->UpdateSubresource(gpu.environment_material_buffer, 0, nullptr,
+                                       &reflection_material, 0, 0);
+        ID3D11ShaderResourceView* reflection_resources[] = {alpha_view, reflection_view};
+        gpu.context->PSSetShaderResources(2, _countof(reflection_resources), reflection_resources);
+        gpu.context->Draw(_countof(triangle), 0);
+        gpu.context->CopyResource(readback, target);
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        ok = SUCCEEDED(gpu.context->Map(readback, 0, D3D11_MAP_READ, 0, &mapped));
+        if (ok) {
+            const auto* actual = static_cast<const uint8_t*>(mapped.pData);
+            constexpr float base_alpha = 128.0f / 255.0f;
+            constexpr float reflection_red = 64.0f / 255.0f;
+            constexpr float reflection_green = 128.0f / 255.0f;
+            constexpr float reflection_blue = 192.0f / 255.0f;
+            const int expected[] = {
+                static_cast<int>(255.0f * .25f * (1.0f + (reflection_red - 1.0f) * base_alpha) + .5f),
+                static_cast<int>(255.0f * .5f * (1.0f + (reflection_green - 1.0f) * base_alpha) + .5f),
+                static_cast<int>(255.0f * .75f * (1.0f + (reflection_blue - 1.0f) * base_alpha) + .5f)};
+            ok = abs(static_cast<int>(actual[0]) - expected[0]) <= 2 &&
+                 abs(static_cast<int>(actual[1]) - expected[1]) <= 2 &&
+                 abs(static_cast<int>(actual[2]) - expected[2]) <= 2;
+            gpu.context->Unmap(readback, 0);
+        }
+    }
+    ID3D11ShaderResourceView* no_textures[] = {nullptr, nullptr};
+    gpu.context->PSSetShaderResources(2, _countof(no_textures), no_textures);
+    gpu.context->OMSetRenderTargets(0, nullptr, nullptr);
+    gpu.context->OMSetBlendState(nullptr, nullptr, 0xffffffffu);
+    gpu_release(reflection_view);
+    gpu_release(reflection_texture);
+    gpu_release(cutout_hole_view);
+    gpu_release(cutout_hole_texture);
+    gpu_release(alpha_view);
+    gpu_release(alpha_texture);
+    gpu_release(vertices);
+    gpu_release(target_view);
+    gpu_release(readback);
+    gpu_release(target);
+    return ok;
+}
+
+bool gpu_verify_rain_streak_display() {
+    if (!gpu.ready || !gpu.rain_texture || !gpu.rain_pixel_shader)
+        return false;
+    constexpr UINT size = 256;
+    ID3D11Texture2D* target = nullptr;
+    ID3D11Texture2D* readback = nullptr;
+    ID3D11RenderTargetView* target_view = nullptr;
+    ID3D11Buffer* vertices = nullptr;
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = desc.Height = size;
+    desc.MipLevels = desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_RENDER_TARGET;
+    bool ok = SUCCEEDED(gpu.device->CreateTexture2D(&desc, nullptr, &target)) &&
+              SUCCEEDED(gpu.device->CreateRenderTargetView(target, nullptr, &target_view));
+    if (ok) {
+        D3D11_TEXTURE2D_DESC staging = desc;
+        staging.Usage = D3D11_USAGE_STAGING;
+        staging.BindFlags = 0;
+        staging.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        ok = SUCCEEDED(gpu.device->CreateTexture2D(&staging, nullptr, &readback));
+    }
+    const DirectX::XMFLOAT4 color{1, 1, 1, 1};
+    const GpuVertex triangle[] = {
+        {{-1.0f, -1.0f, .5f}, {0, -1, 0}, color, {0, 1}},
+        {{-1.0f, 3.0f, .5f}, {0, -1, 0}, color, {0, -1}},
+        {{3.0f, -1.0f, .5f}, {0, -1, 0}, color, {2, 1}},
+    };
+    if (ok) {
+        D3D11_BUFFER_DESC vertex_desc{};
+        vertex_desc.ByteWidth = sizeof(triangle);
+        vertex_desc.Usage = D3D11_USAGE_IMMUTABLE;
+        vertex_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+        const D3D11_SUBRESOURCE_DATA data{triangle};
+        ok = SUCCEEDED(gpu.device->CreateBuffer(&vertex_desc, &data, &vertices));
+    }
+    if (ok) {
+        DirectX::XMFLOAT4X4 identity{};
+        DirectX::XMStoreFloat4x4(&identity, DirectX::XMMatrixIdentity());
+        const float clear[] = {0, 0, 0, 1};
+        const D3D11_VIEWPORT viewport{0, 0, static_cast<float>(size),
+                                      static_cast<float>(size), 0, 1};
+        const UINT stride = sizeof(GpuVertex), offset = 0;
+        gpu.context->ClearRenderTargetView(target_view, clear);
+        gpu.context->OMSetRenderTargets(1, &target_view, nullptr);
+        gpu.context->OMSetDepthStencilState(gpu.depth_disabled, 0);
+        gpu.context->OMSetBlendState(gpu.alpha_blend, nullptr, 0xffffffffu);
+        gpu.context->RSSetViewports(1, &viewport);
+        gpu.context->RSSetState(gpu.rasterizer);
+        gpu.context->IASetInputLayout(gpu.input_layout);
+        gpu.context->IASetVertexBuffers(0, 1, &vertices, &stride, &offset);
+        gpu.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        gpu.context->VSSetShader(gpu.vertex_shader, nullptr, 0);
+        gpu.context->UpdateSubresource(gpu.camera_buffer, 0, nullptr, &identity, 0, 0);
+        gpu.context->VSSetConstantBuffers(0, 1, &gpu.camera_buffer);
+        gpu.context->PSSetShader(gpu.rain_pixel_shader, nullptr, 0);
+        gpu.context->PSSetShaderResources(4, 1, &gpu.rain_texture);
+        gpu.context->PSSetSamplers(2, 1, &gpu.environment_sampler);
+        gpu.context->Draw(_countof(triangle), 0);
+        gpu.context->CopyResource(readback, target);
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        ok = SUCCEEDED(gpu.context->Map(readback, 0, D3D11_MAP_READ, 0, &mapped));
+        if (ok) {
+            const auto* bytes = static_cast<const uint8_t*>(mapped.pData);
+            uint32_t visible = 0, horizontal = 0, vertical = 0;
+            for (UINT y = 0; y < size; ++y) {
+                for (UINT x = 0; x < size; ++x) {
+                    const uint8_t* pixel = bytes + y * mapped.RowPitch + x * 4;
+                    if (pixel[0] <= 12)
+                        continue;
+                    ++visible;
+                    horizontal += x > 0 && pixel[-4] > 12;
+                    vertical += y > 0 && pixel[-static_cast<int>(mapped.RowPitch)] > 12;
+                }
+            }
+            ok = visible >= 40 && vertical > horizontal * 2;
+            gpu.context->Unmap(readback, 0);
+        }
+    }
+    ID3D11ShaderResourceView* none = nullptr;
+    gpu.context->PSSetShaderResources(4, 1, &none);
+    gpu.context->OMSetBlendState(nullptr, nullptr, 0xffffffffu);
+    gpu.context->OMSetRenderTargets(0, nullptr, nullptr);
+    gpu_release(vertices);
+    gpu_release(target_view);
+    gpu_release(readback);
+    gpu_release(target);
+    return ok;
 }
 
 void set_status(const char* text) { SetWindowTextA(g.status, text ? text : ""); }
@@ -3792,8 +4752,14 @@ void update_title() {
     SetWindowTextA(g.window, title.c_str());
 }
 
-void mark_dirty() {
-    g.document.dirty = true;
+bool commit_history_transaction() {
+    const bool changed = g.history.commit(&g.document, g.selected);
+    update_title();
+    return changed;
+}
+
+void reset_history(bool mark_as_saved) {
+    g.history.reset(&g.document, g.selected, mark_as_saved);
     update_title();
 }
 
@@ -3969,9 +4935,18 @@ bool load_spawn_puppets() {
 void set_control_text(HWND control, const char* text) { SetWindowTextA(control, text ? text : ""); }
 
 void set_float(HWND control, float value) {
-    char text[64];
-    snprintf(text, sizeof(text), "%.9g", value);
-    SetWindowTextA(control, text);
+    char text[384]{};
+    const std::to_chars_result result = std::to_chars(text, text + sizeof(text) - 1, value,
+                                                       std::chars_format::fixed, 15);
+    if (result.ec == std::errc{}) {
+        char* end = result.ptr;
+        while (end > text && end[-1] == '0')
+            --end;
+        if (end > text && end[-1] == '.')
+            *end++ = '0';
+        *end = 0;
+        SetWindowTextA(control, text);
+    }
 }
 
 float get_float(HWND control, float fallback) {
@@ -3998,22 +4973,38 @@ uint32_t get_u32(HWND control, uint32_t fallback) {
     return end != text && end && !*end && value <= 0xfffffffful ? static_cast<uint32_t>(value) : fallback;
 }
 
+struct SpawnMaskControl {
+    const char* label;
+    uint32_t mask;
+};
+
+constexpr SpawnMaskControl kSpawnTeamControls[] = {
+    {"Teamless", SnipeSpawnTeam_Deathmatch},
+    {"Germany", SnipeSpawnTeam_German},
+    {"Russia", SnipeSpawnTeam_Russian},
+    {"Camera-only", SnipeSpawnTeam_Camera}
+};
+
+constexpr SpawnMaskControl kSpawnGameModeControls[] = {
+    {"Single-Player", SnipeSpawnGameMode_SinglePlayer},
+    {"Cooperative", SnipeSpawnGameMode_LocalCooperative},
+    {"Deathmatch", SnipeSpawnGameMode_Deathmatch},
+    {"TDM", SnipeSpawnGameMode_TeamDeathmatch},
+    {"Manhunt", SnipeSpawnGameMode_Manhunt},
+    {"Assassination", SnipeSpawnGameMode_Assassination}
+};
+
 enum LightPropertiesId : int {
     ID_LIGHT_POSITION_X = 3000,
     ID_LIGHT_POSITION_Y,
     ID_LIGHT_POSITION_Z,
-    ID_LIGHT_DIRECTION_X,
-    ID_LIGHT_DIRECTION_Y,
-    ID_LIGHT_DIRECTION_Z,
     ID_LIGHT_R,
     ID_LIGHT_G,
     ID_LIGHT_B,
     ID_LIGHT_BRIGHTNESS,
     ID_LIGHT_RANGE,
     ID_LIGHT_INNER_RANGE,
-    ID_LIGHT_ANGLE,
     ID_LIGHT_SHADOW_STRENGTH,
-    ID_LIGHT_BRIGHTNESS_OVER_RANGE,
     ID_LIGHT_BOUND_MIN_X,
     ID_LIGHT_BOUND_MAX_X,
     ID_LIGHT_BOUND_MIN_Y,
@@ -4027,7 +5018,7 @@ enum LightPropertiesId : int {
     ID_LIGHT_OLD_POSITION_Y,
     ID_LIGHT_OLD_POSITION_Z,
     ID_LIGHT_OLD_RANGE,
-    ID_LIGHT_HAS_CHANGED,
+    ID_LIGHT_HAS_CHANGED
 };
 
 struct LightFlagControl {
@@ -4042,23 +5033,20 @@ constexpr LightFlagControl kLightFlagControls[] = {
     {"Affects environment", ASURA_LIGHT_FLAG_AFFECTS_ENVIRONMENT},
     {"Volumetric", ASURA_LIGHT_FLAG_IS_VOLUMETRIC},
     {"Use bounding box", ASURA_LIGHT_FLAG_USE_BOUNDING_BOX},
-    {"Shadow volume", ASURA_LIGHT_FLAG_IS_SHADOW_VOLUME},
+    {"Shadow volume", ASURA_LIGHT_FLAG_IS_SHADOW_VOLUME}
 };
 
 struct LightPropertiesState {
     HWND window = nullptr;
     HWND position[3]{};
-    HWND direction[3]{};
     HWND colour[3]{};
     HWND brightness = nullptr;
     HWND range = nullptr;
     HWND inner_range = nullptr;
-    HWND angle = nullptr;
     HWND shadow_strength = nullptr;
-    HWND brightness_over_range = nullptr;
     HWND bounds[6]{};
     HWND flags = nullptr;
-    HWND flag_checks[7]{};
+    HWND flag_checks[_countof(kLightFlagControls)]{};
     HWND old_position[3]{};
     HWND old_range = nullptr;
     HWND has_changed = nullptr;
@@ -4094,51 +5082,46 @@ void make_light_scalar(LightPropertiesState* state, const char* label, int id, i
 
 void create_light_properties_controls(LightPropertiesState* state) {
     make_light_vector_row(state, "Position", 16, ID_LIGHT_POSITION_X, state->position);
-    make_light_vector_row(state, "Direction", 50, ID_LIGHT_DIRECTION_X, state->direction);
-    make_light_vector_row(state, "Colour (RGB255)", 84, ID_LIGHT_R, state->colour);
+    make_light_vector_row(state, "Colour (RGB255)", 50, ID_LIGHT_R, state->colour);
 
-    make_light_scalar(state, "Brightness", ID_LIGHT_BRIGHTNESS, 14, 122, &state->brightness);
-    make_light_scalar(state, "Range", ID_LIGHT_RANGE, 262, 122, &state->range);
-    make_light_scalar(state, "Inner range", ID_LIGHT_INNER_RANGE, 510, 122, &state->inner_range);
-    make_light_scalar(state, "Angle", ID_LIGHT_ANGLE, 14, 156, &state->angle);
-    make_light_scalar(state, "Shadow strength", ID_LIGHT_SHADOW_STRENGTH, 262, 156,
+    make_light_scalar(state, "Brightness", ID_LIGHT_BRIGHTNESS, 14, 88, &state->brightness);
+    make_light_scalar(state, "Range", ID_LIGHT_RANGE, 262, 88, &state->range);
+    make_light_scalar(state, "Inner range", ID_LIGHT_INNER_RANGE, 510, 88, &state->inner_range);
+    make_light_scalar(state, "Shadow strength", ID_LIGHT_SHADOW_STRENGTH, 14, 122,
                       &state->shadow_strength);
-    make_light_scalar(state, "Brightness/range", ID_LIGHT_BRIGHTNESS_OVER_RANGE, 510, 156,
-                      &state->brightness_over_range);
 
-    make_light_control(state, "STATIC", "Bounding box", SS_LEFT, 0, 14, 198, 110, 22);
+    make_light_control(state, "STATIC", "World-axis bounding box", SS_LEFT, 0, 14, 164, 150, 22);
     constexpr const char* bound_labels[] = {"Min X", "Max X", "Min Y", "Max Y", "Min Z", "Max Z"};
     constexpr int bound_ids[] = {ID_LIGHT_BOUND_MIN_X, ID_LIGHT_BOUND_MAX_X, ID_LIGHT_BOUND_MIN_Y,
                                  ID_LIGHT_BOUND_MAX_Y, ID_LIGHT_BOUND_MIN_Z, ID_LIGHT_BOUND_MAX_Z};
     for (int i = 0; i < 6; ++i) {
         const int column = i % 3, row = i / 3;
-        const int x = 130 + column * 204, y = 194 + row * 34;
+        const int x = 130 + column * 204, y = 160 + row * 34;
         make_light_control(state, "STATIC", bound_labels[i], SS_LEFT, 0, x, y + 3, 48, 22);
         state->bounds[i] = make_light_control(state, "EDIT", "", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP,
                                               bound_ids[i], x + 52, y, 90, 24);
     }
 
-    make_light_control(state, "STATIC", "Raw flags", SS_LEFT, 0, 14, 270, 94, 22);
+    make_light_control(state, "STATIC", "Raw flags", SS_LEFT, 0, 14, 236, 94, 22);
     state->flags = make_light_control(state, "EDIT", "", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP,
-                                      ID_LIGHT_FLAGS, 130, 267, 142, 24);
-    for (int i = 0; i < 7; ++i) {
+                                      ID_LIGHT_FLAGS, 130, 233, 142, 24);
+    for (int i = 0; i < static_cast<int>(_countof(kLightFlagControls)); ++i) {
         const int column = i % 4, row = i / 4;
         state->flag_checks[i] = make_light_control(
             state, "BUTTON", kLightFlagControls[i].label, BS_AUTOCHECKBOX | WS_TABSTOP,
-            ID_LIGHT_FLAG_FIRST + i, 14 + column * 185, 304 + row * 30, 178, 24);
+            ID_LIGHT_FLAG_FIRST + i, 14 + column * 185, 270 + row * 30, 178, 24);
     }
 
-    make_light_vector_row(state, "Old position", 374, ID_LIGHT_OLD_POSITION_X, state->old_position);
-    make_light_scalar(state, "Old range", ID_LIGHT_OLD_RANGE, 14, 412, &state->old_range);
+    make_light_vector_row(state, "Old position", 338, ID_LIGHT_OLD_POSITION_X, state->old_position);
+    make_light_scalar(state, "Old range", ID_LIGHT_OLD_RANGE, 14, 376, &state->old_range);
     state->has_changed = make_light_control(state, "BUTTON", "Has changed", BS_AUTOCHECKBOX | WS_TABSTOP,
-                                            ID_LIGHT_HAS_CHANGED, 280, 412, 150, 24);
+                                             ID_LIGHT_HAS_CHANGED, 280, 376, 150, 24);
 
-    make_light_control(state, "BUTTON", "Apply", BS_DEFPUSHBUTTON | WS_TABSTOP, IDOK, 526, 466, 104, 30);
-    make_light_control(state, "BUTTON", "Cancel", BS_PUSHBUTTON | WS_TABSTOP, IDCANCEL, 638, 466, 104, 30);
+    make_light_control(state, "BUTTON", "Apply", BS_DEFPUSHBUTTON | WS_TABSTOP, IDOK, 526, 430, 104, 30);
+    make_light_control(state, "BUTTON", "Cancel", BS_PUSHBUTTON | WS_TABSTOP, IDCANCEL, 638, 430, 104, 30);
 
     const Asura_Light& light = state->value;
     const float position[] = {light.Position.x, light.Position.y, light.Position.z};
-    const float direction[] = {light.Direction.x, light.Direction.y, light.Direction.z};
     const float colour[] = {light.R, light.G, light.B};
     const float bounds[] = {light.m_xBoundingBox.MinX, light.m_xBoundingBox.MaxX,
                             light.m_xBoundingBox.MinY, light.m_xBoundingBox.MaxY,
@@ -4146,7 +5129,6 @@ void create_light_properties_controls(LightPropertiesState* state) {
     const float old_position[] = {light.OldPosition.x, light.OldPosition.y, light.OldPosition.z};
     for (int i = 0; i < 3; ++i) {
         set_float(state->position[i], position[i]);
-        set_float(state->direction[i], direction[i]);
         set_float(state->colour[i], colour[i]);
         set_float(state->old_position[i], old_position[i]);
     }
@@ -4155,11 +5137,9 @@ void create_light_properties_controls(LightPropertiesState* state) {
     set_float(state->brightness, light.Brightness);
     set_float(state->range, light.Range);
     set_float(state->inner_range, light.m_fInnerRange);
-    set_float(state->angle, light.Angle);
     set_float(state->shadow_strength, light.ShadowStrength);
-    set_float(state->brightness_over_range, light.BrightnessOverRange);
     set_u32_hex(state->flags, light.m_uFlags);
-    for (int i = 0; i < 7; ++i)
+    for (int i = 0; i < static_cast<int>(_countof(kLightFlagControls)); ++i)
         SendMessageA(state->flag_checks[i], BM_SETCHECK,
                      light.m_uFlags & kLightFlagControls[i].mask ? BST_CHECKED : BST_UNCHECKED, 0);
     set_float(state->old_range, light.OldRange);
@@ -4171,25 +5151,20 @@ void apply_light_properties(LightPropertiesState* state) {
     light.Position = {get_float(state->position[0], light.Position.x),
                       get_float(state->position[1], light.Position.y),
                       get_float(state->position[2], light.Position.z)};
-    light.Direction = {get_float(state->direction[0], light.Direction.x),
-                       get_float(state->direction[1], light.Direction.y),
-                       get_float(state->direction[2], light.Direction.z)};
     light.R = get_float(state->colour[0], light.R);
     light.G = get_float(state->colour[1], light.G);
     light.B = get_float(state->colour[2], light.B);
     light.Brightness = get_float(state->brightness, light.Brightness);
     light.Range = get_float(state->range, light.Range);
     light.m_fInnerRange = get_float(state->inner_range, light.m_fInnerRange);
-    light.Angle = get_float(state->angle, light.Angle);
     light.ShadowStrength = get_float(state->shadow_strength, light.ShadowStrength);
-    light.BrightnessOverRange = get_float(state->brightness_over_range, light.BrightnessOverRange);
     float* bounds[] = {&light.m_xBoundingBox.MinX, &light.m_xBoundingBox.MaxX,
                        &light.m_xBoundingBox.MinY, &light.m_xBoundingBox.MaxY,
                        &light.m_xBoundingBox.MinZ, &light.m_xBoundingBox.MaxZ};
     for (int i = 0; i < 6; ++i)
         *bounds[i] = get_float(state->bounds[i], *bounds[i]);
     light.m_uFlags = get_u32(state->flags, light.m_uFlags);
-    for (int i = 0; i < 7; ++i) {
+    for (int i = 0; i < static_cast<int>(_countof(kLightFlagControls)); ++i) {
         if (SendMessageA(state->flag_checks[i], BM_GETCHECK, 0, 0) == BST_CHECKED)
             light.m_uFlags |= kLightFlagControls[i].mask;
         else
@@ -4218,7 +5193,7 @@ LRESULT CALLBACK light_properties_proc(HWND hwnd, UINT message, WPARAM wparam, L
     case WM_COMMAND:
         if (LOWORD(wparam) == ID_LIGHT_FLAGS && HIWORD(wparam) == EN_CHANGE) {
             const uint32_t flags = get_u32(state->flags, state->value.m_uFlags);
-            for (int i = 0; i < 7; ++i)
+            for (int i = 0; i < static_cast<int>(_countof(kLightFlagControls)); ++i)
                 SendMessageA(state->flag_checks[i], BM_SETCHECK,
                              flags & kLightFlagControls[i].mask ? BST_CHECKED : BST_UNCHECKED, 0);
         } else if (LOWORD(wparam) >= ID_LIGHT_FLAG_FIRST && LOWORD(wparam) <= ID_LIGHT_FLAG_LAST &&
@@ -4287,11 +5262,13 @@ void command_light_properties() {
     if (!state.accepted)
         return;
 
+    if (!g.history.begin(g.document, g.selected))
+        return;
     entity.light = state.value;
     entity.position = state.value.Position;
     entity.value_a = state.value.Brightness;
     entity.value_b = state.value.Range;
-    mark_dirty();
+    commit_history_transaction();
     refresh_inspector();
     request_redraw();
 }
@@ -4318,33 +5295,89 @@ void adopt_pickup_template(Entity* entity, const PickupTemplate& source) {
     entity->pickup_has_template = true;
 }
 
+const char* entity_type_label(EntityKind kind) {
+    switch (kind) {
+    case EntityKind::SpawnPoint: return "Spawn";
+    case EntityKind::Light: return "Light";
+    case EntityKind::Sound: return "Sound";
+    case EntityKind::PhysicalObject: return "Pickup";
+    case EntityKind::AssassinationTarget: return "Target";
+    case EntityKind::PositionMarker: return "Marker";
+    }
+    return "Entity";
+}
+
+int entity_list_row(int document_index) {
+    const int count = static_cast<int>(SendMessageA(g.list, LB_GETCOUNT, 0, 0));
+    for (int row = 0; row < count; ++row)
+        if (static_cast<int>(SendMessageA(g.list, LB_GETITEMDATA, row, 0)) == document_index)
+            return row;
+    return LB_ERR;
+}
+
 void refresh_list() {
     SendMessageA(g.list, LB_RESETCONTENT, 0, 0);
-    for (const Entity& e : g.document.entities) {
-        const char* prefix = "Spawn";
-        if (e.kind == EntityKind::Light)
-            prefix = "Light";
-        else if (e.kind == EntityKind::Sound)
-            prefix = "Sound";
-        else if (e.kind == EntityKind::PhysicalObject)
-            prefix = "Pickup";
-        else if (e.kind == EntityKind::AssassinationTarget)
-            prefix = "Target";
-        else if (e.kind == EntityKind::PositionMarker)
-            prefix = "Marker";
-        std::string line = std::string(prefix) + "  " + e.name;
-        SendMessageA(g.list, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(line.c_str()));
+    std::vector<uint32_t> order(g.document.entities.size());
+    for (uint32_t index = 0; index < order.size(); ++index)
+        order[index] = index;
+    std::stable_sort(order.begin(), order.end(), [](uint32_t a, uint32_t b) {
+        const Entity& first = g.document.entities[a];
+        const Entity& second = g.document.entities[b];
+        const int names = _stricmp(first.name.c_str(), second.name.c_str());
+        if (names != 0)
+            return names < 0;
+        const int types = _stricmp(entity_type_label(first.kind), entity_type_label(second.kind));
+        if (types != 0)
+            return types < 0;
+        return first.guid < second.guid;
+    });
+    for (uint32_t index : order) {
+        const Entity& entity = g.document.entities[index];
+        const std::string line = std::string(entity_type_label(entity.kind)) + "  " + entity.name;
+        const LRESULT row = SendMessageA(g.list, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(line.c_str()));
+        if (row != LB_ERR && row != LB_ERRSPACE)
+            SendMessageA(g.list, LB_SETITEMDATA, static_cast<WPARAM>(row), index);
     }
     if (g.selected >= static_cast<int>(g.document.entities.size()))
         g.selected = static_cast<int>(g.document.entities.size()) - 1;
     if (g.selected >= 0)
-        SendMessageA(g.list, LB_SETCURSEL, g.selected, 0);
+        SendMessageA(g.list, LB_SETCURSEL, entity_list_row(g.selected), 0);
+}
+
+void refresh_pickup_choices(uint32_t selected_item) {
+    SendMessageA(g.pickup_item, CB_RESETCONTENT, 0, 0);
+    std::vector<const PickupTemplate*> choices;
+    choices.reserve(g.document.pickup_templates.size());
+    for (const PickupTemplate& item : g.document.pickup_templates)
+        choices.push_back(&item);
+    std::stable_sort(choices.begin(), choices.end(), [](const PickupTemplate* a, const PickupTemplate* b) {
+        const std::string first = snipe_item_label(a->item_id);
+        const std::string second = snipe_item_label(b->item_id);
+        const int names = _stricmp(first.c_str(), second.c_str());
+        return names != 0 ? names < 0 : a->item_id < b->item_id;
+    });
+    for (const PickupTemplate* item : choices) {
+        const std::string label = snipe_item_label(item->item_id);
+        const LRESULT row = SendMessageA(g.pickup_item, CB_ADDSTRING, 0,
+                                         reinterpret_cast<LPARAM>(label.c_str()));
+        if (row == CB_ERR || row == CB_ERRSPACE)
+            continue;
+        SendMessageA(g.pickup_item, CB_SETITEMDATA, static_cast<WPARAM>(row), item->item_id);
+        if (item->item_id == selected_item)
+            SendMessageA(g.pickup_item, CB_SETCURSEL, static_cast<WPARAM>(row), 0);
+    }
 }
 
 void refresh_inspector() {
     const bool enabled = g.selected >= 0 && g.selected < static_cast<int>(g.document.entities.size());
     const bool source_entity = enabled && g.document.entities[g.selected].source_entity_record;
     const bool pickup = enabled && g.document.entities[g.selected].kind == EntityKind::PhysicalObject;
+    if (g.rain_toggle) {
+        SendMessageA(g.rain_toggle, BM_SETCHECK,
+                     g.document.rain_enabled ? BST_CHECKED : BST_UNCHECKED, 0);
+        EnableWindow(g.rain_toggle,
+                     !g.document.source_pc_path.empty() || !g.document.obj_path.empty());
+    }
     HWND fields[] = {g.name, g.pos[0], g.pos[1], g.pos[2], g.rot[0], g.rot[1], g.rot[2], g.value[0], g.value[1]};
     for (HWND h : fields)
         EnableWindow(h, enabled);
@@ -4354,7 +5387,23 @@ void refresh_inspector() {
     EnableWindow(GetDlgItem(g.window, ID_DELETE_ENTITY), enabled && (!source_entity || pickup));
     ShowWindow(g.sound_browse, SW_HIDE);
     ShowWindow(g.sound_loop, SW_HIDE);
+    ShowWindow(g.sound_preview, SW_HIDE);
     ShowWindow(g.light_properties, SW_HIDE);
+    ShowWindow(g.pickup_item, SW_HIDE);
+    ShowWindow(g.spawn_team_label, SW_HIDE);
+    ShowWindow(g.spawn_game_mode_label, SW_HIDE);
+    for (HWND check : g.spawn_team_checks)
+        ShowWindow(check, SW_HIDE);
+    for (HWND check : g.spawn_game_mode_checks)
+        ShowWindow(check, SW_HIDE);
+    for (int i = 0; i < 3; ++i) {
+        ShowWindow(GetDlgItem(g.window, 914 + i), SW_SHOW);
+        ShowWindow(g.rot[i], SW_SHOW);
+    }
+    for (int i = 0; i < 2; ++i) {
+        ShowWindow(g.value_label[i], SW_SHOW);
+        ShowWindow(g.value[i], SW_SHOW);
+    }
     if (!enabled) {
         for (HWND h : fields)
             SetWindowTextA(h, "");
@@ -4371,12 +5420,10 @@ void refresh_inspector() {
     set_float(g.pos[1], e.position.y);
     set_float(g.pos[2], e.position.z);
     if (e.kind == EntityKind::Light) {
-        set_control_text(GetDlgItem(g.window, 914), "Direction X");
-        set_control_text(GetDlgItem(g.window, 915), "Direction Y");
-        set_control_text(GetDlgItem(g.window, 916), "Direction Z");
-        set_float(g.rot[0], e.light.Direction.x);
-        set_float(g.rot[1], e.light.Direction.y);
-        set_float(g.rot[2], e.light.Direction.z);
+        for (int i = 0; i < 3; ++i) {
+            ShowWindow(GetDlgItem(g.window, 914 + i), SW_HIDE);
+            ShowWindow(g.rot[i], SW_HIDE);
+        }
     } else {
         set_control_text(GetDlgItem(g.window, 914), "Pitch");
         set_control_text(GetDlgItem(g.window, 915), "Yaw");
@@ -4384,12 +5431,30 @@ void refresh_inspector() {
         set_float(g.rot[0], e.rotation.x);
         set_float(g.rot[1], e.rotation.y);
         set_float(g.rot[2], e.rotation.z);
+        if (e.kind == EntityKind::SpawnPoint) {
+            set_control_text(GetDlgItem(g.window, 914), "Camera pitch");
+            set_control_text(GetDlgItem(g.window, 915), "Camera yaw");
+            ShowWindow(GetDlgItem(g.window, 916), SW_HIDE);
+            ShowWindow(g.rot[2], SW_HIDE);
+        }
     }
     if (e.kind == EntityKind::SpawnPoint) {
-        set_control_text(g.value_label[0], "Team mask");
-        set_control_text(g.value_label[1], "Gamemode");
-        set_float(g.value[0], static_cast<float>(e.value_u32_a));
-        set_float(g.value[1], static_cast<float>(e.value_u32_b));
+        for (int i = 0; i < 2; ++i) {
+            ShowWindow(g.value_label[i], SW_HIDE);
+            ShowWindow(g.value[i], SW_HIDE);
+        }
+        ShowWindow(g.spawn_team_label, SW_SHOW);
+        ShowWindow(g.spawn_game_mode_label, SW_SHOW);
+        for (int i = 0; i < static_cast<int>(_countof(kSpawnTeamControls)); ++i) {
+            ShowWindow(g.spawn_team_checks[i], SW_SHOW);
+            SendMessageA(g.spawn_team_checks[i], BM_SETCHECK,
+                         e.value_u32_a & kSpawnTeamControls[i].mask ? BST_CHECKED : BST_UNCHECKED, 0);
+        }
+        for (int i = 0; i < static_cast<int>(_countof(kSpawnGameModeControls)); ++i) {
+            ShowWindow(g.spawn_game_mode_checks[i], SW_SHOW);
+            SendMessageA(g.spawn_game_mode_checks[i], BM_SETCHECK,
+                         e.value_u32_b & kSpawnGameModeControls[i].mask ? BST_CHECKED : BST_UNCHECKED, 0);
+        }
     } else if (e.kind == EntityKind::Light) {
         set_control_text(g.value_label[0], "Brightness");
         set_control_text(g.value_label[1], "Range");
@@ -4404,11 +5469,17 @@ void refresh_inspector() {
         SendMessageA(g.sound_loop, BM_SETCHECK, e.sound_loop ? BST_CHECKED : BST_UNCHECKED, 0);
         ShowWindow(g.sound_loop, SW_SHOW);
         ShowWindow(g.sound_browse, SW_SHOW);
+        ShowWindow(g.sound_preview, SW_SHOW);
     } else if (e.kind == EntityKind::PhysicalObject) {
-        set_control_text(g.value_label[0], "Item ID");
+        set_control_text(g.value_label[0], "Item type");
         set_control_text(g.value_label[1], "Object file ID");
         set_u32_hex(g.value[0], e.value_u32_a);
         set_u32_hex(g.value[1], e.value_u32_b);
+        ShowWindow(g.value[0], SW_HIDE);
+        refresh_pickup_choices(e.value_u32_a);
+        EnableWindow(g.pickup_item,
+                     SendMessageA(g.pickup_item, CB_GETCOUNT, 0, 0) > 0);
+        ShowWindow(g.pickup_item, SW_SHOW);
     } else if (e.kind == EntityKind::AssassinationTarget) {
         set_control_text(g.value_label[0], "Health");
         set_control_text(g.value_label[1], "Class ID");
@@ -4423,15 +5494,54 @@ void refresh_inspector() {
 }
 
 void select_entity(int index) {
+    if (index != g.selected)
+        stop_sound_preview();
     g.selected = index;
     if (index >= 0)
-        SendMessageA(g.list, LB_SETCURSEL, index, 0);
+        SendMessageA(g.list, LB_SETCURSEL, entity_list_row(index), 0);
     refresh_inspector();
     request_redraw();
 }
 
+void focus_camera_on_entity(int index) {
+    if (index < 0 || index >= static_cast<int>(g.document.entities.size()))
+        return;
+    const Entity& entity = g.document.entities[index];
+    g.camera.target = entity_view_position(entity.position);
+
+    // Fit an actual spawn/pickup mesh when one is available. Rotation and the
+    // target-to-editor Y conversion preserve the local bounding-sphere radius.
+    float radius = fmaxf(.35f, g.mesh.radius * .008f) * 1.6f;
+    if (const SpawnPuppet* model = entity_render_model(entity)) {
+        const Asura_Vector_3 local_center{(model->min.x + model->max.x) * .5f,
+                                          (model->min.y + model->max.y) * .5f,
+                                          (model->min.z + model->max.z) * .5f};
+        g.camera.target = spawn_puppet_view_position(local_center, entity);
+        const float width = model->max.x - model->min.x;
+        const float height = model->max.y - model->min.y;
+        const float depth = model->max.z - model->min.z;
+        const float model_radius = .5f * sqrtf(width * width + height * height + depth * depth);
+        if (isfinite(model_radius) && model_radius > .01f)
+            radius = model_radius;
+    } else if (entity.kind == EntityKind::PositionMarker) {
+        const float width = entity.source_bounds.MaxX - entity.source_bounds.MinX;
+        const float height = entity.source_bounds.MaxY - entity.source_bounds.MinY;
+        const float depth = entity.source_bounds.MaxZ - entity.source_bounds.MinZ;
+        const float marker_radius = .5f * sqrtf(width * width + height * height + depth * depth);
+        if (isfinite(marker_radius) && marker_radius > .01f)
+            radius = marker_radius;
+    }
+
+    g.camera.distance = std::clamp(radius * 2.8f, .5f, 1000000.0f);
+    invalidate_environment_cache();
+    request_redraw();
+    set_status("Camera focused on the selected entity.");
+}
+
 void apply_inspector() {
     if (g.selected < 0 || g.selected >= static_cast<int>(g.document.entities.size()))
+        return;
+    if (!g.history.begin(g.document, g.selected))
         return;
     Entity& e = g.document.entities[g.selected];
     char name[512]{};
@@ -4441,21 +5551,30 @@ void apply_inspector() {
                   get_float(g.pos[2], e.position.z)};
     if (e.kind == EntityKind::Light) {
         e.light.Position = e.position;
-        e.light.Direction = {get_float(g.rot[0], e.light.Direction.x),
-                             get_float(g.rot[1], e.light.Direction.y),
-                             get_float(g.rot[2], e.light.Direction.z)};
+    } else if (e.kind == EntityKind::SpawnPoint) {
+        e.rotation.x = get_float(g.rot[0], e.rotation.x);
+        e.rotation.y = get_float(g.rot[1], e.rotation.y);
+        e.rotation.z = 0.0f;
     } else {
         e.rotation = {get_float(g.rot[0], e.rotation.x), get_float(g.rot[1], e.rotation.y),
                       get_float(g.rot[2], e.rotation.z)};
     }
     if (e.kind == EntityKind::SpawnPoint) {
-        e.value_u32_a = static_cast<uint32_t>(fmaxf(0, get_float(g.value[0], static_cast<float>(e.value_u32_a))));
-        e.value_u32_b = static_cast<uint32_t>(fmaxf(0, get_float(g.value[1], static_cast<float>(e.value_u32_b))));
-        if (e.spawn_source_record) {
-            const float yaw = e.rotation.y * 3.14159265358979323846f / 180.0f;
-            const float pitch = e.rotation.x * 3.14159265358979323846f / 180.0f;
-            e.spawn_direction = {cosf(pitch) * sinf(yaw), sinf(pitch), cosf(pitch) * cosf(yaw)};
+        for (int i = 0; i < static_cast<int>(_countof(kSpawnTeamControls)); ++i) {
+            if (SendMessageA(g.spawn_team_checks[i], BM_GETCHECK, 0, 0) == BST_CHECKED)
+                e.value_u32_a |= kSpawnTeamControls[i].mask;
+            else
+                e.value_u32_a &= ~kSpawnTeamControls[i].mask;
         }
+        for (int i = 0; i < static_cast<int>(_countof(kSpawnGameModeControls)); ++i) {
+            if (SendMessageA(g.spawn_game_mode_checks[i], BM_GETCHECK, 0, 0) == BST_CHECKED)
+                e.value_u32_b |= kSpawnGameModeControls[i].mask;
+            else
+                e.value_u32_b &= ~kSpawnGameModeControls[i].mask;
+        }
+        const float yaw = e.rotation.y * 3.14159265358979323846f / 180.0f;
+        const float pitch = e.rotation.x * 3.14159265358979323846f / 180.0f;
+        e.spawn_direction = {cosf(pitch) * sinf(yaw), sinf(pitch), cosf(pitch) * cosf(yaw)};
     } else if (e.kind == EntityKind::Light) {
         e.value_a = get_float(g.value[0], e.light.Brightness);
         e.value_b = get_float(g.value[1], e.light.Range);
@@ -4474,7 +5593,12 @@ void apply_inspector() {
                                                    : (e.sound_phonon.m_uFlags & ~1u);
         }
     } else if (e.kind == EntityKind::PhysicalObject) {
-        const uint32_t requested_item = get_u32(g.value[0], e.value_u32_a);
+        const LRESULT selected_item = SendMessageA(g.pickup_item, CB_GETCURSEL, 0, 0);
+        const uint32_t requested_item = selected_item == CB_ERR
+                                            ? e.value_u32_a
+                                            : static_cast<uint32_t>(SendMessageA(
+                                                  g.pickup_item, CB_GETITEMDATA,
+                                                  static_cast<WPARAM>(selected_item), 0));
         if (requested_item != e.value_u32_a) {
             const PickupTemplate* item_template = find_pickup_template(g.document, requested_item, true);
             if (item_template) {
@@ -4496,7 +5620,7 @@ void apply_inspector() {
             }
         }
     }
-    mark_dirty();
+    commit_history_transaction();
     refresh_list();
     refresh_inspector();
     request_redraw();
@@ -4505,16 +5629,19 @@ void apply_inspector() {
 void frame_mesh() {
     g.camera.target = g.mesh.center;
     g.camera.distance = fmaxf(10.0f, g.mesh.radius * 2.3f);
+    g.environment_raycast.build(g.mesh);
     invalidate_environment_cache();
     if (gpu.ready)
         gpu_upload_mesh();
 }
 
 bool open_obj_path(const std::string& path) {
+    stop_sound_preview();
     Mesh mesh;
     std::string why;
     SetCursor(LoadCursor(nullptr, IDC_WAIT));
-    const bool ok = load_preview_mesh(path, &mesh, &why);
+    const std::string preview_material_map = g.document.source_pc_path.empty() ? g.document.material_map : std::string{};
+    const bool ok = load_preview_mesh(path, preview_material_map, &mesh, &why);
     SetCursor(LoadCursor(nullptr, IDC_ARROW));
     if (!ok) {
         MessageBoxA(g.window, why.c_str(), "Could not open OBJ", MB_ICONERROR);
@@ -4539,7 +5666,7 @@ bool open_obj_path(const std::string& path) {
         g.document.output_path += ".PC";
     }
     frame_mesh();
-    mark_dirty();
+    reset_history(false);
     char status[256];
     snprintf(status, sizeof(status), "%zu vertices, %zu triangles", g.mesh.positions.size(), g.mesh.faces.size());
     set_status(status);
@@ -4563,10 +5690,13 @@ void add_entity_at(EntityKind kind, const Asura_Vector_3& p) {
         e.source_entity_record = false;
         e.source_entity_classification = SnipeEntityClass_PhysicalObject;
     }
+    if (!g.history.begin(g.document, g.selected))
+        return;
     e.kind = kind;
     e.position = p;
     e.guid = allocate_editor_guid(&g.document);
     if (!e.guid) {
+        g.history.cancel_transaction();
         g.pending_kind = -1;
         set_status("No free authored entity GUIDs remain in the target's valid range.");
         return;
@@ -4582,7 +5712,6 @@ void add_entity_at(EntityKind kind, const Asura_Vector_3& p) {
         snprintf(name, sizeof(name), "Light %zu", g.document.entities.size() + 1);
         e.value_a = 2.5f;
         e.value_b = 1500;
-        e.rotation.x = -35;
         e.light = legacy_editor_light(e);
     } else if (kind == EntityKind::Sound) {
         snprintf(name, sizeof(name), "Sound %zu", g.document.entities.size() + 1);
@@ -4594,13 +5723,14 @@ void add_entity_at(EntityKind kind, const Asura_Vector_3& p) {
                  g.document.entities.size() + 1);
     }
     e.name = name;
+    stop_sound_preview();
     g.document.entities.push_back(std::move(e));
     g.pending_kind = -1;
     g.selected = static_cast<int>(g.document.entities.size()) - 1;
-    mark_dirty();
+    commit_history_transaction();
     refresh_list();
     refresh_inspector();
-    set_status("Entity placed. Drag it on the ground plane or edit the numeric transform.");
+    set_status("Entity placed on the environment. Drag it across environment geometry or edit its transform.");
     request_redraw();
 }
 
@@ -4615,7 +5745,7 @@ void begin_place(EntityKind kind) {
         return;
     }
     g.pending_kind = static_cast<int>(kind);
-    set_status("Click the viewport to place the entity on the Y=0 ground plane. Right-drag orbits; wheel zooms.");
+    set_status("Click visible environment geometry to place the entity. Right-drag orbits; wheel zooms.");
 }
 
 bool spawn_puppet_screen_bounds(const Entity& entity, RECT* bounds, float* nearest_depth = nullptr) {
@@ -4660,6 +5790,8 @@ int hit_entity(int x, int y) {
     float best_depth = 1.0e30f;
     for (int i = 0; i < static_cast<int>(g.document.entities.size()); ++i) {
         const Entity& entity = g.document.entities[i];
+        if (i != g.selected && environment_occludes_view_position(entity_view_position(entity.position)))
+            continue;
         if (entity_render_model(entity)) {
             RECT bounds{};
             float depth = 0;
@@ -4879,20 +6011,13 @@ void draw_light_gizmo(HDC dc, const Entity& entity, bool selected) {
     const float marker = fmaxf(.35f, g.mesh.radius * .008f);
     std::vector<LightGizmoLine> lines;
     lines.reserve(kMaximumLightGizmoLines);
-    append_light_gizmo(entity, marker, &lines);
+    append_light_gizmo(entity, &lines);
     if (lines.empty())
         return;
     HPEN range_pen = CreatePen(PS_SOLID, selected ? 2 : 1,
                                selected ? RGB(255, 235, 90) : RGB(148, 120, 24));
-    HPEN direction_pen = CreatePen(PS_SOLID, selected ? 2 : 1,
-                                   selected ? RGB(255, 255, 255) : RGB(255, 155, 22));
     HGDIOBJ old_pen = SelectObject(dc, range_pen);
-    LightGizmoPart selected_part = LightGizmoPart::Range;
     for (const LightGizmoLine& line : lines) {
-        if (line.part != selected_part) {
-            selected_part = line.part;
-            SelectObject(dc, selected_part == LightGizmoPart::Range ? range_pen : direction_pen);
-        }
         POINT a{}, b{};
         if (project_point(line.a, &a) && project_point(line.b, &b)) {
             MoveToEx(dc, a.x, a.y, nullptr);
@@ -4901,7 +6026,6 @@ void draw_light_gizmo(HDC dc, const Entity& entity, bool selected) {
     }
     SelectObject(dc, old_pen);
     DeleteObject(range_pen);
-    DeleteObject(direction_pen);
 }
 
 void draw_sound_gizmo(HDC dc, const Entity& entity) {
@@ -4963,6 +6087,8 @@ void draw_entities(HDC dc) {
     SetTextColor(dc, RGB(230, 235, 240));
     for (int i = 0; i < static_cast<int>(g.document.entities.size()); ++i) {
         const Entity& e = g.document.entities[i];
+        if (i != g.selected && environment_occludes_view_position(entity_view_position(e.position)))
+            continue;
         POINT p{};
         if (!project_point(entity_view_position(e.position), &p))
             continue;
@@ -5051,7 +6177,7 @@ void layout_controls() {
                                             {ID_OPEN_PROJECT, 184, 84},    {ID_SAVE_PROJECT, 272, 84},
                                             {ID_EXPORT_PC, 360, 90},       {ID_MATERIAL_MAP, 454, 104},
                                             {ID_TEXTURE_DIR, 562, 100},    {ID_WEAPONS_DONOR, 666, 112},
-                                            {ID_SKYBOX_TEXTURES, 782, 116}};
+                                            {ID_SKYBOX_TEXTURES, 782, 116}, {ID_TOGGLE_RAIN, 906, 74}};
     for (auto c : top)
         MoveWindow(GetDlgItem(g.window, c.id), c.x, top_y, c.w, 28, TRUE);
     MoveWindow(g.list, 8, 48, 220, std::max(80, static_cast<int>(r.bottom) - 301), TRUE);
@@ -5067,7 +6193,7 @@ void layout_controls() {
     MoveWindow(GetDlgItem(g.window, ID_DELETE_ENTITY), 8, y, 218, 27, TRUE);
     y += 38;
     HWND hint = GetDlgItem(g.window, 900);
-    MoveWindow(hint, 8, y, 220, 60, TRUE);
+    MoveWindow(hint, 8, y, 220, 75, TRUE);
 
     const int label_x = right, edit_x = right + 88, ew = 164;
     int iy = 52;
@@ -5082,14 +6208,26 @@ void layout_controls() {
     }
     MoveWindow(g.value_label[0], label_x, iy + 3, 84, 22, TRUE);
     MoveWindow(g.value[0], edit_x, iy, ew, 24, TRUE);
+    MoveWindow(g.pickup_item, edit_x, iy, ew, 240, TRUE);
     iy += 30;
     MoveWindow(g.value_label[1], label_x, iy + 3, 84, 22, TRUE);
     MoveWindow(g.value[1], edit_x, iy, ew, 24, TRUE);
     iy += 34;
-    MoveWindow(g.sound_browse, edit_x, iy, ew, 26, TRUE);
+    MoveWindow(g.sound_browse, edit_x, iy, 80, 26, TRUE);
+    MoveWindow(g.sound_preview, edit_x + 84, iy, 80, 26, TRUE);
     MoveWindow(g.sound_loop, label_x, iy, 82, 26, TRUE);
     MoveWindow(g.light_properties, edit_x, iy, ew, 26, TRUE);
-    iy += 34;
+    MoveWindow(g.spawn_team_label, label_x, iy, 252, 22, TRUE);
+    for (int i = 0; i < static_cast<int>(_countof(kSpawnTeamControls)); ++i) {
+        const int column = i % 2, row = i / 2;
+        MoveWindow(g.spawn_team_checks[i], label_x + column * 126, iy + 22 + row * 24, 126, 22, TRUE);
+    }
+    MoveWindow(g.spawn_game_mode_label, label_x, iy + 72, 252, 22, TRUE);
+    for (int i = 0; i < static_cast<int>(_countof(kSpawnGameModeControls)); ++i) {
+        const int column = i % 2, row = i / 2;
+        MoveWindow(g.spawn_game_mode_checks[i], label_x + column * 126, iy + 94 + row * 24, 126, 22, TRUE);
+    }
+    iy += 172;
     MoveWindow(GetDlgItem(g.window, ID_APPLY_INSPECTOR), label_x, iy, 252, 30, TRUE);
     MoveWindow(g.status, 8, r.bottom - 21, std::max(20, static_cast<int>(r.right) - 16), 18, TRUE);
 }
@@ -5116,14 +6254,19 @@ void create_controls() {
     make_control("BUTTON", "Material map", BS_PUSHBUTTON, ID_MATERIAL_MAP);
     make_control("BUTTON", "Texture folder", BS_PUSHBUTTON, ID_TEXTURE_DIR);
     make_control("BUTTON", "Weapons donor", BS_PUSHBUTTON, ID_WEAPONS_DONOR);
-    make_control("BUTTON", "Skybox textures", BS_PUSHBUTTON, ID_SKYBOX_TEXTURES);
+    make_control("BUTTON", "Skybox properties", BS_PUSHBUTTON, ID_SKYBOX_TEXTURES);
+    g.rain_toggle = make_control("BUTTON", "Rain", BS_AUTOCHECKBOX, ID_TOGGLE_RAIN);
     g.list = make_control("LISTBOX", "", LBS_NOTIFY | WS_VSCROLL | WS_BORDER, ID_ENTITY_LIST);
     make_control("BUTTON", "+ Spawn", BS_PUSHBUTTON, ID_ADD_SPAWN);
     make_control("BUTTON", "+ Light", BS_PUSHBUTTON, ID_ADD_LIGHT);
     make_control("BUTTON", "+ Pickup", BS_PUSHBUTTON, ID_ADD_PICKUP);
     make_control("BUTTON", "+ Sound", BS_PUSHBUTTON, ID_ADD_SOUND);
     make_control("BUTTON", "Delete selected", BS_PUSHBUTTON, ID_DELETE_ENTITY);
-    make_control("STATIC", "Right-drag: orbit\r\nMiddle-drag: pan\r\nWheel: zoom", SS_LEFT, 900);
+    make_control("STATIC",
+                 "Right-drag: orbit; middle-drag: pan; wheel: zoom\r\n"
+                 "Double-click list: focus selected entity\r\n"
+                 "Ctrl+Z/Y: undo/redo; Ctrl+C/V: copy/paste; Delete: remove",
+                 SS_LEFT, 900);
     make_control("STATIC", "Name", SS_LEFT, 910);
     make_control("STATIC", "Position X", SS_LEFT, 911);
     make_control("STATIC", "Position Y (-up)", SS_LEFT, 912);
@@ -5142,8 +6285,19 @@ void create_controls() {
     g.value_label[1] = make_control("STATIC", "Property B", SS_LEFT, 918);
     g.value[0] = make_control("EDIT", "", ES_AUTOHSCROLL | WS_BORDER, ID_VALUE_A);
     g.value[1] = make_control("EDIT", "", ES_AUTOHSCROLL | WS_BORDER, ID_VALUE_B);
+    g.pickup_item = make_control("COMBOBOX", "", CBS_DROPDOWNLIST | CBS_AUTOHSCROLL | WS_VSCROLL,
+                                 ID_PICKUP_ITEM);
     g.sound_browse = make_control("BUTTON", "Choose WAV...", BS_PUSHBUTTON, ID_BROWSE_SOUND);
     g.sound_loop = make_control("BUTTON", "Loop", BS_AUTOCHECKBOX, ID_SOUND_LOOP);
+    g.sound_preview = make_control("BUTTON", "Play preview", BS_PUSHBUTTON, ID_SOUND_PREVIEW);
+    g.spawn_team_label = make_control("STATIC", "Teams", SS_LEFT, 919);
+    g.spawn_game_mode_label = make_control("STATIC", "Game modes", SS_LEFT, 920);
+    for (int i = 0; i < static_cast<int>(_countof(kSpawnTeamControls)); ++i)
+        g.spawn_team_checks[i] = make_control("BUTTON", kSpawnTeamControls[i].label, BS_AUTOCHECKBOX,
+                                             ID_SPAWN_TEAM_FIRST + i);
+    for (int i = 0; i < static_cast<int>(_countof(kSpawnGameModeControls)); ++i)
+        g.spawn_game_mode_checks[i] = make_control("BUTTON", kSpawnGameModeControls[i].label, BS_AUTOCHECKBOX,
+                                                  ID_SPAWN_GAME_MODE_FIRST + i);
     g.light_properties =
         make_control("BUTTON", "All light properties...", BS_PUSHBUTTON, ID_LIGHT_PROPERTIES);
     make_control("BUTTON", "Apply properties", BS_PUSHBUTTON, ID_APPLY_INSPECTOR);
@@ -5205,7 +6359,7 @@ void merge_pickup_templates(Document* document, const std::vector<PickupTemplate
 bool load_document_preview(Document* document, Mesh* mesh, std::string* why,
                            std::vector<PickupModel>* pickup_models = nullptr) {
     if (!document->obj_path.empty()) {
-        if (!load_preview_mesh(document->obj_path, mesh, why))
+        if (!load_preview_mesh(document->obj_path, document->material_map, mesh, why))
             return false;
         if (document->weapons_donor.empty()) {
             if (pickup_models)
@@ -5225,6 +6379,12 @@ bool load_document_preview(Document* document, Mesh* mesh, std::string* why,
         Document imported;
         if (!load_pc_level(document->source_pc_path, &imported, mesh, why, pickup_models))
             return false;
+        if (!document->skybox.source_record && imported.skybox.source_record)
+            document->skybox = imported.skybox;
+        if (!document->weather_source_record && imported.weather_source_record) {
+            document->weather_source_record = true;
+            document->rain_enabled = imported.rain_enabled;
+        }
         enrich_project_pickup_templates(document, imported);
         return true;
     }
@@ -5235,6 +6395,7 @@ bool load_document_preview(Document* document, Mesh* mesh, std::string* why,
 }
 
 bool open_pc_path(const std::string& path) {
+    stop_sound_preview();
     set_status("Reading PC environment and supported entities...");
     UpdateWindow(g.window);
     SetCursor(LoadCursor(nullptr, IDC_WAIT));
@@ -5257,6 +6418,7 @@ bool open_pc_path(const std::string& path) {
     std::string skybox_why;
     const bool skybox_loaded = gpu_load_pc_skybox(path, &skybox_why);
     frame_mesh();
+    reset_history(true);
     refresh_list();
     refresh_inspector();
     update_title();
@@ -5296,7 +6458,7 @@ void command_save_project() {
         return;
     }
     g.document.project_path = path;
-    g.document.dirty = false;
+    g.history.mark_saved(&g.document);
     update_title();
     set_status("Project saved.");
 }
@@ -5306,10 +6468,184 @@ bool reload_skybox_preview(bool show_warning) {
     const bool use_embedded = g.document.sky_texture_dir.empty() && !g.document.source_pc_path.empty();
     const bool loaded = use_embedded ? gpu_load_pc_skybox(g.document.source_pc_path, &why)
                                      : gpu_load_skybox(g.document.sky_texture_dir, &why);
+    if (loaded) {
+        gpu_rebuild_skybox_vertices(g.document.skybox.orientation_radians,
+                                    g.document.skybox.back_texture_is_front_upside_down,
+                                    g.document.skybox.right_texture_is_left_upside_down, nullptr);
+        gpu.skybox_tint = {std::clamp(g.document.skybox.red / 255.0f, 0.0f, 1.0f),
+                           std::clamp(g.document.skybox.green / 255.0f, 0.0f, 1.0f),
+                           std::clamp(g.document.skybox.blue / 255.0f, 0.0f, 1.0f), 1.0f};
+    }
     if (!loaded && show_warning && (use_embedded || !g.document.sky_texture_dir.empty()))
         MessageBoxA(g.window, why.c_str(), "Skybox preview unavailable", MB_ICONWARNING);
     request_redraw();
     return loaded;
+}
+
+bool same_skybox_settings(const SkyboxSettings& a, const SkyboxSettings& b) {
+    return a.chunk_version == b.chunk_version && a.red == b.red &&
+           a.green == b.green && a.blue == b.blue &&
+           a.orientation_radians == b.orientation_radians && a.texture_paths == b.texture_paths &&
+           a.draw_clouds == b.draw_clouds &&
+           a.back_texture_is_front_upside_down == b.back_texture_is_front_upside_down &&
+           a.right_texture_is_left_upside_down == b.right_texture_is_left_upside_down &&
+           a.source_record == b.source_record;
+}
+
+bool all_pc_weather_records_match(const char* path, bool rain_enabled) {
+    Error err{};
+    Arena arena{};
+    ChunkList chunks{};
+    bool found = false, matches = true;
+    if (!arena_init(&arena, 8 * MiB, &err) || !parse_chunks(path, &chunks, &arena, &err)) {
+        arena_release(&arena);
+        return false;
+    }
+    for (uint32_t index = 0; index < chunks.count; ++index) {
+        const ChunkRef& chunk = chunks.chunks[index];
+        if (chunk.cid != ASURA_CHUNK_WEATHERSYSTEM || chunk.version < 5 ||
+            chunk.version > 6 || chunk.size <= 21)
+            continue;
+        found = true;
+        matches &= (chunk.data[21] != 0) == rain_enabled;
+    }
+    unmap_file(&chunks.file);
+    arena_release(&arena);
+    return found && matches;
+}
+
+bool refresh_history_derived_resources(const Document& previous, std::string* why) {
+    const bool preview_changed = previous.obj_path != g.document.obj_path ||
+                                 previous.source_pc_path != g.document.source_pc_path ||
+                                 previous.material_map != g.document.material_map ||
+                                 previous.weapons_donor != g.document.weapons_donor;
+    const bool textures_changed = previous.texture_dir != g.document.texture_dir ||
+                                  previous.material_map != g.document.material_map ||
+                                  previous.rain_enabled != g.document.rain_enabled;
+    const bool skybox_changed = previous.source_pc_path != g.document.source_pc_path ||
+                                previous.sky_texture_dir != g.document.sky_texture_dir ||
+                                !same_skybox_settings(previous.skybox, g.document.skybox);
+
+    bool ok = true;
+    if (preview_changed) {
+        // Preview loading enriches recovered document metadata.  Use a copy so
+        // derived-resource refresh never mutates the restored history state.
+        Document preview_document = g.document;
+        Mesh mesh;
+        std::vector<PickupModel> pickup_models;
+        std::string preview_why;
+        bool preview_loaded = load_document_preview(&preview_document, &mesh, &preview_why, &pickup_models);
+        if (preview_loaded && !g.document.source_pc_path.empty() &&
+            !g.document.weapons_donor.empty()) {
+            std::vector<PickupTemplate> donor_templates;
+            std::vector<PickupModel> donor_models;
+            preview_loaded = load_pickup_donor(g.document.weapons_donor, &donor_templates,
+                                               &donor_models, &preview_why);
+            if (preview_loaded) {
+                for (PickupModel& model : donor_models) {
+                    const bool present = std::any_of(
+                        pickup_models.begin(), pickup_models.end(), [&model](const PickupModel& existing) {
+                            return existing.skin_id == model.skin_id;
+                        });
+                    if (!present)
+                        pickup_models.push_back(std::move(model));
+                }
+            }
+        }
+        if (preview_loaded) {
+            g.mesh = std::move(mesh);
+            g.pickup_models = std::move(pickup_models);
+        } else {
+            g.mesh = {};
+            g.pickup_models.clear();
+            ok = false;
+            if (why)
+                *why = preview_why;
+        }
+        frame_mesh();
+    } else if (textures_changed) {
+        std::string texture_why;
+        if (!gpu_reload_environment_textures(&texture_why)) {
+            ok = false;
+            if (why && why->empty())
+                *why = texture_why;
+        }
+    }
+
+    if (skybox_changed && !reload_skybox_preview(false)) {
+        ok = false;
+        if (why && why->empty())
+            *why = "Skybox preview resources are unavailable for the restored state.";
+    }
+    return ok;
+}
+
+void finish_entity_drag_transaction() {
+    if (!g.moving_entity)
+        return;
+    g.moving_entity = false;
+    commit_history_transaction();
+    if (GetCapture() == g.window)
+        ReleaseCapture();
+}
+
+void refresh_after_history_restore(const Document& previous, const char* action) {
+    stop_sound_preview();
+    g.pending_kind = -1;
+    std::string why;
+    const bool resources_ready = refresh_history_derived_resources(previous, &why);
+    refresh_list();
+    refresh_inspector();
+    update_title();
+    request_redraw();
+    if (resources_ready)
+        set_status(action);
+    else
+        set_status((std::string(action) + " Preview refresh warning: " + why).c_str());
+}
+
+void command_undo() {
+    finish_entity_drag_transaction();
+    Document previous = g.document;
+    if (!g.history.undo(&g.document, &g.selected)) {
+        set_status("Nothing to undo.");
+        return;
+    }
+    refresh_after_history_restore(previous, "Undo complete.");
+}
+
+void command_redo() {
+    finish_entity_drag_transaction();
+    Document previous = g.document;
+    if (!g.history.redo(&g.document, &g.selected)) {
+        set_status("Nothing to redo.");
+        return;
+    }
+    refresh_after_history_restore(previous, "Redo complete.");
+}
+
+void command_copy_entity() {
+    std::string why;
+    if (!g.history.copy(g.document, g.selected, &why)) {
+        set_status(why.c_str());
+        return;
+    }
+    set_status("Entity copied. Paste creates an authored clone with a fresh target-valid GUID.");
+}
+
+void command_paste_entity() {
+    stop_sound_preview();
+    std::string why;
+    if (!g.history.paste(&g.document, &g.selected, &why)) {
+        set_status(why.c_str());
+        return;
+    }
+    g.pending_kind = -1;
+    refresh_list();
+    refresh_inspector();
+    update_title();
+    request_redraw();
+    set_status("Entity pasted as a new authored record.");
 }
 
 void command_open_project() {
@@ -5324,6 +6660,7 @@ void command_open_project() {
         MessageBoxA(g.window, why.c_str(), "Could not open project", MB_ICONERROR);
         return;
     }
+    stop_sound_preview();
     Mesh mesh;
     std::vector<PickupModel> pickup_models;
     if (!load_document_preview(&doc, &mesh, &why, &pickup_models)) {
@@ -5338,6 +6675,7 @@ void command_open_project() {
     const bool skybox_loaded = reload_skybox_preview(true);
     g.selected = g.document.entities.empty() ? -1 : 0;
     frame_mesh();
+    reset_history(!g.document.dirty);
     refresh_list();
     refresh_inspector();
     update_title();
@@ -5362,6 +6700,8 @@ void command_export() {
         path = edited_pc_path(g.document.source_pc_path);
     if (!choose_path(g.window, true, "Export target-game level", "Sniper Elite PC level\0*.PC\0", "PC", &path))
         return;
+    if (!g.history.begin(g.document, g.selected))
+        return;
     set_status("Packing environment, resources, and entities...");
     UpdateWindow(g.window);
     SetCursor(LoadCursor(nullptr, IDC_WAIT));
@@ -5369,16 +6709,123 @@ void command_export() {
     const bool ok = pack_document(g.document, path.c_str(), &why);
     SetCursor(LoadCursor(nullptr, IDC_ARROW));
     if (!ok) {
+        commit_history_transaction();
         set_status("Export failed.");
         MessageBoxA(g.window, why.c_str(), "Could not export .PC", MB_ICONERROR);
         return;
     }
     g.document.output_path = path;
-    mark_dirty();
+    commit_history_transaction();
     set_status(g.document.source_pc_path.empty()
                    ? "Export complete: the .PC contains the environment and editor-authored entities."
                    : "Export complete: source chunks were preserved and editable PC records were updated.");
     MessageBoxA(g.window, path.c_str(), "Exported .PC", MB_ICONINFORMATION);
+}
+
+bool valid_wave_bytes(const std::vector<uint8_t>& bytes) {
+    return bytes.size() >= 12 && memcmp(bytes.data(), "RIFF", 4) == 0 &&
+           memcmp(bytes.data() + 8, "WAVE", 4) == 0;
+}
+
+bool load_preview_wave_file(const std::string& path, std::vector<uint8_t>* bytes, std::string* why) {
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file) {
+        if (why)
+            *why = "Could not open the selected WAV file.";
+        return false;
+    }
+    const std::streamoff size = file.tellg();
+    if (size < 12 || size > static_cast<std::streamoff>(512 * MiB)) {
+        if (why)
+            *why = "The selected WAV file has an invalid size.";
+        return false;
+    }
+    std::vector<uint8_t> next(static_cast<size_t>(size));
+    file.seekg(0);
+    if (!file.read(reinterpret_cast<char*>(next.data()), static_cast<std::streamsize>(size)) ||
+        !valid_wave_bytes(next)) {
+        if (why)
+            *why = "The selected sound is not a raw RIFF/WAVE resource.";
+        return false;
+    }
+    *bytes = std::move(next);
+    return true;
+}
+
+bool load_embedded_preview_wave(const Entity& entity, std::vector<uint8_t>* bytes, std::string* why) {
+    if (g.document.source_pc_path.empty() || !entity.sound_source_record) {
+        if (why)
+            *why = "This sound has no local WAV or imported embedded resource.";
+        return false;
+    }
+    Arena arena{};
+    Error err{};
+    ChunkList chunks{};
+    bool ok = arena_init(&arena, 8 * MiB, &err) &&
+              parse_chunks(g.document.source_pc_path.c_str(), &chunks, &arena, &err);
+    if (ok) {
+        ok = false;
+        for (uint32_t chunk_index = 0; chunk_index < chunks.count; ++chunk_index) {
+            RscfInfo resource{};
+            if (!rscf_info(chunks.chunks[chunk_index], &resource) ||
+                resource.type != ASURA_RESOURCEFILE_TYPE_SOUND ||
+                resource.subtype != entity.sound_phonon.m_uSoundResourceID)
+                continue;
+            bytes->assign(resource.payload, resource.payload + resource.payload_size);
+            ok = valid_wave_bytes(*bytes);
+            if (!ok)
+                fail(&err, "embedded sound resource %u is not raw RIFF/WAVE data",
+                     entity.sound_phonon.m_uSoundResourceID);
+            break;
+        }
+        if (!ok && !err.set)
+            fail(&err, "embedded sound resource %u was not found", entity.sound_phonon.m_uSoundResourceID);
+    }
+    unmap_file(&chunks.file);
+    arena_release(&arena);
+    if (!ok && why)
+        *why = err.set ? err.message : "Could not read the embedded sound resource.";
+    return ok;
+}
+
+void command_sound_preview() {
+    if (g.selected < 0 || g.selected >= static_cast<int>(g.document.entities.size()) ||
+        g.document.entities[g.selected].kind != EntityKind::Sound)
+        return;
+    if (g.sound_preview_entity == g.selected) {
+        stop_sound_preview();
+        set_status("Sound preview stopped.");
+        return;
+    }
+
+    const Entity& entity = g.document.entities[g.selected];
+    std::vector<uint8_t> bytes;
+    std::string why;
+    bool loaded = !entity.sound_file.empty() && load_preview_wave_file(entity.sound_file, &bytes, &why);
+    bool using_embedded = false;
+    if (!loaded && entity.sound_source_record) {
+        loaded = load_embedded_preview_wave(entity, &bytes, &why);
+        using_embedded = loaded;
+    }
+    if (!loaded) {
+        MessageBoxA(g.window, why.c_str(), "Sound preview unavailable", MB_ICONWARNING);
+        return;
+    }
+
+    stop_sound_preview();
+    g.sound_preview_bytes = std::move(bytes);
+    // Preview once even when the in-game repeat flag is set; the same button
+    // remains available as an explicit stop control while playback is active.
+    const DWORD flags = SND_MEMORY | SND_ASYNC | SND_NODEFAULT;
+    if (!PlaySoundA(reinterpret_cast<LPCSTR>(g.sound_preview_bytes.data()), nullptr, flags)) {
+        g.sound_preview_bytes.clear();
+        MessageBoxA(g.window, "Windows could not play this WAV resource.", "Sound preview unavailable",
+                    MB_ICONWARNING);
+        return;
+    }
+    g.sound_preview_entity = g.selected;
+    SetWindowTextA(g.sound_preview, "Stop preview");
+    set_status(using_embedded ? "Playing embedded sound resource." : "Playing local WAV resource.");
 }
 
 void command_browse_sound() {
@@ -5387,13 +6834,16 @@ void command_browse_sound() {
     Entity& e = g.document.entities[g.selected];
     if (e.kind != EntityKind::Sound)
         return;
+    stop_sound_preview();
     std::string path = e.sound_file;
     if (!choose_path(g.window, false, "Choose sound resource", "Wave audio\0*.wav\0All files\0*.*\0", "wav", &path))
+        return;
+    if (!g.history.begin(g.document, g.selected))
         return;
     e.sound_file = path;
     e.sound_name = "sounds\\" + basename_without_extension(path);
     e.name = basename_without_extension(path);
-    mark_dirty();
+    commit_history_transaction();
     refresh_list();
     refresh_inspector();
     set_status(e.sound_name.c_str());
@@ -5401,20 +6851,71 @@ void command_browse_sound() {
 
 void command_material_map() {
     std::string path = g.document.material_map;
-    if (choose_path(g.window, false, "Choose material map", "Material map JSON\0*.json\0All files\0*.*\0", "json", &path)) {
-        g.document.material_map = path;
-        mark_dirty();
-        set_status(path.c_str());
+    if (!choose_path(g.window, false, "Choose material map", "Material map JSON\0*.json\0All files\0*.*\0", "json", &path))
+        return;
+    Mesh rebuilt;
+    std::string why;
+    if (!g.document.obj_path.empty() && !load_preview_mesh(g.document.obj_path, path, &rebuilt, &why)) {
+        MessageBoxA(g.window, why.c_str(), "Could not apply material map", MB_ICONERROR);
+        return;
     }
+    if (!g.history.begin(g.document, g.selected))
+        return;
+    g.document.material_map = path;
+    if (!g.document.obj_path.empty()) {
+        g.mesh = std::move(rebuilt);
+        g.environment_raycast.build(g.mesh);
+        invalidate_environment_cache();
+        gpu_upload_mesh();
+    } else {
+        gpu_reload_environment_textures(&why);
+    }
+    commit_history_transaction();
+    request_redraw();
+    set_status(why.empty() ? "Material map applied to the environment preview." : why.c_str());
 }
 
 void command_texture_dir() {
     std::string path = g.document.texture_dir.empty() ? folder_from_path(g.document.obj_path) : g.document.texture_dir;
     if (!choose_directory(g.window, "Choose texture folder", &path))
         return;
+    if (!g.history.begin(g.document, g.selected))
+        return;
     g.document.texture_dir = path;
-    mark_dirty();
-    set_status(g.document.texture_dir.c_str());
+    uint32_t loaded = 0, missing = 0;
+    std::string why;
+    gpu_reload_environment_textures(&why, &loaded, &missing);
+    commit_history_transaction();
+    request_redraw();
+    char status[256]{};
+    snprintf(status, sizeof(status), "Environment textures: %u loaded, %u using diffuse fallback.%s%s",
+             loaded, missing, why.empty() ? "" : " ", why.c_str());
+    set_status(status);
+}
+
+void command_toggle_rain() {
+    if (g.document.source_pc_path.empty() && g.document.obj_path.empty())
+        return;
+    const bool enabled = SendMessageA(g.rain_toggle, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    if (enabled == g.document.rain_enabled)
+        return;
+    if (!g.history.begin(g.document, g.selected)) {
+        SendMessageA(g.rain_toggle, BM_SETCHECK,
+                     g.document.rain_enabled ? BST_CHECKED : BST_UNCHECKED, 0);
+        return;
+    }
+    g.document.rain_enabled = enabled;
+    std::string why;
+    const bool preview_ready = gpu_reload_environment_textures(&why);
+    if (g.document.source_pc_path.empty())
+        gpu.environment_wet_weather = enabled;
+    commit_history_transaction();
+    invalidate_environment_cache();
+    request_redraw();
+    if (!preview_ready || !why.empty())
+        set_status((std::string(enabled ? "Rain enabled. " : "Rain disabled. ") + why).c_str());
+    else
+        set_status(enabled ? "WTHR rain enabled." : "WTHR rain disabled.");
 }
 
 void command_weapons_donor() {
@@ -5450,6 +6951,8 @@ void command_weapons_donor() {
             return;
         }
     }
+    if (!g.history.begin(g.document, g.selected))
+        return;
     g.document.weapons_donor = path;
     if (g.document.source_pc_path.empty()) {
         g.document.pickup_templates = templates;
@@ -5473,7 +6976,7 @@ void command_weapons_donor() {
                 g.pickup_models.push_back(std::move(model));
         }
     }
-    mark_dirty();
+    commit_history_transaction();
     char status[220]{};
     snprintf(status, sizeof(status), "Weapons donor loaded: %zu pickup item definitions, %zu rendered models.",
              templates.size(), g.pickup_models.size());
@@ -5483,16 +6986,248 @@ void command_weapons_donor() {
     request_redraw();
 }
 
+enum SkyboxPropertiesId : int {
+    ID_SKYBOX_RED = 3300,
+    ID_SKYBOX_GREEN,
+    ID_SKYBOX_BLUE,
+    ID_SKYBOX_ORIENTATION,
+    ID_SKYBOX_PATH_FIRST,
+    ID_SKYBOX_PATH_LAST = ID_SKYBOX_PATH_FIRST + ASURA_SKYBOX_V5_V7_TEXTURE_PATH_COUNT - 1,
+    ID_SKYBOX_DRAW_CLOUDS,
+    ID_SKYBOX_VERSION_6,
+    ID_SKYBOX_VERSION_7,
+    ID_SKYBOX_BACK_FLIPPED,
+    ID_SKYBOX_RIGHT_FLIPPED,
+    ID_SKYBOX_PREVIEW_FOLDER,
+    ID_SKYBOX_USE_EMBEDDED,
+};
+
+struct SkyboxPropertiesState {
+    HWND window = nullptr;
+    HWND red = nullptr;
+    HWND green = nullptr;
+    HWND blue = nullptr;
+    HWND orientation = nullptr;
+    HWND paths[ASURA_SKYBOX_V5_V7_TEXTURE_PATH_COUNT]{};
+    HWND draw_clouds = nullptr;
+    HWND version_6 = nullptr;
+    HWND version_7 = nullptr;
+    HWND back_flipped = nullptr;
+    HWND right_flipped = nullptr;
+    HWND preview_folder = nullptr;
+    SkyboxSettings value;
+    std::string texture_directory;
+    bool accepted = false;
+};
+
+HWND make_skybox_control(SkyboxPropertiesState* state, const char* cls, const char* text, DWORD style,
+                         int id, int x, int y, int width, int height) {
+    HWND control = CreateWindowExA(0, cls, text, WS_CHILD | WS_VISIBLE | style, x, y, width, height,
+                                   state->window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
+                                   GetModuleHandle(nullptr), nullptr);
+    SendMessageA(control, WM_SETFONT, reinterpret_cast<WPARAM>(g.font), TRUE);
+    return control;
+}
+
+void refresh_skybox_folder_text(SkyboxPropertiesState* state) {
+    SetWindowTextA(state->preview_folder,
+                   state->texture_directory.empty() ? "Embedded/source resources" : state->texture_directory.c_str());
+}
+
+void refresh_skybox_version_controls(SkyboxPropertiesState* state) {
+    const bool version_7 =
+        SendMessageA(state->version_7, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    EnableWindow(state->right_flipped, version_7);
+    if (!version_7)
+        SendMessageA(state->right_flipped, BM_SETCHECK, BST_UNCHECKED, 0);
+}
+
+void create_skybox_properties_controls(SkyboxPropertiesState* state) {
+    make_skybox_control(state, "STATIC", "RGB tint", SS_LEFT, 0, 14, 19, 82, 22);
+    constexpr const char* colour_labels[] = {"R", "G", "B"};
+    HWND* colours[] = {&state->red, &state->green, &state->blue};
+    constexpr int colour_ids[] = {ID_SKYBOX_RED, ID_SKYBOX_GREEN, ID_SKYBOX_BLUE};
+    for (int i = 0; i < 3; ++i) {
+        const int x = 100 + i * 150;
+        make_skybox_control(state, "STATIC", colour_labels[i], SS_LEFT, 0, x, 19, 18, 22);
+        *colours[i] = make_skybox_control(state, "EDIT", "", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP,
+                                          colour_ids[i], x + 20, 16, 118, 24);
+    }
+    make_skybox_control(state, "STATIC", "Orientation (radians)", SS_LEFT, 0, 556, 19, 126, 22);
+    state->orientation = make_skybox_control(state, "EDIT", "", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP,
+                                             ID_SKYBOX_ORIENTATION, 682, 16, 112, 24);
+
+    constexpr const char* path_labels[] = {"Path 0 (lower)", "Path 1 (front)", "Path 2 (left)",
+                                            "Path 3 (back)", "Path 4 (right)", "Path 5 (upper)",
+                                            "Path 6 (cloud A)", "Path 7 (cloud B)"};
+    for (int i = 0; i < static_cast<int>(_countof(path_labels)); ++i) {
+        const int y = 58 + i * 36;
+        make_skybox_control(state, "STATIC", path_labels[i], SS_LEFT, 0, 14, y + 3, 112, 22);
+        state->paths[i] = make_skybox_control(state, "EDIT", "", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP,
+                                              ID_SKYBOX_PATH_FIRST + i, 130, y, 664, 24);
+        SendMessageA(state->paths[i], EM_SETLIMITTEXT, 4096, 0);
+    }
+
+    state->draw_clouds = make_skybox_control(state, "BUTTON", "Draw clouds", BS_AUTOCHECKBOX | WS_TABSTOP,
+                                              ID_SKYBOX_DRAW_CLOUDS, 14, 356, 128, 24);
+    state->version_6 = make_skybox_control(state, "BUTTON", "SKYB format version 6",
+                                            BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP,
+                                            ID_SKYBOX_VERSION_6, 158, 356, 166, 24);
+    state->version_7 = make_skybox_control(state, "BUTTON", "SKYB format version 7",
+                                            BS_AUTORADIOBUTTON | WS_TABSTOP,
+                                            ID_SKYBOX_VERSION_7, 330, 356, 204, 24);
+    state->back_flipped = make_skybox_control(
+        state, "BUTTON", "Back texture is front upside down", BS_AUTOCHECKBOX | WS_TABSTOP,
+        ID_SKYBOX_BACK_FLIPPED, 14, 386, 332, 24);
+    state->right_flipped = make_skybox_control(
+        state, "BUTTON", "Right texture is left upside down", BS_AUTOCHECKBOX | WS_TABSTOP,
+        ID_SKYBOX_RIGHT_FLIPPED, 366, 386, 346, 24);
+    make_skybox_control(state, "STATIC",
+                        "Both target formats render the same cube; v7 only adds the right-face mapping flag.",
+                        SS_LEFT, 0, 14, 414, 760, 20);
+    make_skybox_control(state, "STATIC", "Preview resources", SS_LEFT, 0, 14, 438, 112, 22);
+    state->preview_folder = make_skybox_control(state, "EDIT", "", ES_AUTOHSCROLL | WS_BORDER | ES_READONLY,
+                                                0, 130, 435, 414, 24);
+    make_skybox_control(state, "BUTTON", "Choose folder...", BS_PUSHBUTTON | WS_TABSTOP,
+                        ID_SKYBOX_PREVIEW_FOLDER, 552, 434, 116, 27);
+    make_skybox_control(state, "BUTTON", "Use embedded", BS_PUSHBUTTON | WS_TABSTOP,
+                        ID_SKYBOX_USE_EMBEDDED, 676, 434, 118, 27);
+    make_skybox_control(state, "BUTTON", "Apply", BS_DEFPUSHBUTTON | WS_TABSTOP, IDOK, 566, 473, 104, 30);
+    make_skybox_control(state, "BUTTON", "Cancel", BS_PUSHBUTTON | WS_TABSTOP, IDCANCEL, 682, 473, 112, 30);
+
+    set_float(state->red, state->value.red);
+    set_float(state->green, state->value.green);
+    set_float(state->blue, state->value.blue);
+    set_float(state->orientation, state->value.orientation_radians);
+    for (int i = 0; i < static_cast<int>(_countof(state->paths)); ++i)
+        SetWindowTextA(state->paths[i], state->value.texture_paths[i].c_str());
+    SendMessageA(state->draw_clouds, BM_SETCHECK, state->value.draw_clouds ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageA(state->version_6, BM_SETCHECK,
+                 state->value.chunk_version == 6 ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageA(state->version_7, BM_SETCHECK,
+                 state->value.chunk_version == 7 ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageA(state->back_flipped, BM_SETCHECK,
+                 state->value.back_texture_is_front_upside_down ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageA(state->right_flipped, BM_SETCHECK,
+                 state->value.right_texture_is_left_upside_down ? BST_CHECKED : BST_UNCHECKED, 0);
+    refresh_skybox_version_controls(state);
+    refresh_skybox_folder_text(state);
+}
+
+void apply_skybox_properties(SkyboxPropertiesState* state) {
+    state->value.red = get_float(state->red, state->value.red);
+    state->value.green = get_float(state->green, state->value.green);
+    state->value.blue = get_float(state->blue, state->value.blue);
+    state->value.orientation_radians = get_float(state->orientation, state->value.orientation_radians);
+    for (int i = 0; i < static_cast<int>(_countof(state->paths)); ++i) {
+        char path[4097]{};
+        GetWindowTextA(state->paths[i], path, sizeof(path));
+        state->value.texture_paths[i] = path;
+    }
+    state->value.draw_clouds = SendMessageA(state->draw_clouds, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    state->value.chunk_version =
+        SendMessageA(state->version_6, BM_GETCHECK, 0, 0) == BST_CHECKED ? 6u : 7u;
+    state->value.back_texture_is_front_upside_down =
+        SendMessageA(state->back_flipped, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    state->value.right_texture_is_left_upside_down =
+        state->value.chunk_version == 7 &&
+        SendMessageA(state->right_flipped, BM_GETCHECK, 0, 0) == BST_CHECKED;
+}
+
+LRESULT CALLBACK skybox_properties_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+    if (message == WM_NCCREATE) {
+        const CREATESTRUCTA* create = reinterpret_cast<const CREATESTRUCTA*>(lparam);
+        SetWindowLongPtrA(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(create->lpCreateParams));
+        return TRUE;
+    }
+    SkyboxPropertiesState* state =
+        reinterpret_cast<SkyboxPropertiesState*>(GetWindowLongPtrA(hwnd, GWLP_USERDATA));
+    switch (message) {
+    case WM_CREATE:
+        state->window = hwnd;
+        create_skybox_properties_controls(state);
+        return 0;
+    case WM_COMMAND:
+        if (LOWORD(wparam) == ID_SKYBOX_VERSION_6 ||
+            LOWORD(wparam) == ID_SKYBOX_VERSION_7) {
+            refresh_skybox_version_controls(state);
+        } else if (LOWORD(wparam) == ID_SKYBOX_PREVIEW_FOLDER) {
+            std::string path = state->texture_directory;
+            if (choose_directory(hwnd, "Choose skybox texture folder", &path)) {
+                state->texture_directory = std::move(path);
+                refresh_skybox_folder_text(state);
+            }
+        } else if (LOWORD(wparam) == ID_SKYBOX_USE_EMBEDDED) {
+            state->texture_directory.clear();
+            refresh_skybox_folder_text(state);
+        } else if (LOWORD(wparam) == IDOK) {
+            apply_skybox_properties(state);
+            state->accepted = true;
+            DestroyWindow(hwnd);
+        } else if (LOWORD(wparam) == IDCANCEL) {
+            DestroyWindow(hwnd);
+        }
+        return 0;
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+    }
+    return DefWindowProcA(hwnd, message, wparam, lparam);
+}
+
 void command_skybox_textures() {
-    std::string path = g.document.sky_texture_dir;
-    if (!choose_directory(g.window, "Choose skybox texture folder", &path))
+    SkyboxPropertiesState state{};
+    state.value = g.document.skybox;
+    state.texture_directory = g.document.sky_texture_dir;
+    RECT owner{};
+    GetWindowRect(g.window, &owner);
+    constexpr int width = 830, height = 565;
+    const int x = owner.left + std::max(0L, (owner.right - owner.left - width) / 2);
+    const int y = owner.top + std::max(0L, (owner.bottom - owner.top - height) / 2);
+    HWND window = CreateWindowExA(WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT,
+                                  "Asura2005SkyboxProperties", "SKYB version and properties",
+                                  WS_CAPTION | WS_SYSMENU | WS_POPUP | WS_VISIBLE, x, y, width, height,
+                                  g.window, nullptr, GetModuleHandle(nullptr), &state);
+    if (!window)
         return;
-    g.document.sky_texture_dir = path;
-    mark_dirty();
-    if (reload_skybox_preview(true))
-        set_status("Skybox DDS textures loaded into the viewport.");
-    else
-        set_status("Skybox texture folder saved; preview is unavailable.");
+    EnableWindow(g.window, FALSE);
+    MSG message{};
+    bool quit = false;
+    while (IsWindow(window)) {
+        const BOOL result = GetMessageA(&message, nullptr, 0, 0);
+        if (result <= 0) {
+            quit = result == 0;
+            break;
+        }
+        if (!IsDialogMessageA(window, &message)) {
+            TranslateMessage(&message);
+            DispatchMessageA(&message);
+        }
+    }
+    EnableWindow(g.window, TRUE);
+    SetActiveWindow(g.window);
+    if (quit)
+        PostQuitMessage(static_cast<int>(message.wParam));
+    if (!state.accepted)
+        return;
+
+    if (!g.history.begin(g.document, g.selected))
+        return;
+    g.document.skybox = std::move(state.value);
+    g.document.sky_texture_dir = std::move(state.texture_directory);
+    commit_history_transaction();
+    const bool loaded = reload_skybox_preview(true);
+    if (loaded) {
+        gpu_rebuild_skybox_vertices(g.document.skybox.orientation_radians,
+                                    g.document.skybox.back_texture_is_front_upside_down,
+                                    g.document.skybox.right_texture_is_left_upside_down, nullptr);
+        gpu.skybox_tint = {std::clamp(g.document.skybox.red / 255.0f, 0.0f, 1.0f),
+                           std::clamp(g.document.skybox.green / 255.0f, 0.0f, 1.0f),
+                           std::clamp(g.document.skybox.blue / 255.0f, 0.0f, 1.0f), 1.0f};
+        request_redraw();
+    }
+    set_status(loaded ? "SKYB version and properties applied."
+                      : "SKYB version and properties saved; preview unavailable.");
 }
 
 void delete_selected() {
@@ -5503,10 +7238,13 @@ void delete_selected() {
         set_status("Imported target/marker records remain source-preserved and cannot be deleted yet.");
         return;
     }
+    stop_sound_preview();
+    if (!g.history.begin(g.document, g.selected))
+        return;
     g.document.entities.erase(g.document.entities.begin() + g.selected);
     if (g.selected >= static_cast<int>(g.document.entities.size()))
         --g.selected;
-    mark_dirty();
+    commit_history_transaction();
     refresh_list();
     refresh_inspector();
     request_redraw();
@@ -5566,6 +7304,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
     case WM_CREATE:
         g.window = hwnd;
         create_controls();
+        reset_history(true);
         if (g.spawn_puppet_source.empty())
             set_status("MPChars.asr was not found or is incompatible; spawnpoints use fallback markers.");
         DragAcceptFiles(hwnd, TRUE);
@@ -5583,7 +7322,9 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             g.fast_preview = false;
             invalidate_environment_cache();
             request_redraw();
-        } else if (wparam == 2 && gpu.skybox_cloud) {
+        } else if (wparam == 2 &&
+                   ((g.document.skybox.draw_clouds && gpu.skybox_cloud) ||
+                    (g.document.rain_enabled && gpu.rain_texture))) {
             request_redraw();
         }
         return 0;
@@ -5612,6 +7353,8 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             command_weapons_donor();
         else if (id == ID_SKYBOX_TEXTURES)
             command_skybox_textures();
+        else if (id == ID_TOGGLE_RAIN)
+            command_toggle_rain();
         else if (id == ID_ADD_SPAWN)
             begin_place(EntityKind::SpawnPoint);
         else if (id == ID_ADD_LIGHT)
@@ -5620,16 +7363,38 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             begin_place(EntityKind::Sound);
         else if (id == ID_ADD_PICKUP)
             begin_place(EntityKind::PhysicalObject);
+        else if (id == ID_UNDO)
+            command_undo();
+        else if (id == ID_REDO)
+            command_redo();
+        else if (id == ID_COPY_ENTITY)
+            command_copy_entity();
+        else if (id == ID_PASTE_ENTITY)
+            command_paste_entity();
         else if (id == ID_DELETE_ENTITY)
             delete_selected();
         else if (id == ID_APPLY_INSPECTOR)
             apply_inspector();
         else if (id == ID_BROWSE_SOUND)
             command_browse_sound();
+        else if (id == ID_SOUND_PREVIEW)
+            command_sound_preview();
         else if (id == ID_LIGHT_PROPERTIES)
             command_light_properties();
-        else if (id == ID_ENTITY_LIST && HIWORD(wparam) == LBN_SELCHANGE)
-            select_entity(static_cast<int>(SendMessageA(g.list, LB_GETCURSEL, 0, 0)));
+        else if (id == ID_ENTITY_LIST) {
+            const int notification = HIWORD(wparam);
+            const LRESULT row = SendMessageA(g.list, LB_GETCURSEL, 0, 0);
+            const int index = row == LB_ERR
+                                  ? -1
+                                  : static_cast<int>(SendMessageA(g.list, LB_GETITEMDATA,
+                                                                   static_cast<WPARAM>(row), 0));
+            if (notification == LBN_SELCHANGE)
+                select_entity(index);
+            else if (notification == LBN_DBLCLK) {
+                select_entity(index);
+                focus_camera_on_entity(index);
+            }
+        }
         return 0;
     }
     case WM_LBUTTONDOWN: {
@@ -5639,23 +7404,24 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             break;
         SetFocus(hwnd);
         Asura_Vector_3 world{};
-        if (g.pending_kind >= 0 && ground_point_from_screen(p.x, p.y, &world)) {
-            add_entity_at(static_cast<EntityKind>(g.pending_kind), world);
+        if (g.pending_kind >= 0) {
+            if (environment_point_from_screen(p.x, p.y, &world))
+                add_entity_at(static_cast<EntityKind>(g.pending_kind), world);
+            else
+                set_status("No environment geometry is under the cursor; placement remains active.");
             return 0;
         }
         const int hit = hit_entity(p.x, p.y);
         select_entity(hit);
-        if (hit >= 0) {
+        if (hit >= 0 && g.history.begin(g.document, g.selected)) {
             g.moving_entity = true;
+            g.entity_drag_last_mouse = p;
             SetCapture(hwnd);
         }
         return 0;
     }
     case WM_LBUTTONUP:
-        if (g.moving_entity) {
-            g.moving_entity = false;
-            ReleaseCapture();
-        }
+        finish_entity_drag_transaction();
         return 0;
     case WM_RBUTTONDOWN:
         g.orbiting = true;
@@ -5685,17 +7451,35 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
         request_redraw();
         ReleaseCapture();
         return 0;
+    case WM_CAPTURECHANGED:
+        // A modal dialog or another window can steal capture before a button-up
+        // arrives. Never let that leave a latent drag that moves on the next
+        // unrelated mouse event.
+        if (reinterpret_cast<HWND>(lparam) != hwnd) {
+            if (g.moving_entity)
+                finish_entity_drag_transaction();
+            g.moving_entity = false;
+            g.orbiting = false;
+            g.panning = false;
+            g.fast_preview = false;
+            invalidate_environment_cache();
+            request_redraw();
+        }
+        return 0;
     case WM_MOUSEMOVE: {
         const POINT now{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
         if (g.moving_entity && g.selected >= 0) {
+            if (now.x == g.entity_drag_last_mouse.x && now.y == g.entity_drag_last_mouse.y)
+                return 0;
+            g.entity_drag_last_mouse = now;
             Asura_Vector_3 p{};
-            if (ground_point_from_screen(now.x, now.y, &p)) {
+            if (environment_point_from_screen(now.x, now.y, &p)) {
                 Entity& e = g.document.entities[g.selected];
-                e.position.x = p.x;
-                e.position.z = p.z;
+                if (e.position.x == p.x && e.position.y == p.y && e.position.z == p.z)
+                    return 0;
+                e.position = p;
                 if (e.kind == EntityKind::Light)
                     e.light.Position = e.position;
-                mark_dirty();
                 refresh_inspector();
                 request_redraw();
             }
@@ -5745,13 +7529,19 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
                 open_pc_path(p);
         }
         else if (_stricmp(ext.c_str(), ".alev") == 0) {
+            if (!confirm_discard())
+                return 0;
             std::string why;
             Document doc;
             if (load_project(&doc, p.c_str(), &why)) {
+                stop_sound_preview();
                 g.document = std::move(doc);
+                g.selected = g.document.entities.empty() ? -1 : 0;
+                g.pending_kind = -1;
                 const bool skybox_loaded = reload_skybox_preview(true);
                 load_document_preview(&g.document, &g.mesh, &why, &g.pickup_models);
                 frame_mesh();
+                reset_history(!g.document.dirty);
                 refresh_list();
                 refresh_inspector();
                 update_title();
@@ -5767,6 +7557,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             DestroyWindow(hwnd);
         return 0;
     case WM_DESTROY:
+        stop_sound_preview();
         KillTimer(hwnd, 1);
         KillTimer(hwnd, 2);
         release_environment_cache();
@@ -5799,10 +7590,10 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
         constexpr uint32_t required_items[] = {
             SnipeItem_PistolAmmo, SnipeItem_RifleAmmo, SnipeItem_Panzerfaust, SnipeItem_StickGrenade,
             SnipeItem_FragGrenade, SnipeItem_SmokeGrenade, SnipeItem_Knife, SnipeItem_MedKit,
-            SnipeItem_Bandage, SnipeItem_TnT, SnipeItem_Binoculars, SnipeItem_Gewehr43,
-            SnipeItem_Mosin91, SnipeItem_SVT40, SnipeItem_Luger, SnipeItem_P38, SnipeItem_PPSH,
+            SnipeItem_Bandage, SnipeItem_TnT, SnipeItem_Gewehr43,
+            SnipeItem_Mosin91, SnipeItem_SVT40, SnipeItem_PPSH,
             SnipeItem_MP40, SnipeItem_MG42, SnipeItem_DP28, SnipeItem_TimeBomb,
-            SnipeItem_Panzerschreck, SnipeItem_PanzerschreckAmmo,
+            SnipeItem_Panzerschreck, SnipeItem_PanzerschreckAmmo
         };
         for (uint32_t item_id : required_items) {
             const PickupTemplate* pickup = nullptr;
@@ -5947,6 +7738,11 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
     }
     const bool gpu_smoke = (__argc == 3 || __argc == 4) && strcmp(__argv[1], "--gpu-smoke") == 0;
     const bool pc_gpu_smoke = __argc == 3 && strcmp(__argv[1], "--pc-gpu-smoke") == 0;
+    const bool pc_editor_ui_smoke = __argc == 3 && strcmp(__argv[1], "--pc-editor-ui-smoke") == 0;
+    const bool pc_weather_render_smoke =
+        __argc == 3 && strcmp(__argv[1], "--pc-weather-render-smoke") == 0;
+    const bool pc_material_render_smoke =
+        __argc == 4 && strcmp(__argv[1], "--pc-material-render-smoke") == 0;
     if (__argc == 5 && strcmp(__argv[1], "--obj-pickup-lifecycle-smoke") == 0) {
         Document document, project_document, restored;
         Mesh project_mesh, restored_mesh;
@@ -6057,16 +7853,53 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
         Document imported, restored, exported;
         Mesh mesh, exported_mesh;
         std::string why;
-        return load_pc_level(__argv[2], &imported, &mesh, &why) &&
-                       save_project(imported, __argv[3], &why) && load_project(&restored, __argv[3], &why) &&
+        if (!load_pc_level(__argv[2], &imported, &mesh, &why) || !imported.skybox.source_record)
+            return 8;
+        // Exercise an actual version change and independent face flags rather
+        // than conflating the flags with the serialized SKYB chunk version.
+        imported.skybox.chunk_version = imported.skybox.chunk_version == 7 ? 6u : 7u;
+        imported.skybox.back_texture_is_front_upside_down =
+            !imported.skybox.back_texture_is_front_upside_down;
+        imported.skybox.right_texture_is_left_upside_down =
+            imported.skybox.chunk_version == 7 &&
+            !imported.skybox.right_texture_is_left_upside_down;
+        imported.rain_enabled = !imported.rain_enabled;
+        return save_project(imported, __argv[3], &why) && load_project(&restored, __argv[3], &why) &&
+                       same_skybox_settings(restored.skybox, imported.skybox) &&
+                       restored.rain_enabled == imported.rain_enabled &&
+                       restored.weather_source_record == imported.weather_source_record &&
                        restored.entities.size() == imported.entities.size() &&
                        restored.pickup_templates.size() == imported.pickup_templates.size() &&
                        restored.source_pickup_inventory_complete == imported.source_pickup_inventory_complete &&
                        pack_document(restored, __argv[4], &why) &&
                        load_pc_level(__argv[4], &exported, &exported_mesh, &why) &&
+                       same_skybox_settings(exported.skybox, imported.skybox) &&
+                       exported.rain_enabled == imported.rain_enabled &&
                        exported.entities.size() == imported.entities.size()
                    ? 0
                    : 8;
+    }
+    if (__argc == 5 && strcmp(__argv[1], "--pc-sky-weather-smoke") == 0) {
+        Document imported, restored, exported;
+        Mesh mesh, exported_mesh;
+        std::string why;
+        if (!load_pc_level(__argv[2], &imported, &mesh, &why) ||
+            !imported.skybox.source_record || !imported.weather_source_record)
+            return 32;
+        const SkyboxSettings original_skybox = imported.skybox;
+        imported.rain_enabled = !imported.rain_enabled;
+        if (!save_project(imported, __argv[3], &why) ||
+            !load_project(&restored, __argv[3], &why) ||
+            !same_skybox_settings(restored.skybox, original_skybox) ||
+            restored.rain_enabled != imported.rain_enabled ||
+            !pack_document(restored, __argv[4], &why) ||
+            !all_pc_weather_records_match(__argv[4], imported.rain_enabled) ||
+            !load_pc_level(__argv[4], &exported, &exported_mesh, &why))
+            return 33;
+        return same_skybox_settings(exported.skybox, original_skybox) &&
+                       exported.rain_enabled == imported.rain_enabled
+                   ? 0
+                   : 34;
     }
     if (__argc == 4 && strcmp(__argv[1], "--smoke-pack") == 0) {
         Document doc;
@@ -6111,6 +7944,15 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
     light_properties_class.lpszClassName = "Asura2005LightProperties";
     if (!RegisterClassExA(&light_properties_class))
         return 1;
+    WNDCLASSEXA skybox_properties_class{};
+    skybox_properties_class.cbSize = sizeof(skybox_properties_class);
+    skybox_properties_class.lpfnWndProc = skybox_properties_proc;
+    skybox_properties_class.hInstance = instance;
+    skybox_properties_class.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    skybox_properties_class.hbrBackground = static_cast<HBRUSH>(GetStockObject(LTGRAY_BRUSH));
+    skybox_properties_class.lpszClassName = "Asura2005SkyboxProperties";
+    if (!RegisterClassExA(&skybox_properties_class))
+        return 1;
     WNDCLASSEXA wc{};
     wc.cbSize = sizeof(wc);
     wc.style = CS_HREDRAW | CS_VREDRAW;
@@ -6126,14 +7968,252 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
                                   CW_USEDEFAULT, CW_USEDEFAULT, 1380, 840, nullptr, nullptr, instance, nullptr);
     if (!window)
         return 1;
+    if (pc_material_render_smoke) {
+        char* mask_end = nullptr;
+        const unsigned long requested_mask = strtoul(__argv[3], &mask_end, 0);
+        if (!mask_end || *mask_end || !requested_mask || requested_mask > 0xfffffffful ||
+            !open_pc_path(__argv[2])) {
+            DestroyWindow(window);
+            return 39;
+        }
+        uint32_t loaded_count = 0, missing_count = 0;
+        std::string why;
+        const bool textures_loaded =
+            gpu_reload_environment_textures(&why, &loaded_count, &missing_count);
+        bool found_requested_material = false;
+        for (const GpuMaterialRange& range : gpu.material_ranges)
+            found_requested_material |= range.texture &&
+                                        (range.material_flags & static_cast<uint32_t>(requested_mask)) != 0;
+        gpu_render();
+        const bool resources_ready =
+            (!(requested_mask & 0x4u) || gpu.environment_detail) &&
+            (!(requested_mask & 0x80u) || gpu.environment_spheremap);
+        const bool valid = textures_loaded && loaded_count > 0 && found_requested_material &&
+                           resources_ready && gpu.environment_view_buffer && gpu.additive_blend &&
+                           gpu.reflection_blend && gpu_verify_environment_color_pipeline();
+        DestroyWindow(window);
+        return valid ? 0 : 40;
+    }
+    if (pc_weather_render_smoke) {
+        if (!open_pc_path(__argv[2])) {
+            DestroyWindow(window);
+            return 37;
+        }
+        const bool original_rain = g.document.rain_enabled;
+        bool state_matches_document =
+            gpu.environment_wet_weather == original_rain &&
+            (gpu.rain_texture != nullptr) == original_rain;
+        if (!original_rain) {
+            SendMessageA(g.rain_toggle, BM_SETCHECK, BST_CHECKED, 0);
+            SendMessageA(window, WM_COMMAND, MAKEWPARAM(ID_TOGGLE_RAIN, BN_CLICKED),
+                         reinterpret_cast<LPARAM>(g.rain_toggle));
+        }
+        Asura_Vector_3 camera_position, right, up, forward;
+        camera_axes(&camera_position, &right, &up, &forward);
+        const auto first = build_gpu_rain_vertices(camera_position, right, up, forward,
+                                                   1.0f, 1.5f, 0.0f);
+        const auto second = build_gpu_rain_vertices(camera_position, right, up, forward,
+                                                    1.0f, 1.5f, .25f);
+        bool animated_layers = first.size() == 36 && second.size() == first.size();
+        for (size_t index = 0; animated_layers && index < first.size(); ++index) {
+            animated_layers = fabsf(first[index].position.x - second[index].position.x) < .0001f &&
+                              fabsf(first[index].position.y - second[index].position.y) < .0001f &&
+                              fabsf(first[index].position.z - second[index].position.z) < .0001f &&
+                              fabsf(first[index].uv.y - second[index].uv.y) > .01f;
+        }
+        for (size_t index = 6; animated_layers && index < first.size(); index += 6) {
+            const Asura_Vector_3 previous{first[index - 6].position.x,
+                                          first[index - 6].position.y,
+                                          first[index - 6].position.z};
+            const Asura_Vector_3 current{first[index].position.x,
+                                         first[index].position.y,
+                                         first[index].position.z};
+            animated_layers = dot(sub(previous, camera_position), forward) >
+                              dot(sub(current, camera_position), forward);
+        }
+        const bool clouds_enabled = g.document.skybox.draw_clouds;
+        g.document.skybox.draw_clouds = false;
+        refresh_scene_animation_timer();
+        gpu_render();
+        const bool rainfall_drawn = g.document.rain_enabled && gpu.environment_wet_weather &&
+                                    gpu.rain_texture && gpu.rain_pixel_shader &&
+                                    gpu.rain_vertices && gpu.rain_capacity &&
+                                    gpu.rain_vertex_count == 36 && gpu.rain_frame_drawn;
+        const bool visible_vertical_streaks = gpu_verify_rain_streak_display();
+        const bool prelight_identity = gpu_verify_environment_color_pipeline();
+        g.document.skybox.draw_clouds = clouds_enabled;
+        refresh_scene_animation_timer();
+        SendMessageA(g.rain_toggle, BM_SETCHECK, BST_UNCHECKED, 0);
+        SendMessageA(window, WM_COMMAND, MAKEWPARAM(ID_TOGGLE_RAIN, BN_CLICKED),
+                     reinterpret_cast<LPARAM>(g.rain_toggle));
+        gpu_render();
+        const bool rainfall_disabled = !g.document.rain_enabled && !gpu.environment_wet_weather &&
+                                       !gpu.rain_texture && !gpu.rain_frame_drawn &&
+                                       gpu.rain_vertex_count == 0;
+        const bool valid = state_matches_document && animated_layers && rainfall_drawn &&
+                           visible_vertical_streaks && prelight_identity && rainfall_disabled;
+        DestroyWindow(window);
+        return valid ? 0 : 38;
+    }
+    if (pc_editor_ui_smoke) {
+        if (!open_pc_path(__argv[2])) {
+            DestroyWindow(window);
+            return 35;
+        }
+        const int count = static_cast<int>(SendMessageA(g.list, LB_GETCOUNT, 0, 0));
+        bool sorted = count == static_cast<int>(g.document.entities.size());
+        for (int row = 1; sorted && row < count; ++row) {
+            const LRESULT previous = SendMessageA(g.list, LB_GETITEMDATA, row - 1, 0);
+            const LRESULT current = SendMessageA(g.list, LB_GETITEMDATA, row, 0);
+            if (previous == LB_ERR || current == LB_ERR) {
+                sorted = false;
+                break;
+            }
+            const Entity& first = g.document.entities[static_cast<size_t>(previous)];
+            const Entity& second = g.document.entities[static_cast<size_t>(current)];
+            const int names = _stricmp(first.name.c_str(), second.name.c_str());
+            sorted = names < 0 ||
+                     (names == 0 &&
+                      _stricmp(entity_type_label(first.kind), entity_type_label(second.kind)) <= 0);
+        }
+
+        int pickup_index = -1;
+        for (int index = 0; index < static_cast<int>(g.document.entities.size()); ++index)
+            if (g.document.entities[index].kind == EntityKind::PhysicalObject) {
+                pickup_index = index;
+                break;
+            }
+        bool pickup_sorted = pickup_index >= 0;
+        bool pickup_switch = false;
+        if (pickup_sorted) {
+            select_entity(pickup_index);
+            const int item_count = static_cast<int>(SendMessageA(g.pickup_item, CB_GETCOUNT, 0, 0));
+            pickup_sorted = item_count > 1 &&
+                            (GetWindowLongPtrA(g.pickup_item, GWL_STYLE) & WS_VISIBLE) != 0;
+            std::string previous_label;
+            for (int row = 0; pickup_sorted && row < item_count; ++row) {
+                char label[128]{};
+                SendMessageA(g.pickup_item, CB_GETLBTEXT, row,
+                             reinterpret_cast<LPARAM>(label));
+                pickup_sorted = previous_label.empty() ||
+                                _stricmp(previous_label.c_str(), label) <= 0;
+                previous_label = label;
+            }
+            const LRESULT selected = SendMessageA(g.pickup_item, CB_GETCURSEL, 0, 0);
+            if (pickup_sorted && selected != CB_ERR) {
+                const int next = selected == 0 ? 1 : 0;
+                const uint32_t wanted = static_cast<uint32_t>(
+                    SendMessageA(g.pickup_item, CB_GETITEMDATA, next, 0));
+                SendMessageA(g.pickup_item, CB_SETCURSEL, next, 0);
+                apply_inspector();
+                pickup_switch = g.document.entities[g.selected].value_u32_a == wanted;
+            }
+        }
+
+        bool skybox_uv = false;
+        if (gpu.skybox_vertices) {
+            D3D11_BUFFER_DESC source{};
+            gpu.skybox_vertices->GetDesc(&source);
+            D3D11_BUFFER_DESC staging = source;
+            staging.Usage = D3D11_USAGE_STAGING;
+            staging.BindFlags = 0;
+            staging.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            staging.MiscFlags = 0;
+            ID3D11Buffer* copy = nullptr;
+            if (SUCCEEDED(gpu.device->CreateBuffer(&staging, nullptr, &copy))) {
+                gpu.context->CopyResource(copy, gpu.skybox_vertices);
+                D3D11_MAPPED_SUBRESOURCE mapped{};
+                if (SUCCEEDED(gpu.context->Map(copy, 0, D3D11_MAP_READ, 0, &mapped))) {
+                    const auto* vertices = static_cast<const SkyboxVertex*>(mapped.pData);
+                    const float expected_u =
+                        g.document.skybox.right_texture_is_left_upside_down ? 0.0f : 1.0f;
+                    const float expected_v =
+                        !g.document.skybox.right_texture_is_left_upside_down &&
+                                g.document.skybox.back_texture_is_front_upside_down
+                            ? 0.0f
+                            : 1.0f;
+                    skybox_uv = fabsf(vertices[12].uv.x - expected_u) < .001f &&
+                                fabsf(vertices[12].uv.y - expected_v) < .001f;
+                    gpu.context->Unmap(copy, 0);
+                }
+                copy->Release();
+            }
+        }
+
+        const bool original_rain = g.document.rain_enabled;
+        SendMessageA(g.rain_toggle, BM_SETCHECK,
+                     original_rain ? BST_UNCHECKED : BST_CHECKED, 0);
+        SendMessageA(window, WM_COMMAND, MAKEWPARAM(ID_TOGGLE_RAIN, BN_CLICKED),
+                     reinterpret_cast<LPARAM>(g.rain_toggle));
+        const bool rain_toggled = g.document.rain_enabled != original_rain &&
+                                  gpu.environment_wet_weather == g.document.rain_enabled &&
+                                  (gpu.rain_texture != nullptr) == g.document.rain_enabled;
+        command_undo();
+        const bool rain_undo = g.document.rain_enabled == original_rain &&
+                               gpu.environment_wet_weather == original_rain &&
+                               (gpu.rain_texture != nullptr) == original_rain &&
+                               (SendMessageA(g.rain_toggle, BM_GETCHECK, 0, 0) == BST_CHECKED) ==
+                                   original_rain;
+        const bool valid = sorted && pickup_sorted && pickup_switch && skybox_uv &&
+                           rain_toggled && rain_undo && g.document.skybox.chunk_version == 7;
+        DestroyWindow(window);
+        return valid ? 0 : 36;
+    }
     if (pc_gpu_smoke) {
         const bool loaded = open_pc_path(__argv[2]);
+        bool list_double_click_focus = false;
+        if (loaded && g.list && !g.document.entities.empty()) {
+            const Camera before = g.camera;
+            SendMessageA(g.list, LB_SETCURSEL, 0, 0);
+            const int expected_index =
+                static_cast<int>(SendMessageA(g.list, LB_GETITEMDATA, 0, 0));
+            SendMessageA(window, WM_COMMAND, MAKEWPARAM(ID_ENTITY_LIST, LBN_DBLCLK),
+                         reinterpret_cast<LPARAM>(g.list));
+            list_double_click_focus =
+                g.selected == expected_index && (!nearly_equal(g.camera.target, before.target) ||
+                                    !nearly_equal(g.camera.distance, before.distance));
+        }
+        uint32_t environment_textures = 0, environment_fallbacks = 0;
+        std::string environment_why;
+        const bool environment_materials =
+            gpu_reload_environment_textures(&environment_why, &environment_textures, &environment_fallbacks);
         gpu_render();
+        const bool environment_multipass_ready =
+            gpu.alpha_blend && gpu.modulate2x_blend && gpu.additive_blend &&
+            gpu.reflection_blend && gpu.depth_equal && gpu.environment_view_buffer;
+        bool found_txfl_bit_clear = false, found_txfl_bit_set = false, found_wet_material = false;
+        bool found_detail_material = false, found_spheremap_material = false;
+        bool found_solid_cutout = false;
+        for (const GpuMaterialRange& range : gpu.material_ranges) {
+            if (!range.texture)
+                continue;
+            found_detail_material |= (range.material_flags & 0x4u) != 0;
+            found_spheremap_material |= (range.material_flags & 0x80u) != 0;
+            found_solid_cutout |= gpu_material_is_solid_cutout(range);
+            if ((range.material_flags & 2u) == 0)
+                continue;
+            found_txfl_bit_clear |= (range.texture_flags & 8u) == 0;
+            found_txfl_bit_set |= (range.texture_flags & 8u) != 0;
+            found_wet_material |= (range.material_flags & 0x4000u) != 0;
+        }
         bool pickups_resolved = !g.pickup_models.empty();
         for (const Entity& entity : g.document.entities)
             if (entity.kind == EntityKind::PhysicalObject)
                 pickups_resolved &= pickup_model_for_skin(entity.pickup_skin_id) != nullptr;
         const bool rendered = loaded && gpu.ready && gpu.mesh_vertices && gpu.mesh_indices && gpu.mesh_index_count &&
+                              list_double_click_focus &&
+                              environment_materials && environment_textures > 0 &&
+                              environment_textures + environment_fallbacks == gpu.material_ranges.size() &&
+                              environment_multipass_ready && found_txfl_bit_clear && found_txfl_bit_set &&
+                              found_solid_cutout && gpu.alpha_tested_prelight_drawn &&
+                              gpu.solid_cutout_prelight_drawn &&
+                              gpu.composited_alpha_prelight_drawn &&
+                              (!found_detail_material || gpu.environment_detail) &&
+                              (!found_spheremap_material || gpu.environment_spheremap) &&
+                              gpu_verify_environment_color_pipeline() &&
+                              found_wet_material && gpu.environment_wet_weather && gpu.environment_splash &&
+                              gpu.rain_texture && gpu.rain_pixel_shader && gpu.rain_vertices &&
+                              gpu.rain_vertex_count == 36 && gpu.rain_frame_drawn &&
                               gpu.skybox_active && gpu.puppet_vertices && gpu.puppet_capacity && pickups_resolved;
         DestroyWindow(window);
         return rendered ? 0 : 7;
@@ -6176,6 +8256,7 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
             g.document.entities.push_back(german);
             g.selected = 0;
         }
+        reset_history(false);
         gpu_render();
         if (loaded) {
             g.selected = 1;
@@ -6210,9 +8291,12 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
             Document doc;
             if (load_project(&doc, path.c_str(), &why)) {
                 g.document = std::move(doc);
+                g.selected = g.document.entities.empty() ? -1 : 0;
+                g.pending_kind = -1;
                 const bool skybox_loaded = reload_skybox_preview(true);
                 load_document_preview(&g.document, &g.mesh, &why, &g.pickup_models);
                 frame_mesh();
+                reset_history(!g.document.dirty);
                 refresh_list();
                 refresh_inspector();
                 update_title();
@@ -6220,10 +8304,23 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
             }
         }
     }
+    const ACCEL accelerator_entries[] = {
+        {FVIRTKEY | FCONTROL, 'Z', ID_UNDO},
+        {FVIRTKEY | FCONTROL, 'Y', ID_REDO},
+        {FVIRTKEY | FCONTROL, 'C', ID_COPY_ENTITY},
+        {FVIRTKEY | FCONTROL, 'V', ID_PASTE_ENTITY},
+        {FVIRTKEY, VK_DELETE, ID_DELETE_ENTITY},
+    };
+    HACCEL accelerators = CreateAcceleratorTableA(
+        const_cast<LPACCEL>(accelerator_entries), static_cast<int>(_countof(accelerator_entries)));
     MSG message{};
     while (GetMessageA(&message, nullptr, 0, 0) > 0) {
-        TranslateMessage(&message);
-        DispatchMessageA(&message);
+        if (!accelerators || !TranslateAcceleratorA(window, accelerators, &message)) {
+            TranslateMessage(&message);
+            DispatchMessageA(&message);
+        }
     }
+    if (accelerators)
+        DestroyAcceleratorTable(accelerators);
     return static_cast<int>(message.wParam);
 }

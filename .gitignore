@@ -365,3 +365,6 @@ FodyWeavers.xsd
 *.txt
 *.asr
 *.alev
+*.dds
+*.bmp
+*.tga

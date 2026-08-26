@@ -1,8 +1,6 @@
 <Solution>
   <Configurations>
     <Platform Name="x64" />
-    <Platform Name="x86" />
   </Configurations>
-  <Project Path="AsuraLevels2005.vcxproj" Id="256ca937-383a-4d54-b433-6d2097bdbe98" />
   <Project Path="LevelEditor.vcxproj" Id="5f6b4e0e-86a1-4a78-bb85-962c5c40d532" />
 </Solution>
