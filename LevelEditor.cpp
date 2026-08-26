@@ -1769,6 +1769,7 @@ enum ControlId : int {
     ID_SAVE_PROJECT,
     ID_EXPORT_PC,
     ID_MATERIAL_MAP,
+    ID_EXPORT_MATERIAL_MAP,
     ID_TEXTURE_DIR,
     ID_WEAPONS_DONOR,
     ID_SKYBOX_TEXTURES,
@@ -2861,13 +2862,16 @@ bool gpu_reload_environment_textures(std::string* why = nullptr, uint32_t* loade
 
     const bool use_external_textures =
         !g.document.material_map.empty() && !g.document.texture_dir.empty();
+    
+    bool pc_loaded = false;
     if (!use_external_textures && !g.document.source_pc_path.empty()) {
-        const bool loaded =
+        pc_loaded =
             gpu_load_pc_environment_textures(g.document.source_pc_path, loaded_count, missing_count, why);
-        refresh_scene_animation_timer();
-        return loaded;
-    }
-    if (g.document.rain_enabled) {
+        if (g.document.material_map.empty()) {
+            refresh_scene_animation_timer();
+            return pc_loaded;
+        }
+    } else if (g.document.rain_enabled) {
         const std::string& level_path = g.document.source_pc_path.empty()
                                             ? g.document.obj_path
                                             : g.document.source_pc_path;
@@ -2896,10 +2900,10 @@ bool gpu_reload_environment_textures(std::string* why = nullptr, uint32_t* loade
         if (!texture_files_ready)
             last_texture_error = err.set ? err.message : "Could not enumerate the environment texture folder.";
     }
-    uint32_t loaded = 0, missing = 0;
-    if (ok) {
+    if (ok && use_external_textures) {
+        uint32_t loaded = 0, missing = 0;
         for (GpuMaterialRange& range : gpu.material_ranges) {
-            if (!use_external_textures || !texture_files_ready || range.original_material_index < 0) {
+            if (!texture_files_ready || range.original_material_index < 0) {
                 ++missing;
                 continue;
             }
@@ -2929,11 +2933,11 @@ bool gpu_reload_environment_textures(std::string* why = nullptr, uint32_t* loade
                 last_texture_error = std::move(texture_error);
             }
         }
+        if (loaded_count)
+            *loaded_count = loaded;
+        if (missing_count)
+            *missing_count = missing;
     }
-    if (loaded_count)
-        *loaded_count = loaded;
-    if (missing_count)
-        *missing_count = missing;
     if (!ok && why)
         *why = err.set ? err.message : "Could not resolve environment materials.";
     else if (!last_texture_error.empty() && why)
@@ -2941,7 +2945,7 @@ bool gpu_reload_environment_textures(std::string* why = nullptr, uint32_t* loade
     unmap_file(&materials.file);
     arena_release(&arena);
     refresh_scene_animation_timer();
-    return ok;
+    return (!use_external_textures && !g.document.source_pc_path.empty()) ? (ok && pc_loaded) : ok;
 }
 
 bool find_skybox_texture(const std::string& directory, const char* stem, char* output, uint32_t output_size) {
@@ -6175,9 +6179,11 @@ void layout_controls() {
     const int top_y = 7;
     const struct { int id, x, w; } top[] = {{ID_OPEN_OBJ, 8, 84},          {ID_OPEN_PC, 96, 84},
                                             {ID_OPEN_PROJECT, 184, 84},    {ID_SAVE_PROJECT, 272, 84},
-                                            {ID_EXPORT_PC, 360, 90},       {ID_MATERIAL_MAP, 454, 104},
-                                            {ID_TEXTURE_DIR, 562, 100},    {ID_WEAPONS_DONOR, 666, 112},
-                                            {ID_SKYBOX_TEXTURES, 782, 116}, {ID_TOGGLE_RAIN, 906, 74}};
+                                            {ID_EXPORT_PC, 360, 90},       {ID_MATERIAL_MAP, 454, 140},
+                                            {ID_EXPORT_MATERIAL_MAP, 598, 126}, {ID_TEXTURE_DIR, 728, 100},
+                                            {ID_WEAPONS_DONOR, 832, 112},  {ID_SKYBOX_TEXTURES, 948, 116},
+                                            {ID_TOGGLE_RAIN, 1068, 74}
+    };
     for (auto c : top)
         MoveWindow(GetDlgItem(g.window, c.id), c.x, top_y, c.w, 28, TRUE);
     MoveWindow(g.list, 8, 48, 220, std::max(80, static_cast<int>(r.bottom) - 301), TRUE);
@@ -6251,7 +6257,8 @@ void create_controls() {
     make_control("BUTTON", "Open project", BS_PUSHBUTTON, ID_OPEN_PROJECT);
     make_control("BUTTON", "Save project", BS_PUSHBUTTON, ID_SAVE_PROJECT);
     make_control("BUTTON", "Export .PC", BS_DEFPUSHBUTTON, ID_EXPORT_PC);
-    make_control("BUTTON", "Material map", BS_PUSHBUTTON, ID_MATERIAL_MAP);
+    make_control("BUTTON", "Import material map", BS_PUSHBUTTON, ID_MATERIAL_MAP);
+    make_control("BUTTON", "Export material map", BS_PUSHBUTTON, ID_EXPORT_MATERIAL_MAP);
     make_control("BUTTON", "Texture folder", BS_PUSHBUTTON, ID_TEXTURE_DIR);
     make_control("BUTTON", "Weapons donor", BS_PUSHBUTTON, ID_WEAPONS_DONOR);
     make_control("BUTTON", "Skybox properties", BS_PUSHBUTTON, ID_SKYBOX_TEXTURES);
@@ -6849,6 +6856,85 @@ void command_browse_sound() {
     set_status(e.sound_name.c_str());
 }
 
+void command_export_material_map() {
+    if (g.document.source_pc_path.empty()) {
+        MessageBoxA(g.window, "You can't export material map out of a custom level", "Cannot export material map", MB_ICONERROR);
+        return;
+    }
+    std::string path;
+    if (!choose_path(g.window, true, "Save material map as", "Material map JSON\0*.json\0All files\0*.*\0", "json", &path))
+        return;
+
+    Error err{};
+    Arena arena{};
+    ChunkList chunks{};
+    std::vector<PcEnvironmentMaterialBinding> materials;
+    bool ok = arena_init(&arena, 8 * MiB, &err) &&
+              parse_chunks(g.document.source_pc_path.c_str(), &chunks, &arena, &err) &&
+              pc_environment_material_bindings(chunks, &materials, &err);
+
+    std::string out = "{\n";
+    if (ok && !materials.empty()) {
+        out += "  \"texture_by_material_index\": {\n";
+        for (size_t i = 0; i < materials.size(); ++i) {
+            std::string tname(materials[i].texture_name.data, materials[i].texture_name.size);
+            std::string escaped;
+            for (char c : tname) {
+                if (c == '\\' || c == '"') escaped += '\\';
+                escaped += c;
+            }
+            char line[1024];
+            snprintf(line, sizeof(line), "    \"%zu\": \"%s\"%s\n", i, escaped.c_str(), i + 1 == materials.size() ? "" : ",");
+            out += line;
+        }
+        out += "  },\n";
+
+        out += "  \"transparency_flag_by_material_index\": {\n";
+        for (size_t i = 0; i < materials.size(); ++i) {
+            char line[256];
+            snprintf(line, sizeof(line), "    \"%zu\": %u%s\n", i, materials[i].flags, i + 1 == materials.size() ? "" : ",");
+            out += line;
+        }
+        out += "  },\n";
+
+        out += "  \"surface_type_by_material_index\": {\n";
+        for (size_t i = 0; i < materials.size(); ++i) {
+            char line[256];
+            snprintf(line, sizeof(line), "    \"%zu\": %u%s\n", i, materials[i].surface_type, i + 1 == materials.size() ? "" : ",");
+            out += line;
+        }
+        out += "  }\n";
+    }
+    unmap_file(&chunks.file);
+    arena_release(&arena);
+
+    out += "}\n";
+
+    if (!write_entire_file(path.c_str(), out.c_str(), out.size(), nullptr)) {
+        MessageBoxA(g.window, "Failed to write file.", "Error", MB_ICONERROR);
+        return;
+    }
+
+    if (!g.history.begin(g.document, g.selected))
+        return;
+    g.document.material_map = path;
+    std::string why;
+    if (!g.document.obj_path.empty()) {
+        Mesh rebuilt;
+        if (load_preview_mesh(g.document.obj_path, path, &rebuilt, &why)) {
+            g.mesh = std::move(rebuilt);
+            g.environment_raycast.build(g.mesh);
+            invalidate_environment_cache();
+            gpu_upload_mesh();
+        }
+    } else {
+        gpu_reload_environment_textures(&why);
+    }
+    commit_history_transaction();
+    request_redraw();
+    set_status(why.empty() ? "Material map exported and applied." : why.c_str());
+}
+
 void command_material_map() {
     std::string path = g.document.material_map;
     if (!choose_path(g.window, false, "Choose material map", "Material map JSON\0*.json\0All files\0*.*\0", "json", &path))
@@ -7347,6 +7433,8 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             command_export();
         else if (id == ID_MATERIAL_MAP)
             command_material_map();
+        else if (id == ID_EXPORT_MATERIAL_MAP)
+            command_export_material_map();
         else if (id == ID_TEXTURE_DIR)
             command_texture_dir();
         else if (id == ID_WEAPONS_DONOR)
