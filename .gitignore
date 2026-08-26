@@ -368,3 +368,5 @@ FodyWeavers.xsd
 *.dds
 *.bmp
 *.tga
+*.pc
+*.json
