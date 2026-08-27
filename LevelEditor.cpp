@@ -1807,6 +1807,20 @@ enum ControlId : int {
     ID_VIEWPORT,
 };
 
+constexpr uint32_t kInspectorDirtyName = 1u << 0;
+constexpr uint32_t kInspectorDirtyPosX = 1u << 1;
+constexpr uint32_t kInspectorDirtyPosY = 1u << 2;
+constexpr uint32_t kInspectorDirtyPosZ = 1u << 3;
+constexpr uint32_t kInspectorDirtyRotX = 1u << 4;
+constexpr uint32_t kInspectorDirtyRotY = 1u << 5;
+constexpr uint32_t kInspectorDirtyRotZ = 1u << 6;
+constexpr uint32_t kInspectorDirtyValueA = 1u << 7;
+constexpr uint32_t kInspectorDirtyValueB = 1u << 8;
+constexpr uint32_t kInspectorDirtyPickup = 1u << 9;
+constexpr uint32_t kInspectorDirtySoundLoop = 1u << 10;
+constexpr int kInspectorDirtySpawnTeamShift = 11;
+constexpr int kInspectorDirtySpawnGameModeShift = 15;
+
 struct Camera {
     Asura_Vector_3 target{};
     float yaw = .65f;
@@ -1845,11 +1859,14 @@ struct AppState {
     std::vector<uint8_t> sound_preview_bytes;
     int sound_preview_entity = -1;
     Camera camera;
+    std::vector<int> selected_entities;
     int selected = -1;
     int pending_kind = -1;
     bool orbiting = false;
     bool panning = false;
     bool moving_entity = false;
+    bool refreshing_inspector = false;
+    uint32_t inspector_dirty = 0;
     bool fast_preview = false;
     HBITMAP environment_cache = nullptr;
     int environment_cache_width = 0;
@@ -1861,6 +1878,62 @@ struct AppState {
 };
 
 AppState g;
+
+bool valid_entity_index(int index) {
+    return index >= 0 && index < static_cast<int>(g.document.entities.size());
+}
+
+bool entity_is_selected(int index) {
+    return std::find(g.selected_entities.begin(), g.selected_entities.end(), index) !=
+           g.selected_entities.end();
+}
+
+void set_single_selection_state(int index) {
+    g.selected_entities.clear();
+    g.selected = valid_entity_index(index) ? index : -1;
+    if (g.selected >= 0)
+        g.selected_entities.push_back(g.selected);
+}
+
+void normalize_selection_state() {
+    std::vector<int> normalized;
+    normalized.reserve(g.selected_entities.size());
+    for (int index : g.selected_entities) {
+        if (valid_entity_index(index) &&
+            std::find(normalized.begin(), normalized.end(), index) == normalized.end())
+            normalized.push_back(index);
+    }
+    g.selected_entities = std::move(normalized);
+    if (!entity_is_selected(g.selected))
+        g.selected = g.selected_entities.empty() ? -1 : g.selected_entities.back();
+}
+
+void record_inspector_edit(int id, int notification) {
+    if (g.refreshing_inspector)
+        return;
+    if (notification == EN_CHANGE) {
+        switch (id) {
+        case ID_NAME: g.inspector_dirty |= kInspectorDirtyName; break;
+        case ID_POS_X: g.inspector_dirty |= kInspectorDirtyPosX; break;
+        case ID_POS_Y: g.inspector_dirty |= kInspectorDirtyPosY; break;
+        case ID_POS_Z: g.inspector_dirty |= kInspectorDirtyPosZ; break;
+        case ID_ROT_X: g.inspector_dirty |= kInspectorDirtyRotX; break;
+        case ID_ROT_Y: g.inspector_dirty |= kInspectorDirtyRotY; break;
+        case ID_ROT_Z: g.inspector_dirty |= kInspectorDirtyRotZ; break;
+        case ID_VALUE_A: g.inspector_dirty |= kInspectorDirtyValueA; break;
+        case ID_VALUE_B: g.inspector_dirty |= kInspectorDirtyValueB; break;
+        }
+    } else if (id == ID_PICKUP_ITEM && notification == CBN_SELCHANGE) {
+        g.inspector_dirty |= kInspectorDirtyPickup;
+    } else if (id == ID_SOUND_LOOP && notification == BN_CLICKED) {
+        g.inspector_dirty |= kInspectorDirtySoundLoop;
+    } else if (id >= ID_SPAWN_TEAM_FIRST && id <= ID_SPAWN_TEAM_LAST && notification == BN_CLICKED) {
+        g.inspector_dirty |= 1u << (kInspectorDirtySpawnTeamShift + id - ID_SPAWN_TEAM_FIRST);
+    } else if (id >= ID_SPAWN_GAME_MODE_FIRST && id <= ID_SPAWN_GAME_MODE_LAST &&
+               notification == BN_CLICKED) {
+        g.inspector_dirty |= 1u << (kInspectorDirtySpawnGameModeShift + id - ID_SPAWN_GAME_MODE_FIRST);
+    }
+}
 
 void stop_sound_preview() {
     if (g.sound_preview_entity >= 0)
@@ -4113,10 +4186,12 @@ void gpu_render() {
     const float fov_y = 2.0f * atanf(static_cast<float>(height) / (2.0f * focal));
     const float near_plane = fmaxf(.01f, g.camera.distance * .001f);
     float far_plane = fmaxf(1000.0f, g.camera.distance + g.mesh.radius * 8.0f);
-    if (g.selected >= 0 && g.selected < static_cast<int>(g.document.entities.size()) &&
-        (g.document.entities[g.selected].kind == EntityKind::Light ||
-         g.document.entities[g.selected].kind == EntityKind::Sound)) {
-        const Entity& entity = g.document.entities[g.selected];
+    for (int selected_index : g.selected_entities) {
+        if (!valid_entity_index(selected_index))
+            continue;
+        const Entity& entity = g.document.entities[selected_index];
+        if (entity.kind != EntityKind::Light && entity.kind != EntityKind::Sound)
+            continue;
         const float range = fabsf(entity.kind == EntityKind::Light ? entity.light.Range : entity.value_b);
         if (isfinite(range) && range <= kMaximumLightGizmoRange) {
             const Asura_Vector_3 offset = sub(entity_view_position(entity.position), camera_position);
@@ -4293,7 +4368,7 @@ void gpu_render() {
     }
     puppet_vertices.reserve(puppet_vertex_count);
     for (int i = 0; i < static_cast<int>(g.document.entities.size()); ++i) {
-        if (i == g.selected)
+        if (entity_is_selected(i))
             continue;
         const Entity& entity = g.document.entities[i];
         if (entity.kind == EntityKind::SpawnPoint)
@@ -4302,8 +4377,10 @@ void gpu_render() {
             append_gpu_pickup_model(entity, false, &puppet_vertices);
     }
     const uint32_t unselected_puppet_count = static_cast<uint32_t>(puppet_vertices.size());
-    if (g.selected >= 0 && g.selected < static_cast<int>(g.document.entities.size())) {
-        const Entity& selected_entity = g.document.entities[g.selected];
+    for (int selected_index : g.selected_entities) {
+        if (!valid_entity_index(selected_index))
+            continue;
+        const Entity& selected_entity = g.document.entities[selected_index];
         if (selected_entity.kind == EntityKind::SpawnPoint)
             append_gpu_spawn_puppet(selected_entity, true, &puppet_vertices);
         else if (selected_entity.kind == EntityKind::PhysicalObject)
@@ -4320,12 +4397,12 @@ void gpu_render() {
     const int lines = static_cast<int>(extent / step);
     const DirectX::XMFLOAT4 minor{.18f, .22f, .25f, 1}, major{.32f, .38f, .42f, 1};
     size_t gizmo_line_capacity = 0;
-    if (g.selected >= 0 && g.selected < static_cast<int>(g.document.entities.size())) {
+    if (valid_entity_index(g.selected)) {
         const EntityKind kind = g.document.entities[g.selected].kind;
         if (kind == EntityKind::Light)
-            gizmo_line_capacity = kMaximumLightGizmoLines;
+            gizmo_line_capacity = kMaximumLightGizmoLines * g.selected_entities.size();
         else if (kind == EntityKind::Sound)
-            gizmo_line_capacity = kLightRangeSegments * 3;
+            gizmo_line_capacity = kLightRangeSegments * 3 * g.selected_entities.size();
     }
     overlay.reserve((lines * 2 + 1) * 4 +
                     g.document.entities.size() * (6 + kCameraSpawnArrowLines * 2) +
@@ -4344,7 +4421,7 @@ void gpu_render() {
     entity_gizmo.reserve(kMaximumLightGizmoLines);
     for (int pass = 0; pass < 2; ++pass) {
       for (int i = 0; i < static_cast<int>(g.document.entities.size()); ++i) {
-        const bool selected = i == g.selected;
+        const bool selected = entity_is_selected(i);
         if (selected != (pass == 1))
             continue;
         const Entity& entity = g.document.entities[i];
@@ -5341,10 +5418,15 @@ void command_light_properties() {
 
     if (!g.history.begin(g.document, g.selected))
         return;
-    entity.light = state.value;
-    entity.position = state.value.Position;
-    entity.value_a = state.value.Brightness;
-    entity.value_b = state.value.Range;
+    for (int index : g.selected_entities) {
+        if (!valid_entity_index(index) || g.document.entities[index].kind != EntityKind::Light)
+            continue;
+        Entity& target = g.document.entities[index];
+        target.light = state.value;
+        target.position = state.value.Position;
+        target.value_a = state.value.Brightness;
+        target.value_b = state.value.Range;
+    }
     commit_history_transaction();
     refresh_inspector();
     request_redraw();
@@ -5392,6 +5474,78 @@ int entity_list_row(int document_index) {
     return LB_ERR;
 }
 
+void sync_entity_list_selection() {
+    if (!g.list)
+        return;
+    const int count = static_cast<int>(SendMessageA(g.list, LB_GETCOUNT, 0, 0));
+    for (int row = 0; row < count; ++row) {
+        const int index = static_cast<int>(SendMessageA(g.list, LB_GETITEMDATA, row, 0));
+        SendMessageA(g.list, LB_SETSEL, entity_is_selected(index), row);
+    }
+    if (g.selected >= 0) {
+        const int row = entity_list_row(g.selected);
+        if (row != LB_ERR)
+            SendMessageA(g.list, LB_SETCARETINDEX, row, FALSE);
+    }
+}
+
+void select_entities_from_list() {
+    const int old_primary = g.selected;
+    const std::vector<int> old_selection = g.selected_entities;
+    std::vector<int> selection;
+    const int count = static_cast<int>(SendMessageA(g.list, LB_GETCOUNT, 0, 0));
+    for (int row = 0; row < count; ++row) {
+        if (SendMessageA(g.list, LB_GETSEL, row, 0) <= 0)
+            continue;
+        const int index = static_cast<int>(SendMessageA(g.list, LB_GETITEMDATA, row, 0));
+        if (valid_entity_index(index))
+            selection.push_back(index);
+    }
+
+    const LRESULT caret_row = SendMessageA(g.list, LB_GETCARETINDEX, 0, 0);
+    const int caret_index = caret_row == LB_ERR
+                                ? -1
+                                : static_cast<int>(SendMessageA(g.list, LB_GETITEMDATA,
+                                                                 static_cast<WPARAM>(caret_row), 0));
+    bool restricted = false;
+    if (selection.size() > 1) {
+        EntityKind allowed_kind = g.document.entities[selection.front()].kind;
+        bool mixed = false;
+        for (int index : selection)
+            mixed |= g.document.entities[index].kind != allowed_kind;
+        if (mixed) {
+            // When Ctrl/Shift adds another type, preserve the type that was
+            // already selected. A plain click has only one item and switches
+            // types normally.
+            if (!old_selection.empty() && valid_entity_index(old_selection.front()))
+                allowed_kind = g.document.entities[old_selection.front()].kind;
+            else if (valid_entity_index(caret_index))
+                allowed_kind = g.document.entities[caret_index].kind;
+            selection.erase(std::remove_if(selection.begin(), selection.end(), [&](int index) {
+                                return g.document.entities[index].kind != allowed_kind;
+                            }),
+                            selection.end());
+            restricted = true;
+        }
+    }
+
+    g.selected_entities = std::move(selection);
+    if (entity_is_selected(caret_index))
+        g.selected = caret_index;
+    else if (entity_is_selected(old_primary))
+        g.selected = old_primary;
+    else
+        g.selected = g.selected_entities.empty() ? -1 : g.selected_entities.back();
+    if (restricted)
+        sync_entity_list_selection();
+    if (g.selected != old_primary || g.selected_entities != old_selection)
+        stop_sound_preview();
+    refresh_inspector();
+    request_redraw();
+    if (restricted)
+        set_status("Multiple selection is limited to one entity type.");
+}
+
 void refresh_list() {
     SendMessageA(g.list, LB_RESETCONTENT, 0, 0);
     std::vector<uint32_t> order(g.document.entities.size());
@@ -5415,10 +5569,8 @@ void refresh_list() {
         if (row != LB_ERR && row != LB_ERRSPACE)
             SendMessageA(g.list, LB_SETITEMDATA, static_cast<WPARAM>(row), index);
     }
-    if (g.selected >= static_cast<int>(g.document.entities.size()))
-        g.selected = static_cast<int>(g.document.entities.size()) - 1;
-    if (g.selected >= 0)
-        SendMessageA(g.list, LB_SETCURSEL, entity_list_row(g.selected), 0);
+    normalize_selection_state();
+    sync_entity_list_selection();
 }
 
 void refresh_pickup_choices(uint32_t selected_item) {
@@ -5446,9 +5598,16 @@ void refresh_pickup_choices(uint32_t selected_item) {
 }
 
 void refresh_inspector() {
+    g.refreshing_inspector = true;
+    g.inspector_dirty = 0;
     const bool enabled = g.selected >= 0 && g.selected < static_cast<int>(g.document.entities.size());
     const bool source_entity = enabled && g.document.entities[g.selected].source_entity_record;
     const bool pickup = enabled && g.document.entities[g.selected].kind == EntityKind::PhysicalObject;
+    bool selection_deletable = enabled;
+    for (int index : g.selected_entities) {
+        const Entity& entity = g.document.entities[index];
+        selection_deletable &= !entity.source_entity_record || entity.kind == EntityKind::PhysicalObject;
+    }
     if (g.rain_toggle) {
         SendMessageA(g.rain_toggle, BM_SETCHECK,
                      g.document.rain_enabled ? BST_CHECKED : BST_UNCHECKED, 0);
@@ -5461,7 +5620,14 @@ void refresh_inspector() {
     EnableWindow(g.value[0], enabled && (!source_entity || pickup));
     EnableWindow(g.value[1], enabled && !source_entity && !pickup);
     EnableWindow(GetDlgItem(g.window, ID_APPLY_INSPECTOR), enabled);
-    EnableWindow(GetDlgItem(g.window, ID_DELETE_ENTITY), enabled && (!source_entity || pickup));
+    EnableWindow(GetDlgItem(g.window, ID_DELETE_ENTITY), selection_deletable);
+    if (g.selected_entities.size() > 1) {
+        char label[96]{};
+        snprintf(label, sizeof(label), "Apply properties to %zu selected", g.selected_entities.size());
+        SetWindowTextA(GetDlgItem(g.window, ID_APPLY_INSPECTOR), label);
+    } else {
+        SetWindowTextA(GetDlgItem(g.window, ID_APPLY_INSPECTOR), "Apply properties");
+    }
     ShowWindow(g.sound_browse, SW_HIDE);
     ShowWindow(g.sound_loop, SW_HIDE);
     ShowWindow(g.sound_preview, SW_HIDE);
@@ -5489,6 +5655,7 @@ void refresh_inspector() {
         set_control_text(GetDlgItem(g.window, 914), "Pitch");
         set_control_text(GetDlgItem(g.window, 915), "Yaw");
         set_control_text(GetDlgItem(g.window, 916), "Roll");
+        g.refreshing_inspector = false;
         return;
     }
     const Entity& e = g.document.entities[g.selected];
@@ -5569,14 +5736,36 @@ void refresh_inspector() {
         set_float(g.value[0], e.value_a);
         set_float(g.value[1], e.value_b);
     }
+    g.refreshing_inspector = false;
 }
 
 void select_entity(int index) {
     if (index != g.selected)
         stop_sound_preview();
-    g.selected = index;
-    if (index >= 0)
-        SendMessageA(g.list, LB_SETCURSEL, entity_list_row(index), 0);
+    set_single_selection_state(index);
+    sync_entity_list_selection();
+    refresh_inspector();
+    request_redraw();
+}
+
+void toggle_entity_selection(int index) {
+    if (!valid_entity_index(index))
+        return;
+    if (!g.selected_entities.empty() && valid_entity_index(g.selected_entities.front()) &&
+        g.document.entities[g.selected_entities.front()].kind != g.document.entities[index].kind) {
+        set_status("Multiple selection is limited to one entity type.");
+        return;
+    }
+    stop_sound_preview();
+    const auto found = std::find(g.selected_entities.begin(), g.selected_entities.end(), index);
+    if (found == g.selected_entities.end()) {
+        g.selected_entities.push_back(index);
+        g.selected = index;
+    } else {
+        g.selected_entities.erase(found);
+        g.selected = g.selected_entities.empty() ? -1 : g.selected_entities.back();
+    }
+    sync_entity_list_selection();
     refresh_inspector();
     request_redraw();
 }
@@ -5617,87 +5806,122 @@ void focus_camera_on_entity(int index) {
 }
 
 void apply_inspector() {
-    if (g.selected < 0 || g.selected >= static_cast<int>(g.document.entities.size()))
+    normalize_selection_state();
+    if (!valid_entity_index(g.selected))
         return;
     if (!g.history.begin(g.document, g.selected))
         return;
-    Entity& e = g.document.entities[g.selected];
     char name[512]{};
     GetWindowTextA(g.name, name, sizeof(name));
-    e.name = name;
-    e.position = {get_float(g.pos[0], e.position.x), get_float(g.pos[1], e.position.y),
-                  get_float(g.pos[2], e.position.z)};
-    if (e.kind == EntityKind::Light) {
-        e.light.Position = e.position;
-    } else if (e.kind == EntityKind::SpawnPoint) {
-        e.rotation.x = get_float(g.rot[0], e.rotation.x);
-        e.rotation.y = get_float(g.rot[1], e.rotation.y);
-        e.rotation.z = 0.0f;
-    } else {
-        e.rotation = {get_float(g.rot[0], e.rotation.x), get_float(g.rot[1], e.rotation.y),
-                      get_float(g.rot[2], e.rotation.z)};
-    }
-    if (e.kind == EntityKind::SpawnPoint) {
-        for (int i = 0; i < static_cast<int>(_countof(kSpawnTeamControls)); ++i) {
-            if (SendMessageA(g.spawn_team_checks[i], BM_GETCHECK, 0, 0) == BST_CHECKED)
-                e.value_u32_a |= kSpawnTeamControls[i].mask;
-            else
-                e.value_u32_a &= ~kSpawnTeamControls[i].mask;
+    const std::vector<int> targets = g.selected_entities;
+    const bool apply_all = targets.size() == 1;
+    const auto changed = [&](uint32_t flag) { return apply_all || (g.inspector_dirty & flag) != 0; };
+    const uint32_t position_dirty = kInspectorDirtyPosX | kInspectorDirtyPosY | kInspectorDirtyPosZ;
+    const uint32_t rotation_dirty = kInspectorDirtyRotX | kInspectorDirtyRotY | kInspectorDirtyRotZ;
+    for (int index : targets) {
+        Entity& e = g.document.entities[index];
+        if (changed(kInspectorDirtyName))
+            e.name = name;
+        if (changed(kInspectorDirtyPosX))
+            e.position.x = get_float(g.pos[0], e.position.x);
+        if (changed(kInspectorDirtyPosY))
+            e.position.y = get_float(g.pos[1], e.position.y);
+        if (changed(kInspectorDirtyPosZ))
+            e.position.z = get_float(g.pos[2], e.position.z);
+        if (e.kind == EntityKind::Light) {
+            if (apply_all || (g.inspector_dirty & position_dirty))
+                e.light.Position = e.position;
+        } else if (e.kind == EntityKind::SpawnPoint) {
+            if (changed(kInspectorDirtyRotX))
+                e.rotation.x = get_float(g.rot[0], e.rotation.x);
+            if (changed(kInspectorDirtyRotY))
+                e.rotation.y = get_float(g.rot[1], e.rotation.y);
+            if (apply_all)
+                e.rotation.z = 0.0f;
+        } else {
+            if (changed(kInspectorDirtyRotX))
+                e.rotation.x = get_float(g.rot[0], e.rotation.x);
+            if (changed(kInspectorDirtyRotY))
+                e.rotation.y = get_float(g.rot[1], e.rotation.y);
+            if (changed(kInspectorDirtyRotZ))
+                e.rotation.z = get_float(g.rot[2], e.rotation.z);
         }
-        for (int i = 0; i < static_cast<int>(_countof(kSpawnGameModeControls)); ++i) {
-            if (SendMessageA(g.spawn_game_mode_checks[i], BM_GETCHECK, 0, 0) == BST_CHECKED)
-                e.value_u32_b |= kSpawnGameModeControls[i].mask;
-            else
-                e.value_u32_b &= ~kSpawnGameModeControls[i].mask;
-        }
-        const float yaw = e.rotation.y * 3.14159265358979323846f / 180.0f;
-        const float pitch = e.rotation.x * 3.14159265358979323846f / 180.0f;
-        e.spawn_direction = {cosf(pitch) * sinf(yaw), sinf(pitch), cosf(pitch) * cosf(yaw)};
-    } else if (e.kind == EntityKind::Light) {
-        if (e.light.m_uFlags & ASURA_LIGHT_FLAG_IS_SHADOW_VOLUME)
-            e.light.ShadowStrength = get_float(g.value[0], e.light.ShadowStrength);
-        else
-            e.light.Brightness = get_float(g.value[0], e.light.Brightness);
-        e.value_b = get_float(g.value[1], e.light.Range);
-        e.value_a = e.light.Brightness;
-        e.light.Range = e.value_b;
-    } else if (e.kind == EntityKind::Sound) {
-        e.value_a = get_float(g.value[0], e.value_a);
-        e.value_b = get_float(g.value[1], e.value_b);
-        e.sound_loop = SendMessageA(g.sound_loop, BM_GETCHECK, 0, 0) == BST_CHECKED;
-        if (e.sound_source_record) {
-            e.sound_phonon.m_xPosition = e.position;
-            e.sound_phonon.m_fInnerRadius = e.value_a;
-            e.sound_phonon.m_fOuterRadius = e.value_b;
-            e.sound_phonon.m_xOrient = euler_quaternion(e.rotation);
-            e.sound_phonon.m_uFlags = e.sound_loop ? (e.sound_phonon.m_uFlags | 1u)
-                                                   : (e.sound_phonon.m_uFlags & ~1u);
-        }
-    } else if (e.kind == EntityKind::PhysicalObject) {
-        const LRESULT selected_item = SendMessageA(g.pickup_item, CB_GETCURSEL, 0, 0);
-        const uint32_t requested_item = selected_item == CB_ERR
-                                            ? e.value_u32_a
-                                            : static_cast<uint32_t>(SendMessageA(
-                                                  g.pickup_item, CB_GETITEMDATA,
-                                                  static_cast<WPARAM>(selected_item), 0));
-        if (requested_item != e.value_u32_a) {
-            const PickupTemplate* item_template = find_pickup_template(g.document, requested_item, true);
-            if (item_template) {
-                const char* old_item_name = snipe_item_name(e.value_u32_a);
-                const bool automatic_name = old_item_name && e.name.rfind(old_item_name, 0) == 0;
-                const std::string name_suffix = automatic_name ? e.name.substr(strlen(old_item_name)) : std::string{};
-                adopt_pickup_template(&e, *item_template);
-                if (automatic_name) {
-                    const char* new_item_name = snipe_item_name(requested_item);
-                    e.name = std::string(new_item_name ? new_item_name : "Pickup") + name_suffix;
+        if (e.kind == EntityKind::SpawnPoint) {
+            for (int i = 0; i < static_cast<int>(_countof(kSpawnTeamControls)); ++i) {
+                if (!changed(1u << (kInspectorDirtySpawnTeamShift + i)))
+                    continue;
+                if (SendMessageA(g.spawn_team_checks[i], BM_GETCHECK, 0, 0) == BST_CHECKED)
+                    e.value_u32_a |= kSpawnTeamControls[i].mask;
+                else
+                    e.value_u32_a &= ~kSpawnTeamControls[i].mask;
+            }
+            for (int i = 0; i < static_cast<int>(_countof(kSpawnGameModeControls)); ++i) {
+                if (!changed(1u << (kInspectorDirtySpawnGameModeShift + i)))
+                    continue;
+                if (SendMessageA(g.spawn_game_mode_checks[i], BM_GETCHECK, 0, 0) == BST_CHECKED)
+                    e.value_u32_b |= kSpawnGameModeControls[i].mask;
+                else
+                    e.value_u32_b &= ~kSpawnGameModeControls[i].mask;
+            }
+            if (apply_all || (g.inspector_dirty & (kInspectorDirtyRotX | kInspectorDirtyRotY))) {
+                const float yaw = e.rotation.y * 3.14159265358979323846f / 180.0f;
+                const float pitch = e.rotation.x * 3.14159265358979323846f / 180.0f;
+                e.spawn_direction = {cosf(pitch) * sinf(yaw), sinf(pitch), cosf(pitch) * cosf(yaw)};
+            }
+        } else if (e.kind == EntityKind::Light) {
+            if (changed(kInspectorDirtyValueA)) {
+                if (e.light.m_uFlags & ASURA_LIGHT_FLAG_IS_SHADOW_VOLUME)
+                    e.light.ShadowStrength = get_float(g.value[0], e.light.ShadowStrength);
+                else
+                    e.light.Brightness = get_float(g.value[0], e.light.Brightness);
+            }
+            if (changed(kInspectorDirtyValueB))
+                e.value_b = get_float(g.value[1], e.light.Range);
+            e.value_a = e.light.Brightness;
+            e.light.Range = e.value_b;
+        } else if (e.kind == EntityKind::Sound) {
+            if (changed(kInspectorDirtyValueA))
+                e.value_a = get_float(g.value[0], e.value_a);
+            if (changed(kInspectorDirtyValueB))
+                e.value_b = get_float(g.value[1], e.value_b);
+            if (changed(kInspectorDirtySoundLoop))
+                e.sound_loop = SendMessageA(g.sound_loop, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            if (e.sound_source_record &&
+                (apply_all || (g.inspector_dirty & (position_dirty | rotation_dirty |
+                                                    kInspectorDirtyValueA | kInspectorDirtyValueB |
+                                                    kInspectorDirtySoundLoop)))) {
+                e.sound_phonon.m_xPosition = e.position;
+                e.sound_phonon.m_fInnerRadius = e.value_a;
+                e.sound_phonon.m_fOuterRadius = e.value_b;
+                e.sound_phonon.m_xOrient = euler_quaternion(e.rotation);
+                e.sound_phonon.m_uFlags = e.sound_loop ? (e.sound_phonon.m_uFlags | 1u)
+                                                       : (e.sound_phonon.m_uFlags & ~1u);
+            }
+        } else if (e.kind == EntityKind::PhysicalObject) {
+            const LRESULT selected_item = SendMessageA(g.pickup_item, CB_GETCURSEL, 0, 0);
+            const uint32_t requested_item = !changed(kInspectorDirtyPickup) || selected_item == CB_ERR
+                                                ? e.value_u32_a
+                                                : static_cast<uint32_t>(SendMessageA(
+                                                      g.pickup_item, CB_GETITEMDATA,
+                                                      static_cast<WPARAM>(selected_item), 0));
+            if (requested_item != e.value_u32_a) {
+                const PickupTemplate* item_template = find_pickup_template(g.document, requested_item, true);
+                if (item_template) {
+                    const char* old_item_name = snipe_item_name(e.value_u32_a);
+                    const bool automatic_name = old_item_name && e.name.rfind(old_item_name, 0) == 0;
+                    const std::string name_suffix = automatic_name ? e.name.substr(strlen(old_item_name)) : std::string{};
+                    adopt_pickup_template(&e, *item_template);
+                    if (automatic_name) {
+                        const char* new_item_name = snipe_item_name(requested_item);
+                        e.name = std::string(new_item_name ? new_item_name : "Pickup") + name_suffix;
+                    }
+                } else {
+                    char message[192]{};
+                    snprintf(message, sizeof(message),
+                             "Item 0x%02X is not present in the loaded 0x0008 pickup catalog.",
+                             requested_item);
+                    set_status(message);
                 }
-                set_status(snipe_item_label(requested_item).c_str());
-            } else {
-                char message[192]{};
-                snprintf(message, sizeof(message),
-                         "Item 0x%02X is not present in the loaded 0x0008 pickup catalog.",
-                         requested_item);
-                set_status(message);
             }
         }
     }
@@ -5705,6 +5929,12 @@ void apply_inspector() {
     refresh_list();
     refresh_inspector();
     request_redraw();
+    if (targets.size() > 1) {
+        char status[128]{};
+        snprintf(status, sizeof(status), "Properties applied to %zu selected %s entities.",
+                 targets.size(), entity_type_label(g.document.entities[targets.front()].kind));
+        set_status(status);
+    }
 }
 
 void frame_mesh() {
@@ -5731,7 +5961,7 @@ bool open_obj_path(const std::string& path) {
     if (!g.document.source_pc_path.empty()) {
         g.document = Document{};
         g.pickup_models.clear();
-        g.selected = -1;
+        set_single_selection_state(-1);
         g.pending_kind = -1;
         gpu_load_skybox({}, nullptr);
         refresh_list();
@@ -5807,7 +6037,7 @@ void add_entity_at(EntityKind kind, const Asura_Vector_3& p) {
     stop_sound_preview();
     g.document.entities.push_back(std::move(e));
     g.pending_kind = -1;
-    g.selected = static_cast<int>(g.document.entities.size()) - 1;
+    set_single_selection_state(static_cast<int>(g.document.entities.size()) - 1);
     commit_history_transaction();
     refresh_list();
     refresh_inspector();
@@ -5871,7 +6101,8 @@ int hit_entity(int x, int y) {
     float best_depth = 1.0e30f;
     for (int i = 0; i < static_cast<int>(g.document.entities.size()); ++i) {
         const Entity& entity = g.document.entities[i];
-        if (i != g.selected && environment_occludes_view_position(entity_view_position(entity.position)))
+        if (!entity_is_selected(i) &&
+            environment_occludes_view_position(entity_view_position(entity.position)))
             continue;
         if (entity_render_model(entity)) {
             RECT bounds{};
@@ -6159,40 +6390,41 @@ void draw_entities(HDC dc) {
     SetTextColor(dc, RGB(230, 235, 240));
     for (int i = 0; i < static_cast<int>(g.document.entities.size()); ++i) {
         const Entity& e = g.document.entities[i];
-        if (i != g.selected && environment_occludes_view_position(entity_view_position(e.position)))
+        const bool selected = entity_is_selected(i);
+        if (!selected && environment_occludes_view_position(entity_view_position(e.position)))
             continue;
         POINT p{};
         if (!project_point(entity_view_position(e.position), &p))
             continue;
         const COLORREF color = entity_color(e.kind);
-        if (e.kind == EntityKind::Light && i == g.selected)
+        if (e.kind == EntityKind::Light && selected)
             draw_light_gizmo(dc, e, true);
-        else if (e.kind == EntityKind::Sound && i == g.selected)
+        else if (e.kind == EntityKind::Sound && selected)
             draw_sound_gizmo(dc, e);
         if (e.kind == EntityKind::SpawnPoint && (e.value_u32_a & SnipeSpawnTeam_Camera)) {
             std::vector<LightGizmoLine> lines;
             lines.reserve(kCameraSpawnArrowLines);
-            const float marker = fmaxf(.35f, g.mesh.radius * .008f) * (i == g.selected ? 1.6f : 1.0f);
+            const float marker = fmaxf(.35f, g.mesh.radius * .008f) * (selected ? 1.6f : 1.0f);
             append_camera_spawn_arrow(e, marker, &lines);
-            draw_gizmo_lines(dc, lines, i == g.selected ? 2 : 1,
-                             i == g.selected ? RGB(255, 255, 255) : color);
+            draw_gizmo_lines(dc, lines, selected ? 2 : 1,
+                             selected ? RGB(255, 255, 255) : color);
         }
         if ((e.kind == EntityKind::SpawnPoint || e.kind == EntityKind::PhysicalObject) &&
-            draw_spawn_puppet(dc, e, i == g.selected)) {
-            if (i == g.selected)
+            draw_spawn_puppet(dc, e, selected)) {
+            if (selected)
                 TextOutA(dc, p.x + 10, p.y - 8, e.name.c_str(), static_cast<int>(e.name.size()));
             continue;
         }
         HBRUSH brush = CreateSolidBrush(color);
-        HPEN pen = CreatePen(PS_SOLID, i == g.selected ? 3 : 1, i == g.selected ? RGB(255, 255, 255) : color);
+        HPEN pen = CreatePen(PS_SOLID, selected ? 3 : 1, selected ? RGB(255, 255, 255) : color);
         HGDIOBJ ob = SelectObject(dc, brush), op = SelectObject(dc, pen);
-        const int r = i == g.selected ? 7 : 5;
+        const int r = selected ? 7 : 5;
         Ellipse(dc, p.x - r, p.y - r, p.x + r + 1, p.y + r + 1);
         SelectObject(dc, ob);
         SelectObject(dc, op);
         DeleteObject(brush);
         DeleteObject(pen);
-        if (i == g.selected)
+        if (selected)
             TextOutA(dc, p.x + 10, p.y - 8, e.name.c_str(), static_cast<int>(e.name.size()));
     }
     SelectClipRgn(dc, nullptr);
@@ -6340,7 +6572,8 @@ void create_controls() {
     make_control("BUTTON", "Weapons donor", BS_PUSHBUTTON, ID_WEAPONS_DONOR);
     make_control("BUTTON", "Skybox properties", BS_PUSHBUTTON, ID_SKYBOX_TEXTURES);
     g.rain_toggle = make_control("BUTTON", "Rain", BS_AUTOCHECKBOX, ID_TOGGLE_RAIN);
-    g.list = make_control("LISTBOX", "", LBS_NOTIFY | WS_VSCROLL | WS_BORDER, ID_ENTITY_LIST);
+    g.list = make_control("LISTBOX", "", LBS_NOTIFY | LBS_EXTENDEDSEL | WS_VSCROLL | WS_BORDER,
+                          ID_ENTITY_LIST);
     make_control("BUTTON", "+ Spawn", BS_PUSHBUTTON, ID_ADD_SPAWN);
     make_control("BUTTON", "+ Light", BS_PUSHBUTTON, ID_ADD_LIGHT);
     make_control("BUTTON", "+ Pickup", BS_PUSHBUTTON, ID_ADD_PICKUP);
@@ -6348,7 +6581,7 @@ void create_controls() {
     make_control("BUTTON", "Delete selected", BS_PUSHBUTTON, ID_DELETE_ENTITY);
     make_control("STATIC",
                  "Right-drag: orbit; middle-drag: pan; wheel: zoom\r\n"
-                 "Double-click list: focus selected entity\r\n"
+                 "Ctrl/Shift list: select same-type entities\r\n"
                  "Ctrl+Z/Y: undo/redo; Ctrl+C/V: copy/paste; Delete: remove",
                  SS_LEFT, 900);
     make_control("STATIC", "Name", SS_LEFT, 910);
@@ -6497,7 +6730,7 @@ bool open_pc_path(const std::string& path) {
     g.document = std::move(document);
     g.mesh = std::move(mesh);
     g.pickup_models = std::move(pickup_models);
-    g.selected = g.document.entities.empty() ? -1 : 0;
+    set_single_selection_state(g.document.entities.empty() ? -1 : 0);
     g.pending_kind = -1;
     std::string skybox_why;
     const bool skybox_loaded = gpu_load_pc_skybox(path, &skybox_why);
@@ -6676,6 +6909,7 @@ void finish_entity_drag_transaction() {
 void refresh_after_history_restore(const Document& previous, const char* action) {
     stop_sound_preview();
     g.pending_kind = -1;
+    set_single_selection_state(g.selected);
     std::string why;
     const bool resources_ready = refresh_history_derived_resources(previous, &why);
     refresh_list();
@@ -6724,6 +6958,7 @@ void command_paste_entity() {
         set_status(why.c_str());
         return;
     }
+    set_single_selection_state(g.selected);
     g.pending_kind = -1;
     refresh_list();
     refresh_inspector();
@@ -6757,7 +6992,7 @@ void command_open_project() {
     }
     g.document = std::move(doc);
     const bool skybox_loaded = reload_skybox_preview(true);
-    g.selected = g.document.entities.empty() ? -1 : 0;
+    set_single_selection_state(g.document.entities.empty() ? -1 : 0);
     frame_mesh();
     reset_history(!g.document.dirty);
     refresh_list();
@@ -7394,23 +7629,34 @@ void command_skybox_textures() {
 }
 
 void delete_selected() {
-    if (g.selected < 0 || g.selected >= static_cast<int>(g.document.entities.size()))
+    normalize_selection_state();
+    if (g.selected_entities.empty())
         return;
-    if (g.document.entities[g.selected].source_entity_record &&
-        g.document.entities[g.selected].kind != EntityKind::PhysicalObject) {
-        set_status("Imported target/marker records remain source-preserved and cannot be deleted yet.");
-        return;
+    for (int index : g.selected_entities) {
+        if (g.document.entities[index].source_entity_record &&
+            g.document.entities[index].kind != EntityKind::PhysicalObject) {
+            set_status("Imported target/marker records remain source-preserved and cannot be deleted yet.");
+            return;
+        }
     }
     stop_sound_preview();
     if (!g.history.begin(g.document, g.selected))
         return;
-    g.document.entities.erase(g.document.entities.begin() + g.selected);
-    if (g.selected >= static_cast<int>(g.document.entities.size()))
-        --g.selected;
+    std::vector<int> targets = g.selected_entities;
+    std::sort(targets.begin(), targets.end());
+    const int next_index = targets.front();
+    for (auto it = targets.rbegin(); it != targets.rend(); ++it)
+        g.document.entities.erase(g.document.entities.begin() + *it);
+    set_single_selection_state(std::min(next_index, static_cast<int>(g.document.entities.size()) - 1));
     commit_history_transaction();
     refresh_list();
     refresh_inspector();
     request_redraw();
+    if (targets.size() > 1) {
+        char status[96]{};
+        snprintf(status, sizeof(status), "Deleted %zu selected entities.", targets.size());
+        set_status(status);
+    }
 }
 
 void paint_window() {
@@ -7498,6 +7744,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
         return 0;
     case WM_COMMAND: {
         const int id = LOWORD(wparam);
+        record_inspector_edit(id, HIWORD(wparam));
         if (id == ID_OPEN_OBJ)
             command_open_obj();
         else if (id == ID_OPEN_PC)
@@ -7548,16 +7795,11 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             command_light_properties();
         else if (id == ID_ENTITY_LIST) {
             const int notification = HIWORD(wparam);
-            const LRESULT row = SendMessageA(g.list, LB_GETCURSEL, 0, 0);
-            const int index = row == LB_ERR
-                                  ? -1
-                                  : static_cast<int>(SendMessageA(g.list, LB_GETITEMDATA,
-                                                                   static_cast<WPARAM>(row), 0));
             if (notification == LBN_SELCHANGE)
-                select_entity(index);
+                select_entities_from_list();
             else if (notification == LBN_DBLCLK) {
-                select_entity(index);
-                focus_camera_on_entity(index);
+                select_entities_from_list();
+                focus_camera_on_entity(g.selected);
             }
         }
         return 0;
@@ -7577,6 +7819,10 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             return 0;
         }
         const int hit = hit_entity(p.x, p.y);
+        if ((GetKeyState(VK_CONTROL) & 0x8000) && hit >= 0) {
+            toggle_entity_selection(hit);
+            return 0;
+        }
         select_entity(hit);
         if (hit >= 0 && g.history.begin(g.document, g.selected)) {
             g.moving_entity = true;
@@ -7701,7 +7947,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             if (load_project(&doc, p.c_str(), &why)) {
                 stop_sound_preview();
                 g.document = std::move(doc);
-                g.selected = g.document.entities.empty() ? -1 : 0;
+                set_single_selection_state(g.document.entities.empty() ? -1 : 0);
                 g.pending_kind = -1;
                 const bool skybox_loaded = reload_skybox_preview(true);
                 load_document_preview(&g.document, &g.mesh, &why, &g.pickup_models);
@@ -7764,6 +8010,18 @@ bool entity_gizmo_smoke() {
     spawn.value_u32_a = SnipeSpawnTeam_Deathmatch;
     append_camera_spawn_arrow(spawn, .5f, &lines);
     return lines.empty();
+}
+
+bool focused_edit_owns_clipboard_shortcut(const MSG& message) {
+    if (message.message != WM_KEYDOWN || !(GetKeyState(VK_CONTROL) & 0x8000) ||
+        (message.wParam != 'C' && message.wParam != 'V'))
+        return false;
+    const HWND focused = GetFocus();
+    if (!focused || (focused != g.window && !IsChild(g.window, focused)))
+        return false;
+    char class_name[32]{};
+    return GetClassNameA(focused, class_name, static_cast<int>(sizeof(class_name))) > 0 &&
+           _stricmp(class_name, "Edit") == 0;
 }
 
 } // namespace editor
@@ -7938,6 +8196,7 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
     const bool gpu_smoke = (__argc == 3 || __argc == 4) && strcmp(__argv[1], "--gpu-smoke") == 0;
     const bool pc_gpu_smoke = __argc == 3 && strcmp(__argv[1], "--pc-gpu-smoke") == 0;
     const bool pc_editor_ui_smoke = __argc == 3 && strcmp(__argv[1], "--pc-editor-ui-smoke") == 0;
+    const bool selection_smoke = __argc == 2 && strcmp(__argv[1], "--selection-smoke") == 0;
     const bool pc_weather_render_smoke =
         __argc == 3 && strcmp(__argv[1], "--pc-weather-render-smoke") == 0;
     const bool pc_material_render_smoke =
@@ -8167,6 +8426,57 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
                                   CW_USEDEFAULT, CW_USEDEFAULT, 1380, 840, nullptr, nullptr, instance, nullptr);
     if (!window)
         return 1;
+    if (selection_smoke) {
+        g.document = {};
+        Entity first;
+        first.kind = EntityKind::SpawnPoint;
+        first.name = "First spawn";
+        first.position = {1, 2, 3};
+        Entity second = first;
+        second.name = "Second spawn";
+        second.position = {4, 5, 6};
+        Entity light;
+        light.kind = EntityKind::Light;
+        light.name = "Other type";
+        g.document.entities = {first, second, light};
+        set_single_selection_state(0);
+        reset_history(true);
+        refresh_list();
+        refresh_inspector();
+
+        SendMessageA(g.list, LB_SETSEL, FALSE, -1);
+        SendMessageA(g.list, LB_SETSEL, TRUE, entity_list_row(0));
+        SendMessageA(g.list, LB_SETSEL, TRUE, entity_list_row(1));
+        SendMessageA(g.list, LB_SETCARETINDEX, entity_list_row(1), FALSE);
+        SendMessageA(window, WM_COMMAND, MAKEWPARAM(ID_ENTITY_LIST, LBN_SELCHANGE),
+                     reinterpret_cast<LPARAM>(g.list));
+        const bool same_type_selected = g.selected_entities.size() == 2 && entity_is_selected(0) &&
+                                        entity_is_selected(1) && g.selected == 1;
+
+        SendMessageA(g.list, LB_SETSEL, TRUE, entity_list_row(2));
+        SendMessageA(g.list, LB_SETCARETINDEX, entity_list_row(2), FALSE);
+        SendMessageA(window, WM_COMMAND, MAKEWPARAM(ID_ENTITY_LIST, LBN_SELCHANGE),
+                     reinterpret_cast<LPARAM>(g.list));
+        const bool mixed_type_rejected = g.selected_entities.size() == 2 && entity_is_selected(0) &&
+                                         entity_is_selected(1) && !entity_is_selected(2);
+
+        SetWindowTextA(g.pos[0], "42");
+        SendMessageA(window, WM_COMMAND, MAKEWPARAM(ID_POS_X, EN_CHANGE),
+                     reinterpret_cast<LPARAM>(g.pos[0]));
+        apply_inspector();
+        const bool batch_applied = g.document.entities[0].position.x == 42.0f &&
+                                   g.document.entities[1].position.x == 42.0f &&
+                                   g.document.entities[0].position.y == 2.0f &&
+                                   g.document.entities[1].position.y == 5.0f &&
+                                   g.document.entities[0].name == "First spawn" &&
+                                   g.document.entities[1].name == "Second spawn";
+        int restored_selection = g.selected;
+        const bool undo_restored = g.history.undo(&g.document, &restored_selection) &&
+                                   g.document.entities[0].position.x == 1.0f &&
+                                   g.document.entities[1].position.x == 4.0f;
+        DestroyWindow(window);
+        return same_type_selected && mixed_type_rejected && batch_applied && undo_restored ? 0 : 41;
+    }
     if (pc_material_render_smoke) {
         char* mask_end = nullptr;
         const unsigned long requested_mask = strtoul(__argv[3], &mask_end, 0);
@@ -8363,7 +8673,8 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
         bool list_double_click_focus = false;
         if (loaded && g.list && !g.document.entities.empty()) {
             const Camera before = g.camera;
-            SendMessageA(g.list, LB_SETCURSEL, 0, 0);
+            SendMessageA(g.list, LB_SETSEL, TRUE, 0);
+            SendMessageA(g.list, LB_SETCARETINDEX, 0, FALSE);
             const int expected_index =
                 static_cast<int>(SendMessageA(g.list, LB_GETITEMDATA, 0, 0));
             SendMessageA(window, WM_COMMAND, MAKEWPARAM(ID_ENTITY_LIST, LBN_DBLCLK),
@@ -8453,12 +8764,12 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
             german.rotation.y = 180.0f;
             german.value_u32_a = 3;
             g.document.entities.push_back(german);
-            g.selected = 0;
+            set_single_selection_state(0);
         }
         reset_history(false);
         gpu_render();
         if (loaded) {
-            g.selected = 1;
+            set_single_selection_state(1);
             gpu_render();
         }
         bool all_skybox_faces = true;
@@ -8490,7 +8801,7 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
             Document doc;
             if (load_project(&doc, path.c_str(), &why)) {
                 g.document = std::move(doc);
-                g.selected = g.document.entities.empty() ? -1 : 0;
+                set_single_selection_state(g.document.entities.empty() ? -1 : 0);
                 g.pending_kind = -1;
                 const bool skybox_loaded = reload_skybox_preview(true);
                 load_document_preview(&g.document, &g.mesh, &why, &g.pickup_models);
@@ -8514,7 +8825,8 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
         const_cast<LPACCEL>(accelerator_entries), static_cast<int>(_countof(accelerator_entries)));
     MSG message{};
     while (GetMessageA(&message, nullptr, 0, 0) > 0) {
-        if (!accelerators || !TranslateAcceleratorA(window, accelerators, &message)) {
+        if (!accelerators || focused_edit_owns_clipboard_shortcut(message) ||
+            !TranslateAcceleratorA(window, accelerators, &message)) {
             TranslateMessage(&message);
             DispatchMessageA(&message);
         }
