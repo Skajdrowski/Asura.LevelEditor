@@ -1956,7 +1956,9 @@ struct LightGizmoLine {
 };
 
 constexpr int kLightRangeSegments = 48;
-constexpr size_t kMaximumLightGizmoLines = kLightRangeSegments * 3;
+constexpr size_t kLightBoundingBoxLines = 12;
+constexpr size_t kCameraSpawnArrowLines = 5;
+constexpr size_t kMaximumLightGizmoLines = kLightRangeSegments * 3 + kLightBoundingBoxLines;
 constexpr float kMaximumLightGizmoRange = 10000000.0f;
 
 void append_light_gizmo_line(std::vector<LightGizmoLine>* lines, Asura_Vector_3 a, Asura_Vector_3 b) {
@@ -1987,6 +1989,51 @@ void append_range_globe(Asura_Vector_3 center, float range, std::vector<LightGiz
     }
 }
 
+void append_light_bounding_box(const Asura_Bounding_Box& bounds, std::vector<LightGizmoLine>* lines) {
+    const float values[] = {bounds.MinX, bounds.MaxX, bounds.MinY,
+                            bounds.MaxY, bounds.MinZ, bounds.MaxZ};
+    for (float value : values)
+        if (!isfinite(value))
+            return;
+
+    Asura_Vector_3 corners[8]{};
+    for (int corner = 0; corner < 8; ++corner) {
+        corners[corner] = entity_view_position({corner & 1 ? bounds.MaxX : bounds.MinX,
+                                                corner & 2 ? bounds.MaxY : bounds.MinY,
+                                                corner & 4 ? bounds.MaxZ : bounds.MinZ});
+    }
+    for (int corner = 0; corner < 8; ++corner) {
+        for (int axis = 0; axis < 3; ++axis) {
+            const int other = corner ^ (1 << axis);
+            if (corner < other)
+                append_light_gizmo_line(lines, corners[corner], corners[other]);
+        }
+    }
+}
+
+void append_camera_spawn_arrow(const Entity& entity, float marker, std::vector<LightGizmoLine>* lines) {
+    if (entity.kind != EntityKind::SpawnPoint || !(entity.value_u32_a & SnipeSpawnTeam_Camera))
+        return;
+    Asura_Vector_3 direction = normalized(entity_view_direction(entity.spawn_direction));
+    if (dot(direction, direction) <= .00001f)
+        return;
+    const Asura_Vector_3 start = entity_view_position(entity.position);
+    const float length = fmaxf(1.0f, marker * 4.0f);
+    const float head_length = length * .28f;
+    const float head_width = length * .18f;
+    const Asura_Vector_3 tip = add(start, mul(direction, length));
+    const Asura_Vector_3 head_center = sub(tip, mul(direction, head_length));
+    Asura_Vector_3 side = normalized(cross(direction, {0, 1, 0}));
+    if (dot(side, side) <= .00001f)
+        side = {1, 0, 0};
+    const Asura_Vector_3 vertical = normalized(cross(direction, side));
+    append_light_gizmo_line(lines, start, tip);
+    append_light_gizmo_line(lines, tip, add(head_center, mul(side, head_width)));
+    append_light_gizmo_line(lines, tip, sub(head_center, mul(side, head_width)));
+    append_light_gizmo_line(lines, tip, add(head_center, mul(vertical, head_width)));
+    append_light_gizmo_line(lines, tip, sub(head_center, mul(vertical, head_width)));
+}
+
 void append_sound_gizmo(const Entity& entity, std::vector<LightGizmoLine>* lines) {
     if (entity.kind != EntityKind::Sound)
         return;
@@ -2002,6 +2049,8 @@ void append_light_gizmo(const Entity& entity, std::vector<LightGizmoLine>* lines
     const float range = fabsf(entity.light.Range);
     if (isfinite(range) && range > .00001f && range <= kMaximumLightGizmoRange)
         append_range_globe(center, range, lines);
+    if (entity.light.m_uFlags & ASURA_LIGHT_FLAG_USE_BOUNDING_BOX)
+        append_light_bounding_box(entity.light.m_xBoundingBox, lines);
 }
 
 RECT viewport_rect() {
@@ -4278,7 +4327,8 @@ void gpu_render() {
         else if (kind == EntityKind::Sound)
             gizmo_line_capacity = kLightRangeSegments * 3;
     }
-    overlay.reserve((lines * 2 + 1) * 4 + g.document.entities.size() * 6 +
+    overlay.reserve((lines * 2 + 1) * 4 +
+                    g.document.entities.size() * (6 + kCameraSpawnArrowLines * 2) +
                     gizmo_line_capacity * 2);
     for (int i = -lines; i <= lines; ++i) {
         const auto color = i == 0 ? major : minor;
@@ -4314,6 +4364,15 @@ void gpu_render() {
             color = {.75f, .35f, 1, 1};
         if (selected)
             color = {1, 1, 1, 1};
+        if (entity.kind == EntityKind::SpawnPoint &&
+            (entity.value_u32_a & SnipeSpawnTeam_Camera)) {
+            entity_gizmo.clear();
+            append_camera_spawn_arrow(entity, selected ? marker * 1.6f : marker, &entity_gizmo);
+            for (const LightGizmoLine& line : entity_gizmo) {
+                overlay.push_back(gpu_line_vertex(line.a, color));
+                overlay.push_back(gpu_line_vertex(line.b, color));
+            }
+        }
         if (selected && (entity.kind == EntityKind::Light || entity.kind == EntityKind::Sound)) {
             entity_gizmo.clear();
             if (entity.kind == EntityKind::Light)
@@ -5058,6 +5117,17 @@ struct LightPropertiesState {
     bool accepted = false;
 };
 
+void update_light_flag_dependent_controls(LightPropertiesState* state, uint32_t flags) {
+    const BOOL shadow_volume = (flags & ASURA_LIGHT_FLAG_IS_SHADOW_VOLUME) != 0;
+    const BOOL use_bounding_box = (flags & ASURA_LIGHT_FLAG_USE_BOUNDING_BOX) != 0;
+    for (HWND field : state->colour)
+        EnableWindow(field, !shadow_volume);
+    EnableWindow(state->brightness, !shadow_volume);
+    EnableWindow(state->shadow_strength, shadow_volume);
+    for (HWND field : state->bounds)
+        EnableWindow(field, use_bounding_box);
+}
+
 HWND make_light_control(LightPropertiesState* state, const char* cls, const char* text, DWORD style, int id,
                         int x, int y, int width, int height) {
     HWND control = CreateWindowExA(0, cls, text, WS_CHILD | WS_VISIBLE | style, x, y, width, height,
@@ -5148,6 +5218,7 @@ void create_light_properties_controls(LightPropertiesState* state) {
                      light.m_uFlags & kLightFlagControls[i].mask ? BST_CHECKED : BST_UNCHECKED, 0);
     set_float(state->old_range, light.OldRange);
     SendMessageA(state->has_changed, BM_SETCHECK, light.HasChanged ? BST_CHECKED : BST_UNCHECKED, 0);
+    update_light_flag_dependent_controls(state, light.m_uFlags);
 }
 
 void apply_light_properties(LightPropertiesState* state) {
@@ -5200,6 +5271,7 @@ LRESULT CALLBACK light_properties_proc(HWND hwnd, UINT message, WPARAM wparam, L
             for (int i = 0; i < static_cast<int>(_countof(kLightFlagControls)); ++i)
                 SendMessageA(state->flag_checks[i], BM_SETCHECK,
                              flags & kLightFlagControls[i].mask ? BST_CHECKED : BST_UNCHECKED, 0);
+            update_light_flag_dependent_controls(state, flags);
         } else if (LOWORD(wparam) >= ID_LIGHT_FLAG_FIRST && LOWORD(wparam) <= ID_LIGHT_FLAG_LAST &&
                    HIWORD(wparam) == BN_CLICKED) {
             uint32_t flags = get_u32(state->flags, state->value.m_uFlags);
@@ -5209,6 +5281,7 @@ LRESULT CALLBACK light_properties_proc(HWND hwnd, UINT message, WPARAM wparam, L
             else
                 flags &= ~kLightFlagControls[index].mask;
             set_u32_hex(state->flags, flags);
+            update_light_flag_dependent_controls(state, flags);
         } else if (LOWORD(wparam) == IDOK) {
             apply_light_properties(state);
             state->accepted = true;
@@ -5460,9 +5533,10 @@ void refresh_inspector() {
                          e.value_u32_b & kSpawnGameModeControls[i].mask ? BST_CHECKED : BST_UNCHECKED, 0);
         }
     } else if (e.kind == EntityKind::Light) {
-        set_control_text(g.value_label[0], "Brightness");
+        const bool shadow_volume = (e.light.m_uFlags & ASURA_LIGHT_FLAG_IS_SHADOW_VOLUME) != 0;
+        set_control_text(g.value_label[0], shadow_volume ? "Shadow strength" : "Brightness");
         set_control_text(g.value_label[1], "Range");
-        set_float(g.value[0], e.light.Brightness);
+        set_float(g.value[0], shadow_volume ? e.light.ShadowStrength : e.light.Brightness);
         set_float(g.value[1], e.light.Range);
         ShowWindow(g.light_properties, SW_SHOW);
     } else if (e.kind == EntityKind::Sound) {
@@ -5580,9 +5654,12 @@ void apply_inspector() {
         const float pitch = e.rotation.x * 3.14159265358979323846f / 180.0f;
         e.spawn_direction = {cosf(pitch) * sinf(yaw), sinf(pitch), cosf(pitch) * cosf(yaw)};
     } else if (e.kind == EntityKind::Light) {
-        e.value_a = get_float(g.value[0], e.light.Brightness);
+        if (e.light.m_uFlags & ASURA_LIGHT_FLAG_IS_SHADOW_VOLUME)
+            e.light.ShadowStrength = get_float(g.value[0], e.light.ShadowStrength);
+        else
+            e.light.Brightness = get_float(g.value[0], e.light.Brightness);
         e.value_b = get_float(g.value[1], e.light.Range);
-        e.light.Brightness = e.value_a;
+        e.value_a = e.light.Brightness;
         e.light.Range = e.value_b;
     } else if (e.kind == EntityKind::Sound) {
         e.value_a = get_float(g.value[0], e.value_a);
@@ -6011,34 +6088,10 @@ void draw_environment(HDC dc) {
     FrameRect(dc, &vr, static_cast<HBRUSH>(GetStockObject(GRAY_BRUSH)));
 }
 
-void draw_light_gizmo(HDC dc, const Entity& entity, bool selected) {
-    const float marker = fmaxf(.35f, g.mesh.radius * .008f);
-    std::vector<LightGizmoLine> lines;
-    lines.reserve(kMaximumLightGizmoLines);
-    append_light_gizmo(entity, &lines);
+void draw_gizmo_lines(HDC dc, const std::vector<LightGizmoLine>& lines, int width, COLORREF color) {
     if (lines.empty())
         return;
-    HPEN range_pen = CreatePen(PS_SOLID, selected ? 2 : 1,
-                               selected ? RGB(255, 235, 90) : RGB(148, 120, 24));
-    HGDIOBJ old_pen = SelectObject(dc, range_pen);
-    for (const LightGizmoLine& line : lines) {
-        POINT a{}, b{};
-        if (project_point(line.a, &a) && project_point(line.b, &b)) {
-            MoveToEx(dc, a.x, a.y, nullptr);
-            LineTo(dc, b.x, b.y);
-        }
-    }
-    SelectObject(dc, old_pen);
-    DeleteObject(range_pen);
-}
-
-void draw_sound_gizmo(HDC dc, const Entity& entity) {
-    std::vector<LightGizmoLine> lines;
-    lines.reserve(kLightRangeSegments * 3);
-    append_sound_gizmo(entity, &lines);
-    if (lines.empty())
-        return;
-    HPEN pen = CreatePen(PS_SOLID, 2, RGB(65, 205, 255));
+    HPEN pen = CreatePen(PS_SOLID, width, color);
     HGDIOBJ old_pen = SelectObject(dc, pen);
     for (const LightGizmoLine& line : lines) {
         POINT a{}, b{};
@@ -6049,6 +6102,21 @@ void draw_sound_gizmo(HDC dc, const Entity& entity) {
     }
     SelectObject(dc, old_pen);
     DeleteObject(pen);
+}
+
+void draw_light_gizmo(HDC dc, const Entity& entity, bool selected) {
+    std::vector<LightGizmoLine> lines;
+    lines.reserve(kMaximumLightGizmoLines);
+    append_light_gizmo(entity, &lines);
+    draw_gizmo_lines(dc, lines, selected ? 2 : 1,
+                     selected ? RGB(255, 235, 90) : RGB(148, 120, 24));
+}
+
+void draw_sound_gizmo(HDC dc, const Entity& entity) {
+    std::vector<LightGizmoLine> lines;
+    lines.reserve(kLightRangeSegments * 3);
+    append_sound_gizmo(entity, &lines);
+    draw_gizmo_lines(dc, lines, 2, RGB(65, 205, 255));
 }
 
 bool draw_spawn_puppet(HDC dc, const Entity& entity, bool selected) {
@@ -6096,17 +6164,25 @@ void draw_entities(HDC dc) {
         POINT p{};
         if (!project_point(entity_view_position(e.position), &p))
             continue;
+        const COLORREF color = entity_color(e.kind);
         if (e.kind == EntityKind::Light && i == g.selected)
             draw_light_gizmo(dc, e, true);
         else if (e.kind == EntityKind::Sound && i == g.selected)
             draw_sound_gizmo(dc, e);
+        if (e.kind == EntityKind::SpawnPoint && (e.value_u32_a & SnipeSpawnTeam_Camera)) {
+            std::vector<LightGizmoLine> lines;
+            lines.reserve(kCameraSpawnArrowLines);
+            const float marker = fmaxf(.35f, g.mesh.radius * .008f) * (i == g.selected ? 1.6f : 1.0f);
+            append_camera_spawn_arrow(e, marker, &lines);
+            draw_gizmo_lines(dc, lines, i == g.selected ? 2 : 1,
+                             i == g.selected ? RGB(255, 255, 255) : color);
+        }
         if ((e.kind == EntityKind::SpawnPoint || e.kind == EntityKind::PhysicalObject) &&
             draw_spawn_puppet(dc, e, i == g.selected)) {
             if (i == g.selected)
                 TextOutA(dc, p.x + 10, p.y - 8, e.name.c_str(), static_cast<int>(e.name.size()));
             continue;
         }
-        const COLORREF color = entity_color(e.kind);
         HBRUSH brush = CreateSolidBrush(color);
         HPEN pen = CreatePen(PS_SOLID, i == g.selected ? 3 : 1, i == g.selected ? RGB(255, 255, 255) : color);
         HGDIOBJ ob = SelectObject(dc, brush), op = SelectObject(dc, pen);
@@ -6202,6 +6278,7 @@ void layout_controls() {
     MoveWindow(hint, 8, y, 220, 75, TRUE);
 
     const int label_x = right, edit_x = right + 88, ew = 164;
+    const int property_edit_x = right + 116, property_ew = 136;
     int iy = 52;
     MoveWindow(GetDlgItem(g.window, 910), label_x, iy + 3, 84, 22, TRUE);
     MoveWindow(g.name, edit_x, iy, ew, 24, TRUE);
@@ -6212,12 +6289,12 @@ void layout_controls() {
         MoveWindow(GetDlgItem(g.window, labels[i]), label_x, iy + 3, 84, 22, TRUE);
         MoveWindow(edits[i], edit_x, iy, ew, 24, TRUE);
     }
-    MoveWindow(g.value_label[0], label_x, iy + 3, 84, 22, TRUE);
-    MoveWindow(g.value[0], edit_x, iy, ew, 24, TRUE);
-    MoveWindow(g.pickup_item, edit_x, iy, ew, 240, TRUE);
+    MoveWindow(g.value_label[0], label_x, iy + 3, 112, 22, TRUE);
+    MoveWindow(g.value[0], property_edit_x, iy, property_ew, 24, TRUE);
+    MoveWindow(g.pickup_item, property_edit_x, iy, property_ew, 240, TRUE);
     iy += 30;
-    MoveWindow(g.value_label[1], label_x, iy + 3, 84, 22, TRUE);
-    MoveWindow(g.value[1], edit_x, iy, ew, 24, TRUE);
+    MoveWindow(g.value_label[1], label_x, iy + 3, 112, 22, TRUE);
+    MoveWindow(g.value[1], property_edit_x, iy, property_ew, 24, TRUE);
     iy += 34;
     MoveWindow(g.sound_browse, edit_x, iy, 80, 26, TRUE);
     MoveWindow(g.sound_preview, edit_x + 84, iy, 80, 26, TRUE);
@@ -7657,10 +7734,44 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
     return DefWindowProcA(hwnd, message, wparam, lparam);
 }
 
+bool entity_gizmo_smoke() {
+    Entity light;
+    light.kind = EntityKind::Light;
+    light.light.Range = 0.0f;
+    light.light.m_uFlags = ASURA_LIGHT_FLAG_USE_BOUNDING_BOX;
+    light.light.m_xBoundingBox = {-1, 2, -3, 4, -5, 6};
+    std::vector<LightGizmoLine> lines;
+    append_light_gizmo(light, &lines);
+    if (lines.size() != kLightBoundingBoxLines)
+        return false;
+    light.light.m_uFlags = 0;
+    lines.clear();
+    append_light_gizmo(light, &lines);
+    if (!lines.empty())
+        return false;
+
+    Entity spawn;
+    spawn.kind = EntityKind::SpawnPoint;
+    spawn.position = {1, 2, 3};
+    spawn.spawn_direction = {0, 1, 0};
+    spawn.value_u32_a = SnipeSpawnTeam_Camera;
+    append_camera_spawn_arrow(spawn, .5f, &lines);
+    if (lines.size() != kCameraSpawnArrowLines ||
+        !nearly_equal(lines[0].a, Asura_Vector_3{1, -2, 3}) ||
+        !nearly_equal(lines[0].b, Asura_Vector_3{1, -4, 3}))
+        return false;
+    lines.clear();
+    spawn.value_u32_a = SnipeSpawnTeam_Deathmatch;
+    append_camera_spawn_arrow(spawn, .5f, &lines);
+    return lines.empty();
+}
+
 } // namespace editor
 
 int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show) {
     using namespace editor;
+    if (__argc == 2 && strcmp(__argv[1], "--entity-gizmo-smoke") == 0)
+        return entity_gizmo_smoke() ? 0 : 40;
     if (__argc == 2 && strcmp(__argv[1], "--spawn-puppet-smoke") == 0) {
         if (!load_spawn_puppets())
             return 4;
