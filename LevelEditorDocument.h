@@ -107,6 +107,12 @@ struct Document {
     SkyboxSettings skybox;
     bool rain_enabled = false;
     bool weather_source_record = false;
+    // Target path consumed by the independent SBSN streaming ambience system,
+    // for example "Sounds\\Streams\\m1_karl1.wav".  An empty path disables
+    // the default stream while retaining any imported regional sound records.
+    std::string ambient_stream_path;
+    float ambient_volume = 1.0f;
+    bool ambient_source_record = false;
     // True only when every source physical-object ENTI was imported. This
     // makes absence from entities an intentional deletion during export.
     bool source_pickup_inventory_complete = false;

@@ -12,7 +12,7 @@ namespace editor {
 namespace {
 
 constexpr char kProjectMagic[8] = {'A', 'L', 'E', 'V', '2', '0', '0', '5'};
-constexpr uint32_t kProjectVersion = 11;
+constexpr uint32_t kProjectVersion = 12;
 
 struct BinaryWriter {
     std::vector<uint8_t> bytes;
@@ -261,6 +261,9 @@ bool save_project(const Document& document, const char* path, std::string* why) 
     writer.u32(document.skybox.chunk_version);
     writer.u32(document.rain_enabled ? 1u : 0u);
     writer.u32(document.weather_source_record ? 1u : 0u);
+    writer.str(document.ambient_stream_path);
+    writer.f32(document.ambient_volume);
+    writer.u32(document.ambient_source_record ? 1u : 0u);
     writer.u32(static_cast<uint32_t>(document.entities.size()));
     for (const Entity& entity : document.entities) {
         writer.u32(static_cast<uint32_t>(entity.kind));
@@ -406,6 +409,16 @@ bool load_project(Document* document, const char* path, std::string* why) {
                 next.weather_source_record = reader.u32() != 0;
                 if (next.skybox.chunk_version < 6 || next.skybox.chunk_version > 7)
                     reader.ok = false;
+                if (project_version >= 12) {
+                    next.ambient_stream_path = reader.str();
+                    next.ambient_volume = reader.f32();
+                    next.ambient_source_record = reader.u32() != 0;
+                    if (next.ambient_stream_path.size() > 4096 ||
+                        next.ambient_stream_path.find('\0') != std::string::npos ||
+                        !std::isfinite(next.ambient_volume) || next.ambient_volume < 0.0f ||
+                        next.ambient_volume > 1.0f)
+                        reader.ok = false;
+                }
             }
         }
     }

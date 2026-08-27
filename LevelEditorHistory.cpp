@@ -116,6 +116,9 @@ bool equal_document_content(const Document& a, const Document& b) {
            a.light_header_flag == b.light_header_flag && equal(a.skybox, b.skybox) &&
            a.rain_enabled == b.rain_enabled &&
            a.weather_source_record == b.weather_source_record &&
+           a.ambient_stream_path == b.ambient_stream_path &&
+           equal(a.ambient_volume, b.ambient_volume) &&
+           a.ambient_source_record == b.ambient_source_record &&
            a.source_pickup_inventory_complete == b.source_pickup_inventory_complete;
 }
 

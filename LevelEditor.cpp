@@ -1032,6 +1032,9 @@ void import_pc_skybox_settings(const PcSkyboxInfo& info, SkyboxSettings* skybox)
     skybox->source_record = true;
 }
 
+bool source_ambience_info(const ChunkRef& chunk, std::string* path, float* volume,
+                          uint32_t* tail_offset, Error* err);
+
 bool load_pc_level(const std::string& path, Document* document, Mesh* mesh, std::string* why,
                    std::vector<PickupModel>* pickup_models = nullptr) {
     Error err{};
@@ -1055,6 +1058,17 @@ bool load_pc_level(const std::string& path, Document* document, Mesh* mesh, std:
             chunk.version <= 6 && chunk.size > 21) {
             next_document.weather_source_record = true;
             next_document.rain_enabled = chunk.data[21] != 0;
+        } else if (chunk.cid == ASURA_CHUNK_STREAMINGBACKGROUNDSOUND &&
+                   !next_document.ambient_source_record) {
+            std::string stream_path;
+            float volume = 1.0f;
+            if (!source_ambience_info(chunk, &stream_path, &volume, nullptr, &err)) {
+                ok = false;
+            } else {
+                next_document.ambient_source_record = true;
+                next_document.ambient_stream_path = std::move(stream_path);
+                next_document.ambient_volume = volume;
+            }
         }
     }
     RscfInfo environment{};
@@ -1134,19 +1148,123 @@ bool append_editor_weather(Buffer* out, const Document& document, Error* err) {
     const uint64_t start = out->size;
     if (!append_wthr(out, err))
         return false;
-    const uint8_t enabled = document.rain_enabled ? 1u : 0u;
-    return buffer_patch(out, start + 21, &enabled, sizeof(enabled), err);
+    const uint8_t enabled[2]{document.rain_enabled ? 1u : 0u,
+                             document.rain_enabled ? 1u : 0u};
+    return buffer_patch(out, start + 21, enabled, sizeof(enabled), err);
 }
 
 bool append_editor_weather_copy(Buffer* out, const ChunkRef& chunk, const Document& document,
                                 Error* err) {
-    if (chunk.size <= 21)
-        return fail(err, "the source WTHR rain flag is truncated");
+    if (chunk.size <= 22)
+        return fail(err, "the source WTHR rain state is truncated");
     const uint64_t start = out->size;
     if (!append_chunk_copy(out, chunk, err))
         return false;
-    const uint8_t enabled = document.rain_enabled ? 1u : 0u;
-    return buffer_patch(out, start + 21, &enabled, sizeof(enabled), err);
+    // SniperElite.exe's WTHR v5/v6 reader loads the adjacent bytes at +21 and
+    // +22 into the two runtime rain gates. Retail rainy levels set both and
+    // retail dry levels clear both. The byte at +20 is a separate legacy
+    // weather flag (it is set in some dry levels), so preserve it verbatim.
+    const uint8_t enabled[2]{document.rain_enabled ? 1u : 0u,
+                             document.rain_enabled ? 1u : 0u};
+    return buffer_patch(out, start + 21, enabled, sizeof(enabled), err);
+}
+
+// AEPR v0 stores the extended rain system's two runtime enable bits in the
+// low bits of the dword at chunk +0x1c. Retail rainy levels set both bits,
+// while dry levels clear both. WTHR controls wet-material response, but an
+// imported level's preserved AEPR overrides whether its rain particles run.
+constexpr uint32_t kExtendedRainFlagsOffset = 0x1cu;
+constexpr uint32_t kExtendedRainEnabledMask = 0x3u;
+constexpr uint32_t kStreamingBackgroundSoundDefaultVolumeOffset = 0x18u;
+constexpr uint32_t kStreamingBackgroundSoundDefaultPathOffset = 0x1cu;
+
+bool append_editor_extended_rain_copy(Buffer* out, const ChunkRef& chunk,
+                                      const Document& document, Error* err) {
+    if (chunk.version != 0 || chunk.size < kExtendedRainFlagsOffset + sizeof(uint32_t))
+        return fail(err, "the source AEPR rain flags are truncated or unsupported");
+    const uint64_t start = out->size;
+    if (!append_chunk_copy(out, chunk, err))
+        return false;
+    uint32_t flags = read_u32(chunk.data + kExtendedRainFlagsOffset);
+    flags = (flags & ~kExtendedRainEnabledMask) |
+            (document.rain_enabled ? kExtendedRainEnabledMask : 0u);
+    return buffer_patch(out, start + kExtendedRainFlagsOffset, &flags, sizeof(flags), err);
+}
+
+bool source_ambience_info(const ChunkRef& chunk, std::string* path, float* volume,
+                          uint32_t* tail_offset, Error* err) {
+    if (chunk.cid != ASURA_CHUNK_STREAMINGBACKGROUNDSOUND || chunk.version > 1 ||
+        chunk.size <= kStreamingBackgroundSoundDefaultPathOffset)
+        return fail(err, "the source SBSN default sound is truncated or unsupported");
+    const Str source_path = padded_string_at(chunk.data, chunk.size,
+                                             kStreamingBackgroundSoundDefaultPathOffset);
+    if (!source_path.data)
+        return fail(err, "the source SBSN default sound path is truncated");
+    const uint64_t tail = align_up(
+        static_cast<uint64_t>(kStreamingBackgroundSoundDefaultPathOffset) + source_path.size + 1, 4);
+    if (tail > chunk.size)
+        return fail(err, "the source SBSN default sound path is invalid");
+    path->assign(source_path.data, source_path.size);
+    memcpy(volume, chunk.data + kStreamingBackgroundSoundDefaultVolumeOffset, sizeof(*volume));
+    if (tail_offset)
+        *tail_offset = static_cast<uint32_t>(tail);
+    return true;
+}
+
+bool valid_ambience_settings(const Document& document, Error* err) {
+    if (document.ambient_stream_path.size() > 4096 ||
+        document.ambient_stream_path.find('\0') != std::string::npos)
+        return fail(err, "the ambience stream path must contain at most 4096 non-NUL bytes");
+    if (!isfinite(document.ambient_volume) || document.ambient_volume < 0.0f ||
+        document.ambient_volume > 1.0f)
+        return fail(err, "the ambience volume must be between 0 and 1");
+    return true;
+}
+
+bool append_editor_ambience(Buffer* out, const Document& document, Error* err) {
+    if (!valid_ambience_settings(document, err))
+        return false;
+    ChunkMark chunk = begin_chunk(out, ASURA_CHUNK_STREAMINGBACKGROUNDSOUND, 1, 0, err);
+    append_u32(out, 0, err); // regional sound count
+    append_u32(out, 0, err); // SBSN flags (unused by the 2005 target reader)
+    append_f32(out, document.ambient_volume, err);
+    if (!append_padded_cstr(out,
+                            {document.ambient_stream_path.data(),
+                             static_cast<uint32_t>(document.ambient_stream_path.size())},
+                            err))
+        return false;
+    return end_chunk(out, chunk, err);
+}
+
+bool append_editor_ambience_copy(Buffer* out, const ChunkRef& chunk,
+                                 const Document& document, Error* err) {
+    if (!valid_ambience_settings(document, err))
+        return false;
+    std::string source_path;
+    float source_volume = 0.0f;
+    uint32_t tail_offset = 0;
+    if (!source_ambience_info(chunk, &source_path, &source_volume, &tail_offset, err))
+        return false;
+    if (source_path == document.ambient_stream_path &&
+        memcmp(&source_volume, &document.ambient_volume, sizeof(source_volume)) == 0)
+        return append_chunk_copy(out, chunk, err);
+
+    const uint64_t start = out->size;
+    if (buffer_append(out, chunk.data, kStreamingBackgroundSoundDefaultPathOffset, err) == ~0ull ||
+        !append_padded_cstr(out,
+                            {document.ambient_stream_path.data(),
+                             static_cast<uint32_t>(document.ambient_stream_path.size())},
+                            err) ||
+        buffer_append(out, chunk.data + tail_offset, chunk.size - tail_offset, err) == ~0ull)
+        return false;
+    const uint64_t rebuilt_size = out->size - start;
+    if (rebuilt_size > UINT32_MAX)
+        return fail(err, "the edited SBSN chunk is too large");
+    const uint32_t rebuilt_size_32 = static_cast<uint32_t>(rebuilt_size);
+    return buffer_patch(out, start + offsetof(Asura_Chunk_Header, Size), &rebuilt_size_32,
+                        sizeof(rebuilt_size_32), err) &&
+           buffer_patch(out, start + kStreamingBackgroundSoundDefaultVolumeOffset,
+                        &document.ambient_volume, sizeof(document.ambient_volume), err);
 }
 
 bool append_editor_spawnpoints(Buffer* out, const Document& doc, Error* err) {
@@ -1563,11 +1681,14 @@ bool pack_pc_document(const Document& doc, const char* output_path, std::string*
              buffer_append(&output, kAsuraMagic, sizeof(kAsuraMagic), &err) != ~0ull;
 
     bool source_has_lights = false, source_has_phonons = false, source_has_editable_entities = false;
+    bool source_has_ambience = false;
     if (ok) {
         for (uint32_t i = 0; i < source.count; ++i) {
             source_has_lights |= source.chunks[i].cid == ASURA_CHUNK_LIGHTS;
             source_has_phonons |= source.chunks[i].cid == ASURA_CHUNK_PHONONS;
             source_has_editable_entities |= editable_pc_entity_chunk(source.chunks[i]);
+            source_has_ambience |=
+                source.chunks[i].cid == ASURA_CHUNK_STREAMINGBACKGROUNDSOUND;
         }
     }
     bool wrote_lights = false, wrote_phonons = false, wrote_entities = false, wrote_sound_resources = false;
@@ -1613,6 +1734,16 @@ bool pack_pc_document(const Document& doc, const char* output_path, std::string*
             ok = append_editor_weather_copy(&output, chunk, doc, &err);
             continue;
         }
+        if (chunk.cid == ASURA_CHUNK_EXTENDED_PARTICLE_RAIN_SYSTEM && doc.weather_source_record &&
+            chunk.version == 0 && chunk.size >= kExtendedRainFlagsOffset + sizeof(uint32_t)) {
+            ok = append_editor_extended_rain_copy(&output, chunk, doc, &err);
+            continue;
+        }
+        if (chunk.cid == ASURA_CHUNK_STREAMINGBACKGROUNDSOUND &&
+            doc.ambient_source_record) {
+            ok = append_editor_ambience_copy(&output, chunk, doc, &err);
+            continue;
+        }
         if (chunk.cid == ASURA_CHUNK_RESOURCEFILE) {
             RscfInfo resource{};
             if (rscf_info(chunk, &resource) && replaced_pc_sound_resource(doc, resource))
@@ -1647,6 +1778,8 @@ bool pack_pc_document(const Document& doc, const char* output_path, std::string*
         write_lights();
         write_phonons();
         write_entities();
+        if (!source_has_ambience && !doc.ambient_stream_path.empty())
+            ok = append_editor_ambience(&output, doc, &err);
         ok = ok && buffer_append(&output, nullptr, sizeof(Asura_Chunk_Header), &err) != ~0ull;
     }
 
@@ -1735,7 +1868,9 @@ bool pack_document(Document& doc, const char* output_path, std::string* why) {
              append_rscf(&output, str_from_c(cfg.env_name), ASURA_RESOURCEFILE_TYPE_PLATFORMSPECIFIC,
                          ASURA_RESOURCEFILE_TYPE_PC_ENVIRONMENT, env_payload.base,
                          static_cast<uint32_t>(env_payload.size), &err) &&
-             append_sound_resources(&output, sounds, &scratch, &err) && append_editor_lights(&output, doc, &err) &&
+             append_sound_resources(&output, sounds, &scratch, &err) &&
+             (doc.ambient_stream_path.empty() || append_editor_ambience(&output, doc, &err)) &&
+             append_editor_lights(&output, doc, &err) &&
              append_phon(&output, sounds, &err) &&
              append_emod(&output, view, view.module_count, cfg, material_map, &scratch, metrics, &err) &&
              append_mlin(&output, metrics, view.module_count, &err) &&
@@ -1774,6 +1909,7 @@ enum ControlId : int {
     ID_WEAPONS_DONOR,
     ID_SKYBOX_TEXTURES,
     ID_TOGGLE_RAIN,
+    ID_AMBIENCE_PROPERTIES,
     ID_ENTITY_LIST,
     ID_ADD_SPAWN,
     ID_ADD_LIGHT,
@@ -1838,6 +1974,7 @@ struct AppState {
     HWND value_label[2]{};
     HWND pickup_item = nullptr;
     HWND rain_toggle = nullptr;
+    HWND ambience_properties = nullptr;
     HWND sound_browse = nullptr;
     HWND sound_loop = nullptr;
     HWND sound_preview = nullptr;
@@ -2386,6 +2523,7 @@ struct GpuRenderer {
     bool alpha_tested_prelight_drawn = false;
     bool solid_cutout_prelight_drawn = false;
     bool composited_alpha_prelight_drawn = false;
+    bool wet_splash_drawn = false;
     bool rain_frame_drawn = false;
     bool skybox_active = false;
     bool ready = false;
@@ -3017,6 +3155,22 @@ bool gpu_reload_environment_textures(std::string* why = nullptr, uint32_t* loade
     std::string last_texture_error;
     if (ok)
         gpu_apply_material_map_colors(materials);
+    if (ok && g.document.rain_enabled) {
+        const bool needs_splash = std::any_of(
+            gpu.material_ranges.begin(), gpu.material_ranges.end(),
+            [](const GpuMaterialRange& range) {
+                return (range.material_flags & 0x4000u) != 0;
+            });
+        if (needs_splash) {
+            const std::string& level_path = g.document.obj_path.empty()
+                                                ? g.document.source_pc_path
+                                                : g.document.obj_path;
+            std::string splash_error;
+            if (!gpu_load_global_texture("SpecialFX\\splash.dds", level_path,
+                                         &gpu.environment_splash, &splash_error))
+                last_texture_error = std::move(splash_error);
+        }
+    }
     if (ok && use_external_textures) {
         texture_files_ready = list_files(g.document.texture_dir.c_str(), &arena, &files, &err);
         if (!texture_files_ready)
@@ -4164,6 +4318,7 @@ void gpu_render() {
     gpu.alpha_tested_prelight_drawn = false;
     gpu.solid_cutout_prelight_drawn = false;
     gpu.composited_alpha_prelight_drawn = false;
+    gpu.wet_splash_drawn = false;
     RECT rect{};
     GetClientRect(g.viewport, &rect);
     const uint32_t width = std::max<LONG>(1, rect.right), height = std::max<LONG>(1, rect.bottom);
@@ -4322,6 +4477,7 @@ void gpu_render() {
             gpu.context->UpdateSubresource(gpu.environment_material_buffer, 0, nullptr, &material_constants, 0, 0);
             gpu.context->PSSetShaderResources(2, 1, &range.texture);
             gpu.context->DrawIndexed(range.index_count, range.start_index, 0);
+            gpu.wet_splash_drawn |= wet_splash;
 
             if ((range.material_flags & 0x1u) != 0) {
                 // sub_48DD7D: flag 0x1 replays combiner 8 with blend mode 5
@@ -5614,6 +5770,9 @@ void refresh_inspector() {
         EnableWindow(g.rain_toggle,
                      !g.document.source_pc_path.empty() || !g.document.obj_path.empty());
     }
+    if (g.ambience_properties)
+        EnableWindow(g.ambience_properties,
+                     !g.document.source_pc_path.empty() || !g.document.obj_path.empty());
     HWND fields[] = {g.name, g.pos[0], g.pos[1], g.pos[2], g.rot[0], g.rot[1], g.rot[2], g.value[0], g.value[1]};
     for (HWND h : fields)
         EnableWindow(h, enabled);
@@ -6489,11 +6648,12 @@ void layout_controls() {
                                             {ID_OPEN_PROJECT, 184, 84},    {ID_SAVE_PROJECT, 272, 84},
                                             {ID_EXPORT_PC, 360, 90},       {ID_MATERIAL_MAP, 454, 140},
                                             {ID_EXPORT_MATERIAL_MAP, 598, 126}, {ID_TEXTURE_DIR, 728, 100},
-                                            {ID_WEAPONS_DONOR, 832, 112},  {ID_SKYBOX_TEXTURES, 948, 116},
-                                            {ID_TOGGLE_RAIN, 1068, 74}
+                                            {ID_WEAPONS_DONOR, 832, 112},  {ID_SKYBOX_TEXTURES, 948, 108},
+                                            {ID_TOGGLE_RAIN, 1060, 54}
     };
     for (auto c : top)
         MoveWindow(GetDlgItem(g.window, c.id), c.x, top_y, c.w, 28, TRUE);
+    MoveWindow(g.ambience_properties, right, top_y, 252, 28, TRUE);
     MoveWindow(g.list, 8, 48, 220, std::max(80, static_cast<int>(r.bottom) - 301), TRUE);
     int y = std::max(140, static_cast<int>(r.bottom) - 245);
     const int bw = 106;
@@ -6572,6 +6732,7 @@ void create_controls() {
     make_control("BUTTON", "Weapons donor", BS_PUSHBUTTON, ID_WEAPONS_DONOR);
     make_control("BUTTON", "Skybox properties", BS_PUSHBUTTON, ID_SKYBOX_TEXTURES);
     g.rain_toggle = make_control("BUTTON", "Rain", BS_AUTOCHECKBOX, ID_TOGGLE_RAIN);
+    g.ambience_properties = make_control("BUTTON", "Ambience sound", BS_PUSHBUTTON, ID_AMBIENCE_PROPERTIES);
     g.list = make_control("LISTBOX", "", LBS_NOTIFY | LBS_EXTENDEDSEL | WS_VSCROLL | WS_BORDER,
                           ID_ENTITY_LIST);
     make_control("BUTTON", "+ Spawn", BS_PUSHBUTTON, ID_ADD_SPAWN);
@@ -6702,6 +6863,11 @@ bool load_document_preview(Document* document, Mesh* mesh, std::string* why,
             document->weather_source_record = true;
             document->rain_enabled = imported.rain_enabled;
         }
+        if (!document->ambient_source_record && imported.ambient_source_record) {
+            document->ambient_source_record = true;
+            document->ambient_stream_path = imported.ambient_stream_path;
+            document->ambient_volume = imported.ambient_volume;
+        }
         enrich_project_pickup_templates(document, imported);
         return true;
     }
@@ -6809,26 +6975,39 @@ bool same_skybox_settings(const SkyboxSettings& a, const SkyboxSettings& b) {
            a.source_record == b.source_record;
 }
 
-bool all_pc_weather_records_match(const char* path, bool rain_enabled) {
+bool same_ambience_settings(const Document& a, const Document& b) {
+    return a.ambient_stream_path == b.ambient_stream_path &&
+           memcmp(&a.ambient_volume, &b.ambient_volume, sizeof(a.ambient_volume)) == 0 &&
+           a.ambient_source_record == b.ambient_source_record;
+}
+
+bool all_pc_rain_records_match(const char* path, bool rain_enabled) {
     Error err{};
     Arena arena{};
     ChunkList chunks{};
-    bool found = false, matches = true;
+    bool found_weather = false, matches = true;
     if (!arena_init(&arena, 8 * MiB, &err) || !parse_chunks(path, &chunks, &arena, &err)) {
         arena_release(&arena);
         return false;
     }
     for (uint32_t index = 0; index < chunks.count; ++index) {
         const ChunkRef& chunk = chunks.chunks[index];
-        if (chunk.cid != ASURA_CHUNK_WEATHERSYSTEM || chunk.version < 5 ||
-            chunk.version > 6 || chunk.size <= 21)
-            continue;
-        found = true;
-        matches &= (chunk.data[21] != 0) == rain_enabled;
+        if (chunk.cid == ASURA_CHUNK_WEATHERSYSTEM && chunk.version >= 5 &&
+            chunk.version <= 6 && chunk.size > 22) {
+            found_weather = true;
+            matches &= (chunk.data[21] != 0) == rain_enabled &&
+                       (chunk.data[22] != 0) == rain_enabled;
+        } else if (chunk.cid == ASURA_CHUNK_EXTENDED_PARTICLE_RAIN_SYSTEM &&
+                   chunk.version == 0 &&
+                   chunk.size >= kExtendedRainFlagsOffset + sizeof(uint32_t)) {
+            const uint32_t flags = read_u32(chunk.data + kExtendedRainFlagsOffset);
+            matches &= (flags & kExtendedRainEnabledMask) ==
+                       (rain_enabled ? kExtendedRainEnabledMask : 0u);
+        }
     }
     unmap_file(&chunks.file);
     arena_release(&arena);
-    return found && matches;
+    return found_weather && matches;
 }
 
 bool refresh_history_derived_resources(const Document& previous, std::string* why) {
@@ -7316,6 +7495,247 @@ void command_toggle_rain() {
         set_status(enabled ? "WTHR rain enabled." : "WTHR rain disabled.");
 }
 
+enum AmbiencePropertiesId : int {
+    ID_AMBIENCE_STREAM = 3400,
+    ID_AMBIENCE_VOLUME,
+};
+
+struct AmbiencePropertiesState {
+    HWND window = nullptr;
+    HWND stream = nullptr;
+    HWND volume = nullptr;
+    std::vector<std::string> paths;
+    std::string selected_path;
+    float selected_volume = 1.0f;
+    bool accepted = false;
+};
+
+constexpr const char* kAmbienceSoundNames[] = {
+    "01_temp.wav",
+    "02_temp.wav",
+    "indoor_s\\m1_kar1i.wav",
+    "indoor_s\\m1_roof.wav",
+    "indoor_s\\m2_bra1i.wav",
+    "indoor_s\\m2_bra1r.wav",
+    "indoor_s\\m3_pla5i.wav",
+    "indoor_s\\m4_anh3i.wav",
+    "indoor_s\\m4_entr.wav",
+    "indoor_s\\m4_roof.wav",
+    "indoor_s\\m4_tube.wav",
+    "indoor_s\\m5_bor3i.wav",
+    "indoor_s\\m5_bor4i.wav",
+    "indoor_s\\m5_roof.wav",
+    "indoor_s\\m5_room.wav",
+    "indoor_s\\m7_kei1i.wav",
+    "indoor_s\\m8_air1i.wav",
+    "indoor_s\\m8_contr.wav",
+    "m1_karl1.wav",
+    "m1_karl2.wav",
+    "m10_Hofe.wav",
+    "m11_bunk.wav",
+    "m2_bran1.wav",
+    "m2_bran2.wav",
+    "m2_bran3.wav",
+    "m2_bran4.wav",
+    "m2_bran5.wav",
+    "m3_play1.wav",
+    "m3_play2.wav",
+    "m3_play3.wav",
+    "m3_play4.wav",
+    "m3_play5.wav",
+    "m4_anh1.wav",
+    "m4_anh2.wav",
+    "m4_anh3.wav",
+    "m4_anh3o.wav",
+    "m5_bor1.wav",
+    "m5_bor2.wav",
+    "m5_bor3o.wav",
+    "m5_bor4o.wav",
+    "m5_bor5.wav",
+    "m5_bor6.wav",
+    "m6_schl1.wav",
+    "m6_schl2.wav",
+    "m6_schl3.wav",
+    "m6_schl4.wav",
+    "m6_schl5.wav",
+    "m7_kei1o.wav",
+    "m7_kei2o.wav",
+    "m7_kei3o.wav",
+    "m8_air1o.wav",
+    "m8_air2o.wav",
+    "m8_air3o.wav",
+    "m8_air4o.wav"
+};
+
+std::vector<std::string> available_ambience_streams() {
+    std::vector<std::string> paths;
+    paths.reserve(sizeof(kAmbienceSoundNames) / sizeof(kAmbienceSoundNames[0]));
+    for (const char* name : kAmbienceSoundNames)
+        paths.emplace_back(std::string("Sounds\\Streams\\") + name);
+    return paths;
+}
+
+std::string ambience_stream_label(const std::string& path) {
+    constexpr const char prefix[] = "Sounds\\Streams\\";
+    size_t start = 0;
+    while (start < path.size() && (path[start] == '\\' || path[start] == '/'))
+        ++start;
+    if (path.size() - start >= sizeof(prefix) - 1 &&
+        _strnicmp(path.c_str() + start, prefix, sizeof(prefix) - 1) == 0)
+        start += sizeof(prefix) - 1;
+    size_t end = path.size();
+    const size_t dot = path.find_last_of('.');
+    if (dot != std::string::npos && dot >= start)
+        end = dot;
+    std::string label = path.substr(start, end - start);
+    for (char& c : label)
+        if (c == '/')
+            c = '\\';
+    return label;
+}
+
+HWND make_ambience_control(AmbiencePropertiesState* state, const char* cls, const char* text,
+                           DWORD style, int id, int x, int y, int width, int height) {
+    HWND control = CreateWindowExA(0, cls, text, WS_CHILD | WS_VISIBLE | style, x, y, width, height,
+                                   state->window,
+                                   reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
+                                   GetModuleHandle(nullptr), nullptr);
+    SendMessageA(control, WM_SETFONT, reinterpret_cast<WPARAM>(g.font), TRUE);
+    return control;
+}
+
+void create_ambience_properties_controls(AmbiencePropertiesState* state) {
+    make_ambience_control(state, "STATIC", "Default stream", SS_LEFT, -1, 18, 22, 104, 22);
+    state->stream = make_ambience_control(state, "COMBOBOX", "",
+                                          CBS_DROPDOWNLIST | CBS_AUTOHSCROLL | WS_VSCROLL,
+                                          ID_AMBIENCE_STREAM, 126, 18, 380, 260);
+    make_ambience_control(state, "STATIC", "Volume (0-1)", SS_LEFT, -1, 18, 62, 104, 22);
+    state->volume = make_ambience_control(state, "EDIT", "",
+                                          ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP,
+                                          ID_AMBIENCE_VOLUME, 126, 58, 100, 24);
+    make_ambience_control(
+        state, "STATIC",
+        "Ambience sound names come from game's root Sounds\\Streams",
+        SS_LEFT, -1, 18, 98, 355, 17);
+    make_ambience_control(state, "BUTTON", "OK", BS_DEFPUSHBUTTON | WS_TABSTOP,
+                          IDOK, 290, 158, 104, 30);
+    make_ambience_control(state, "BUTTON", "Cancel", BS_PUSHBUTTON | WS_TABSTOP,
+                          IDCANCEL, 402, 158, 104, 30);
+
+    SendMessageA(state->stream, CB_ADDSTRING, 0,
+                 reinterpret_cast<LPARAM>("(None - No ambience sound)"));
+    int selected = state->selected_path.empty() ? 0 : -1;
+    for (size_t index = 0; index < state->paths.size(); ++index) {
+        const std::string label = ambience_stream_label(state->paths[index]);
+        const LRESULT row = SendMessageA(state->stream, CB_ADDSTRING, 0,
+                                         reinterpret_cast<LPARAM>(label.c_str()));
+        if (row != CB_ERR && row != CB_ERRSPACE &&
+            _stricmp(state->paths[index].c_str(), state->selected_path.c_str()) == 0)
+            selected = static_cast<int>(row);
+    }
+    SendMessageA(state->stream, CB_SETCURSEL, selected >= 0 ? selected : 0, 0);
+    set_float(state->volume, state->selected_volume);
+}
+
+LRESULT CALLBACK ambience_properties_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+    if (message == WM_NCCREATE) {
+        const CREATESTRUCTA* create = reinterpret_cast<const CREATESTRUCTA*>(lparam);
+        SetWindowLongPtrA(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(create->lpCreateParams));
+        return TRUE;
+    }
+    AmbiencePropertiesState* state =
+        reinterpret_cast<AmbiencePropertiesState*>(GetWindowLongPtrA(hwnd, GWLP_USERDATA));
+    switch (message) {
+    case WM_CREATE:
+        state->window = hwnd;
+        create_ambience_properties_controls(state);
+        return 0;
+    case WM_COMMAND:
+        if (LOWORD(wparam) == IDOK) {
+            const int selection = static_cast<int>(SendMessageA(state->stream, CB_GETCURSEL, 0, 0));
+            const float volume = get_float(state->volume, state->selected_volume);
+            if (selection < 0 || selection > static_cast<int>(state->paths.size()) ||
+                !isfinite(volume) || volume < 0.0f || volume > 1.0f) {
+                MessageBoxA(hwnd, "Choose a stream and enter a volume from 0 to 1.",
+                            "Invalid ambience settings", MB_ICONWARNING);
+                return 0;
+            }
+            state->selected_path = selection == 0 ? std::string{} : state->paths[selection - 1];
+            state->selected_volume = volume;
+            state->accepted = true;
+            DestroyWindow(hwnd);
+        } else if (LOWORD(wparam) == IDCANCEL) {
+            DestroyWindow(hwnd);
+        }
+        return 0;
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+    }
+    return DefWindowProcA(hwnd, message, wparam, lparam);
+}
+
+void command_ambience_properties() {
+    if (g.document.source_pc_path.empty() && g.document.obj_path.empty())
+        return;
+    AmbiencePropertiesState state{};
+    state.selected_path = g.document.ambient_stream_path;
+    state.selected_volume = g.document.ambient_volume;
+    state.paths = available_ambience_streams();
+    bool current_present = state.selected_path.empty();
+    for (const std::string& path : state.paths)
+        current_present |= _stricmp(path.c_str(), state.selected_path.c_str()) == 0;
+    if (!current_present)
+        state.paths.push_back(state.selected_path);
+
+    RECT owner{};
+    GetWindowRect(g.window, &owner);
+    constexpr int width = 540, height = 235;
+    const int x = owner.left + std::max(0L, (owner.right - owner.left - width) / 2);
+    const int y = owner.top + std::max(0L, (owner.bottom - owner.top - height) / 2);
+    HWND window = CreateWindowExA(WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT,
+                                  "Asura2005AmbienceProperties", "Streaming ambience",
+                                  WS_CAPTION | WS_SYSMENU | WS_POPUP | WS_VISIBLE,
+                                  x, y, width, height, g.window, nullptr,
+                                  GetModuleHandle(nullptr), &state);
+    if (!window)
+        return;
+    EnableWindow(g.window, FALSE);
+    MSG message{};
+    bool quit = false;
+    while (IsWindow(window)) {
+        const BOOL result = GetMessageA(&message, nullptr, 0, 0);
+        if (result <= 0) {
+            quit = result == 0;
+            break;
+        }
+        if (!IsDialogMessageA(window, &message)) {
+            TranslateMessage(&message);
+            DispatchMessageA(&message);
+        }
+    }
+    EnableWindow(g.window, TRUE);
+    SetActiveWindow(g.window);
+    if (quit)
+        PostQuitMessage(static_cast<int>(message.wParam));
+    if (!state.accepted)
+        return;
+    if (!g.history.begin(g.document, g.selected))
+        return;
+    g.document.ambient_stream_path = std::move(state.selected_path);
+    g.document.ambient_volume = state.selected_volume;
+    commit_history_transaction();
+    if (g.document.ambient_stream_path.empty()) {
+        set_status("Default streaming ambience disabled");
+    } else {
+        const std::string label = ambience_stream_label(g.document.ambient_stream_path);
+        char status[320]{};
+        snprintf(status, sizeof(status), "Streaming ambience: %s at %.3g",
+                 label.c_str(), g.document.ambient_volume);
+        set_status(status);
+    }
+}
+
 void command_weapons_donor() {
     std::string path = g.document.weapons_donor;
     if (!choose_path(g.window, false, "Choose a target-game weapons donor .PC",
@@ -7767,6 +8187,8 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             command_skybox_textures();
         else if (id == ID_TOGGLE_RAIN)
             command_toggle_rain();
+        else if (id == ID_AMBIENCE_PROPERTIES)
+            command_ambience_properties();
         else if (id == ID_ADD_SPAWN)
             begin_place(EntityKind::SpawnPoint);
         else if (id == ID_ADD_LIGHT)
@@ -8199,6 +8621,8 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
     const bool selection_smoke = __argc == 2 && strcmp(__argv[1], "--selection-smoke") == 0;
     const bool pc_weather_render_smoke =
         __argc == 3 && strcmp(__argv[1], "--pc-weather-render-smoke") == 0;
+    const bool project_weather_render_smoke =
+        __argc == 3 && strcmp(__argv[1], "--project-weather-render-smoke") == 0;
     const bool pc_material_render_smoke =
         __argc == 4 && strcmp(__argv[1], "--pc-material-render-smoke") == 0;
     if (__argc == 5 && strcmp(__argv[1], "--obj-pickup-lifecycle-smoke") == 0) {
@@ -8273,6 +8697,22 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
                    ? 0
                    : 6;
     }
+    if (__argc == 4 && strcmp(__argv[1], "--project-ambience-smoke") == 0) {
+        Document document, exported;
+        Mesh mesh;
+        std::string why;
+        if (!load_project(&document, __argv[2], &why))
+            return 39;
+        document.ambient_stream_path = "Sounds\\Streams\\indoor_s\\m1_roof.wav";
+        document.ambient_volume = 0.375f;
+        return pack_document(document, __argv[3], &why) &&
+                       load_pc_level(__argv[3], &exported, &mesh, &why) &&
+                       exported.ambient_stream_path == document.ambient_stream_path &&
+                       memcmp(&exported.ambient_volume, &document.ambient_volume,
+                              sizeof(document.ambient_volume)) == 0
+                   ? 0
+                   : 39;
+    }
     if (__argc == 4 && strcmp(__argv[1], "--pc-entity-transform-smoke") == 0) {
         Document doc, restored;
         Mesh mesh, restored_mesh;
@@ -8322,10 +8762,13 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
             imported.skybox.chunk_version == 7 &&
             !imported.skybox.right_texture_is_left_upside_down;
         imported.rain_enabled = !imported.rain_enabled;
+        imported.ambient_stream_path = "Sounds\\Streams\\indoor_s\\m1_roof.wav";
+        imported.ambient_volume = 0.375f;
         return save_project(imported, __argv[3], &why) && load_project(&restored, __argv[3], &why) &&
                        same_skybox_settings(restored.skybox, imported.skybox) &&
                        restored.rain_enabled == imported.rain_enabled &&
                        restored.weather_source_record == imported.weather_source_record &&
+                       same_ambience_settings(restored, imported) &&
                        restored.entities.size() == imported.entities.size() &&
                        restored.pickup_templates.size() == imported.pickup_templates.size() &&
                        restored.source_pickup_inventory_complete == imported.source_pickup_inventory_complete &&
@@ -8333,6 +8776,7 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
                        load_pc_level(__argv[4], &exported, &exported_mesh, &why) &&
                        same_skybox_settings(exported.skybox, imported.skybox) &&
                        exported.rain_enabled == imported.rain_enabled &&
+                       same_ambience_settings(exported, imported) &&
                        exported.entities.size() == imported.entities.size()
                    ? 0
                    : 8;
@@ -8345,17 +8789,25 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
             !imported.skybox.source_record || !imported.weather_source_record)
             return 32;
         const SkyboxSettings original_skybox = imported.skybox;
+        const std::string original_ambience_path = imported.ambient_stream_path;
+        const float original_ambience_volume = imported.ambient_volume;
         imported.rain_enabled = !imported.rain_enabled;
         if (!save_project(imported, __argv[3], &why) ||
             !load_project(&restored, __argv[3], &why) ||
             !same_skybox_settings(restored.skybox, original_skybox) ||
             restored.rain_enabled != imported.rain_enabled ||
+            restored.ambient_stream_path != original_ambience_path ||
+            memcmp(&restored.ambient_volume, &original_ambience_volume,
+                   sizeof(original_ambience_volume)) != 0 ||
             !pack_document(restored, __argv[4], &why) ||
-            !all_pc_weather_records_match(__argv[4], imported.rain_enabled) ||
+            !all_pc_rain_records_match(__argv[4], imported.rain_enabled) ||
             !load_pc_level(__argv[4], &exported, &exported_mesh, &why))
             return 33;
         return same_skybox_settings(exported.skybox, original_skybox) &&
-                       exported.rain_enabled == imported.rain_enabled
+                       exported.rain_enabled == imported.rain_enabled &&
+                       exported.ambient_stream_path == original_ambience_path &&
+                       memcmp(&exported.ambient_volume, &original_ambience_volume,
+                              sizeof(original_ambience_volume)) == 0
                    ? 0
                    : 34;
     }
@@ -8410,6 +8862,15 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
     skybox_properties_class.hbrBackground = static_cast<HBRUSH>(GetStockObject(LTGRAY_BRUSH));
     skybox_properties_class.lpszClassName = "Asura2005SkyboxProperties";
     if (!RegisterClassExA(&skybox_properties_class))
+        return 1;
+    WNDCLASSEXA ambience_properties_class{};
+    ambience_properties_class.cbSize = sizeof(ambience_properties_class);
+    ambience_properties_class.lpfnWndProc = ambience_properties_proc;
+    ambience_properties_class.hInstance = instance;
+    ambience_properties_class.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    ambience_properties_class.hbrBackground = static_cast<HBRUSH>(GetStockObject(LTGRAY_BRUSH));
+    ambience_properties_class.lpszClassName = "Asura2005AmbienceProperties";
+    if (!RegisterClassExA(&ambience_properties_class))
         return 1;
     WNDCLASSEXA wc{};
     wc.cbSize = sizeof(wc);
@@ -8476,6 +8937,37 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
                                    g.document.entities[1].position.x == 4.0f;
         DestroyWindow(window);
         return same_type_selected && mixed_type_rejected && batch_applied && undo_restored ? 0 : 41;
+    }
+    if (project_weather_render_smoke) {
+        Document document;
+        Mesh mesh;
+        std::vector<PickupModel> pickup_models;
+        std::string why;
+        if (!load_project(&document, __argv[2], &why)) {
+            DestroyWindow(window);
+            return 42;
+        }
+        g.document = std::move(document);
+        if (!load_document_preview(&g.document, &mesh, &why, &pickup_models)) {
+            DestroyWindow(window);
+            return 42;
+        }
+        g.mesh = std::move(mesh);
+        g.pickup_models = std::move(pickup_models);
+        frame_mesh();
+        g.document.rain_enabled = true;
+        uint32_t loaded_count = 0, missing_count = 0;
+        const bool textures_loaded =
+            gpu_reload_environment_textures(&why, &loaded_count, &missing_count);
+        bool found_wet_material = false;
+        for (const GpuMaterialRange& range : gpu.material_ranges)
+            found_wet_material |= range.texture && (range.material_flags & 0x4000u) != 0;
+        gpu_render();
+        const bool valid = textures_loaded && loaded_count > 0 && found_wet_material &&
+                           gpu.environment_wet_weather && gpu.environment_splash &&
+                           gpu.rain_texture && gpu.wet_splash_drawn;
+        DestroyWindow(window);
+        return valid ? 0 : 43;
     }
     if (pc_material_render_smoke) {
         char* mask_end = nullptr;
@@ -8663,8 +9155,32 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
                                (gpu.rain_texture != nullptr) == original_rain &&
                                (SendMessageA(g.rain_toggle, BM_GETCHECK, 0, 0) == BST_CHECKED) ==
                                    original_rain;
+        const std::vector<std::string> ambience_streams = available_ambience_streams();
+        AmbiencePropertiesState ambience_test_state{};
+        ambience_test_state.paths = ambience_streams;
+        HWND ambience_test_window = CreateWindowExA(
+            WS_EX_TOOLWINDOW, "Asura2005AmbienceProperties", "Ambience combo test", WS_POPUP,
+            0, 0, 540, 235, window, nullptr, GetModuleHandle(nullptr), &ambience_test_state);
+        const bool ambience_first_choice =
+            ambience_test_window && ambience_test_state.stream &&
+            SendMessageA(ambience_test_state.stream, CB_GETCOUNT, 0, 0) ==
+                static_cast<LRESULT>(ambience_streams.size() + 1) &&
+            SendMessageA(ambience_test_state.stream, CB_FINDSTRINGEXACT,
+                         static_cast<WPARAM>(-1), reinterpret_cast<LPARAM>("01_temp")) == 1;
+        if (ambience_test_window)
+            DestroyWindow(ambience_test_window);
+        const bool ambience_ui = IsWindowEnabled(g.ambience_properties) &&
+                                 ambience_streams.size() >= 54 &&
+                                 ambience_stream_label(ambience_streams.front()) == "01_temp" &&
+                                 ambience_first_choice &&
+                                 std::any_of(ambience_streams.begin(), ambience_streams.end(),
+                                             [&](const std::string& path) {
+                                                 return _stricmp(path.c_str(),
+                                                                 g.document.ambient_stream_path.c_str()) == 0;
+                                             });
         const bool valid = sorted && pickup_sorted && pickup_switch && skybox_uv &&
-                           rain_toggled && rain_undo && g.document.skybox.chunk_version == 7;
+                           rain_toggled && rain_undo && ambience_ui &&
+                           g.document.skybox.chunk_version == 7;
         DestroyWindow(window);
         return valid ? 0 : 36;
     }
