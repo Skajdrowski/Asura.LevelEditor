@@ -341,7 +341,6 @@ enum SNIPE_ITEM_ID_2005 : uint8_t {
     SnipeItem_StickGrenade = 0x09,
     SnipeItem_FragGrenade = 0x0A,
     SnipeItem_SmokeGrenade = 0x0B,
-    SnipeItem_Knife = 0x0C,
     SnipeItem_MedKit = 0x0D,
     SnipeItem_Bandage = 0x0E,
     SnipeItem_TnT = 0x0F,

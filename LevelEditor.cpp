@@ -302,7 +302,6 @@ const char* snipe_item_name(uint32_t item_id) {
     case SnipeItem_StickGrenade: return "Stick Grenade";
     case SnipeItem_FragGrenade: return "Frag Grenade";
     case SnipeItem_SmokeGrenade: return "Smoke Grenade";
-    case SnipeItem_Knife: return "Knife";
     case SnipeItem_MedKit: return "MedKit";
     case SnipeItem_Bandage: return "Bandage";
     case SnipeItem_TnT: return "TnT";
@@ -433,7 +432,6 @@ constexpr PickupResourceDefinition kPickupResourceDefinitions[] = {
     {SnipeItem_StickGrenade, "stickgrenade"},
     {SnipeItem_FragGrenade, "Pineapple"},
     {SnipeItem_SmokeGrenade, "smokegrenade"},
-    {SnipeItem_Knife, "Knife"},
     {SnipeItem_MedKit, "smallmedkit"},
     {SnipeItem_Bandage, "bandage"},
     {SnipeItem_TnT, "tnt"},
@@ -8685,7 +8683,7 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
             return 23;
         constexpr uint32_t required_items[] = {
             SnipeItem_PistolAmmo, SnipeItem_RifleAmmo, SnipeItem_Panzerfaust, SnipeItem_StickGrenade,
-            SnipeItem_FragGrenade, SnipeItem_SmokeGrenade, SnipeItem_Knife, SnipeItem_MedKit,
+            SnipeItem_FragGrenade, SnipeItem_SmokeGrenade, SnipeItem_MedKit,
             SnipeItem_Bandage, SnipeItem_TnT, SnipeItem_Gewehr43,
             SnipeItem_Mosin91, SnipeItem_SVT40, SnipeItem_PPSH,
             SnipeItem_MP40, SnipeItem_MG42, SnipeItem_DP28, SnipeItem_TimeBomb,
