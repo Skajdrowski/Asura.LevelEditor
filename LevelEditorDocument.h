@@ -8,13 +8,13 @@
 
 namespace editor {
 
-inline constexpr size_t kPhysicalObjectBodySize = sizeof(Snipe_ServerEntity_PhysicalPickup_ChunkDataV0);
+inline constexpr size_t kPickupBodySize = sizeof(Snipe_ServerEntity_Pickup_ChunkDataV0);
 
 enum class EntityKind : uint32_t {
     SpawnPoint,
     Light,
     Sound,
-    PhysicalObject,
+    Pickup,
     AssassinationTarget,
     PositionMarker,
 };
@@ -55,7 +55,7 @@ struct Entity {
     uint32_t pickup_skin_id = 0;
     uint32_t pickup_anim_id = 0;
     uint32_t pickup_anim_file_id = 0;
-    std::array<uint8_t, kPhysicalObjectBodySize> pickup_body{};
+    std::array<uint8_t, kPickupBodySize> pickup_body{};
 };
 
 struct PickupTemplate {
@@ -66,7 +66,7 @@ struct PickupTemplate {
     uint32_t anim_id = 0;
     uint32_t anim_file_id = 0;
     uint16_t entity_padding = 0;
-    std::array<uint8_t, kPhysicalObjectBodySize> body{};
+    std::array<uint8_t, kPickupBodySize> body{};
 };
 
 struct SkyboxSettings {

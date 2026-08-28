@@ -280,7 +280,7 @@ struct Asura_ServerEntity_PhysicalObject_ChunkDataV7 {
 // ENTI classification 0x0008 payload, excluding the common eight-byte ENTI
 // GUID/classification header.  Its writer is a chain of Pickup v2, static
 // object v3, Snipe physical object v7, and Asura physical object v7 records.
-struct Snipe_ServerEntity_PhysicalPickup_ChunkDataV0 {
+struct Snipe_ServerEntity_Pickup_ChunkDataV0 {
     int32_t m_iPickupVersion;
     uint32_t m_uPickupClassID;
     uint32_t m_uPickupFlags;

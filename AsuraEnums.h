@@ -300,7 +300,7 @@ enum ASURA_ENTITY_CLASSIFICATION : int32_t {
 // Project-specific classification used by Sniper Elite 2005. The target's
 // source assertions identify this class as Snipe_ServerEntity_SpawnPoint.
 enum SNIPE_ENTITY_CLASSIFICATION_2005 : uint16_t {
-    SnipeEntityClass_PhysicalObject = 0x8,
+    SnipeEntityClass_Pickup = 0x8,
     SnipeEntityClass_SpawnPoint = 0x803A,
     SnipeEntityClass_AssassinationTarget = 0x804F,
     SnipeEntityClass_PositionMarker = 0x8052

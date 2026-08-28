@@ -124,7 +124,7 @@ bool equal_document_content(const Document& a, const Document& b) {
 
 bool authorable(EntityKind kind) {
     return kind == EntityKind::SpawnPoint || kind == EntityKind::Light ||
-           kind == EntityKind::Sound || kind == EntityKind::PhysicalObject;
+           kind == EntityKind::Sound || kind == EntityKind::Pickup;
 }
 
 void set_error(std::string* error, const char* message) {
@@ -176,8 +176,8 @@ void canonicalize_clone(Entity* entity) {
         entity->sound_controller_padding = 0x4974;
         entity->sound_phonon = {};
         break;
-    case EntityKind::PhysicalObject:
-        entity->source_entity_classification = SnipeEntityClass_PhysicalObject;
+    case EntityKind::Pickup:
+        entity->source_entity_classification = SnipeEntityClass_Pickup;
         // pickup_has_template, pickup_body, IDs, padding, and the user-visible
         // asset properties are the recovered authored template and stay intact.
         break;

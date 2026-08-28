@@ -340,7 +340,7 @@ PickupTemplate make_canonical_pickup_template(uint32_t item_id, float health, ui
     pickup.anim_id = anim_id;
     pickup.anim_file_id = anim_file_id;
 
-    Snipe_ServerEntity_PhysicalPickup_ChunkDataV0 body{};
+    Snipe_ServerEntity_Pickup_ChunkDataV0 body{};
     body.m_iPickupVersion = 2;
     body.m_uPickupClassID = 999;
     body.m_uPickupFlags = 2;
@@ -380,7 +380,7 @@ PickupTemplate make_canonical_pickup_template(uint32_t item_id, float health, ui
 PickupTemplate pickup_template_from_entity(const Entity& entity) {
     const uint32_t state_bits = entity.pickup_has_template
                                     ? read_u32(entity.pickup_body.data() +
-                                               offsetof(Snipe_ServerEntity_PhysicalPickup_ChunkDataV0,
+                                               offsetof(Snipe_ServerEntity_Pickup_ChunkDataV0,
                                                         m_xPhysicalObject) +
                                                offsetof(Asura_ServerEntity_PhysicalObject_ChunkDataV7,
                                                         m_uStateBits))
@@ -501,7 +501,7 @@ void add_resource_backed_pickup_templates(const ChunkList& chunks, Document* cat
 
 bool pickup_skin_is_referenced(const Document& document, uint32_t skin_id) {
     for (const Entity& entity : document.entities)
-        if (entity.kind == EntityKind::PhysicalObject && entity.pickup_skin_id == skin_id)
+        if (entity.kind == EntityKind::Pickup && entity.pickup_skin_id == skin_id)
             return true;
     for (const PickupTemplate& pickup : document.pickup_templates)
         if (pickup.skin_id == skin_id)
@@ -634,7 +634,7 @@ bool decode_pc_pickup_models(const ChunkList& chunks, const Document& document,
     return true;
 }
 
-bool valid_physical_pickup_body(const Snipe_ServerEntity_PhysicalPickup_ChunkDataV0& body) {
+bool valid_physical_pickup_body(const Snipe_ServerEntity_Pickup_ChunkDataV0& body) {
     return body.m_iPickupVersion == 2 && body.m_iAsuraPickupVersion == 2 &&
            body.m_iStaticObjectVersion == 3 && body.m_iAsuraStaticObjectVersion == 0 &&
            body.m_iPhysicalObjectVersion == 7 && body.m_iAsuraPhysicalObjectVersion == 7;
@@ -655,14 +655,14 @@ bool load_pickup_donor(const std::string& path, std::vector<PickupTemplate>* tem
         const uint8_t* payload = chunk.data + sizeof(Asura_Chunk_Header);
         const uint16_t classification =
             read_u16(payload + offsetof(Asura_Chunk_Entity_PayloadHeader, Classification));
-        if (classification != SnipeEntityClass_PhysicalObject)
+        if (classification != SnipeEntityClass_Pickup)
             continue;
         if (chunk.version != 0 ||
-            chunk.size < sizeof(Asura_Chunk_Entity) + sizeof(Snipe_ServerEntity_PhysicalPickup_ChunkDataV0)) {
+            chunk.size < sizeof(Asura_Chunk_Entity) + sizeof(Snipe_ServerEntity_Pickup_ChunkDataV0)) {
             ok = fail(&err, "physical-pickup ENTI chunk %u is truncated or unsupported", chunk_index);
             break;
         }
-        Snipe_ServerEntity_PhysicalPickup_ChunkDataV0 body{};
+        Snipe_ServerEntity_Pickup_ChunkDataV0 body{};
         memcpy(&body, payload + sizeof(Asura_Chunk_Entity_PayloadHeader), sizeof(body));
         if (!valid_physical_pickup_body(body)) {
             ok = fail(&err, "physical-pickup ENTI chunk %u uses unsupported payload versions", chunk_index);
@@ -741,7 +741,7 @@ bool normalise_editor_guids(Document* document, std::string* why) {
         // Lights have no ENTI GUID on disk. Source-backed records retain their
         // original IDs exactly; only editor-authored ENTI records are migrated.
         const bool has_enti_guid = entity.kind == EntityKind::SpawnPoint || entity.kind == EntityKind::Sound ||
-                                   entity.kind == EntityKind::PhysicalObject;
+                                   entity.kind == EntityKind::Pickup;
         if (!has_enti_guid || entity.source_entity_record || entity.sound_source_record)
             continue;
         bool duplicate = false;
@@ -874,16 +874,16 @@ bool import_pc_entities(const ChunkList& chunks, Document* document, Error* err)
                 note_document_guid(document, entity.guid);
                 break;
             }
-        } else if (classification == SnipeEntityClass_PhysicalObject) {
-            if (chunk.version != 0 || chunk.size < sizeof(Asura_Chunk_Entity) + kPhysicalObjectBodySize)
+        } else if (classification == SnipeEntityClass_Pickup) {
+            if (chunk.version != 0 || chunk.size < sizeof(Asura_Chunk_Entity) + kPickupBodySize)
                 return fail(err, "physical-object ENTI chunk %u is truncated or unsupported", chunk_index);
             const uint8_t* body = payload + sizeof(Asura_Chunk_Entity_PayloadHeader);
-            Snipe_ServerEntity_PhysicalPickup_ChunkDataV0 pickup{};
+            Snipe_ServerEntity_Pickup_ChunkDataV0 pickup{};
             memcpy(&pickup, body, sizeof(pickup));
             if (!valid_physical_pickup_body(pickup))
                 return fail(err, "physical-object ENTI chunk %u has unsupported payload versions", chunk_index);
             Entity entity;
-            entity.kind = EntityKind::PhysicalObject;
+            entity.kind = EntityKind::Pickup;
             entity.guid = read_u32(payload);
             entity.source_entity_record = true;
             entity.source_entity_classification = classification;
@@ -1351,8 +1351,8 @@ bool make_editor_sounds(const Document& doc, Sounds* sounds, Arena* arena, Error
     return true;
 }
 
-void make_pickup_body(const Entity& entity, std::array<uint8_t, kPhysicalObjectBodySize>* body) {
-    Snipe_ServerEntity_PhysicalPickup_ChunkDataV0 wire{};
+void make_pickup_body(const Entity& entity, std::array<uint8_t, kPickupBodySize>* body) {
+    Snipe_ServerEntity_Pickup_ChunkDataV0 wire{};
     if (entity.source_entity_record) {
         memcpy(&wire, entity.pickup_body.data(), sizeof(wire));
     } else {
@@ -1372,16 +1372,16 @@ void make_pickup_body(const Entity& entity, std::array<uint8_t, kPhysicalObjectB
 
 bool append_editor_pickups(Buffer* out, const Document& doc, Error* err) {
     for (const Entity& entity : doc.entities) {
-        if (entity.kind != EntityKind::PhysicalObject || entity.source_entity_record)
+        if (entity.kind != EntityKind::Pickup || entity.source_entity_record)
             continue;
         if (!entity.pickup_has_template)
             return fail(err, "pickup '%s' has no resolved item asset profile", entity.name.c_str());
         ChunkMark chunk = begin_chunk(out, ASURA_CHUNK_ENTITY, 0, 0, err);
         Asura_Chunk_Entity_PayloadHeader header{};
         header.Guid = entity.guid;
-        header.Classification = SnipeEntityClass_PhysicalObject;
+        header.Classification = SnipeEntityClass_Pickup;
         header.m_usPadding = entity.entity_padding;
-        std::array<uint8_t, kPhysicalObjectBodySize> body{};
+        std::array<uint8_t, kPickupBodySize> body{};
         make_pickup_body(entity, &body);
         buffer_append(out, &header, sizeof(header), err);
         buffer_append(out, body.data(), body.size(), err);
@@ -1545,14 +1545,14 @@ bool append_source_entity_copy(Buffer* out, const ChunkRef& chunk, const Documen
         payload + offsetof(Asura_Chunk_Entity_PayloadHeader, Classification));
     const Entity* entity = find_source_entity(doc, guid, classification);
     if (!entity) {
-        if (classification == SnipeEntityClass_PhysicalObject && doc.source_pickup_inventory_complete)
+        if (classification == SnipeEntityClass_Pickup && doc.source_pickup_inventory_complete)
             return true;
         return append_chunk_copy(out, chunk, err);
     }
 
     const uint8_t* body = payload + sizeof(Asura_Chunk_Entity_PayloadHeader);
-    if (classification == SnipeEntityClass_PhysicalObject && entity->pickup_has_template) {
-        if (chunk.size < sizeof(Asura_Chunk_Entity) + kPhysicalObjectBodySize)
+    if (classification == SnipeEntityClass_Pickup && entity->pickup_has_template) {
+        if (chunk.size < sizeof(Asura_Chunk_Entity) + kPickupBodySize)
             return fail(err, "source physical-object ENTI is truncated");
         Asura_Vector_3 source_position{};
         Asura_Quat source_orientation{};
@@ -1568,14 +1568,14 @@ bool append_source_entity_copy(Buffer* out, const ChunkRef& chunk, const Documen
             nearly_equal_rotation(entity->rotation, quaternion_euler(source_orientation)))
             return append_chunk_copy(out, chunk, err);
         std::vector<uint8_t> patched(chunk.data, chunk.data + chunk.size);
-        std::array<uint8_t, kPhysicalObjectBodySize> patched_body{};
+        std::array<uint8_t, kPickupBodySize> patched_body{};
         make_pickup_body(*entity, &patched_body);
         memcpy(patched.data() + sizeof(Asura_Chunk_Entity), patched_body.data(), patched_body.size());
         return buffer_append(out, patched.data(), patched.size(), err) != ~0ull;
     }
 
     uint32_t position_offset = 0, orientation_offset = 0;
-    if (classification == SnipeEntityClass_PhysicalObject) {
+    if (classification == SnipeEntityClass_Pickup) {
         position_offset = 0x4c;
         orientation_offset = 0x58;
     } else if (classification == SnipeEntityClass_AssassinationTarget) {
@@ -1832,7 +1832,7 @@ bool pack_document(Document& doc, const char* output_path, std::string* why) {
     }
     bool has_pickups = false;
     for (const Entity& entity : doc.entities)
-        has_pickups |= entity.kind == EntityKind::PhysicalObject;
+        has_pickups |= entity.kind == EntityKind::Pickup;
     if (has_pickups && doc.weapons_donor.empty()) {
         if (why)
             *why = "Choose a Weapons donor .PC before exporting pickups from a custom level.";
@@ -2164,7 +2164,7 @@ const SpawnPuppet* pickup_model_for_skin(uint32_t skin_id) {
 const SpawnPuppet* entity_render_model(const Entity& entity) {
     if (entity.kind == EntityKind::SpawnPoint)
         return spawn_puppet_for_team(entity.value_u32_a);
-    if (entity.kind == EntityKind::PhysicalObject)
+    if (entity.kind == EntityKind::Pickup)
         return pickup_model_for_skin(entity.pickup_skin_id);
     return nullptr;
 }
@@ -4664,7 +4664,7 @@ void gpu_render() {
         const Entity& entity = g.document.entities[i];
         if (entity.kind == EntityKind::SpawnPoint)
             append_gpu_spawn_puppet(entity, false, &puppet_vertices);
-        else if (entity.kind == EntityKind::PhysicalObject)
+        else if (entity.kind == EntityKind::Pickup)
             append_gpu_pickup_model(entity, false, &puppet_vertices);
     }
     const uint32_t unselected_puppet_count = static_cast<uint32_t>(puppet_vertices.size());
@@ -4674,7 +4674,7 @@ void gpu_render() {
         const Entity& selected_entity = g.document.entities[selected_index];
         if (selected_entity.kind == EntityKind::SpawnPoint)
             append_gpu_spawn_puppet(selected_entity, true, &puppet_vertices);
-        else if (selected_entity.kind == EntityKind::PhysicalObject)
+        else if (selected_entity.kind == EntityKind::Pickup)
             append_gpu_pickup_model(selected_entity, true, &puppet_vertices);
     }
     const uint32_t selected_puppet_count =
@@ -4724,7 +4724,7 @@ void gpu_render() {
             color = {1, .86f, .2f, 1};
         else if (entity.kind == EntityKind::Sound)
             color = {.2f, .7f, 1, 1};
-        else if (entity.kind == EntityKind::PhysicalObject)
+        else if (entity.kind == EntityKind::Pickup)
             color = {1, .45f, .18f, 1};
         else if (entity.kind == EntityKind::AssassinationTarget)
             color = {1, .15f, .25f, 1};
@@ -5750,7 +5750,7 @@ const char* entity_type_label(EntityKind kind) {
     case EntityKind::SpawnPoint: return "Spawn";
     case EntityKind::Light: return "Light";
     case EntityKind::Sound: return "Sound";
-    case EntityKind::PhysicalObject: return "Pickup";
+    case EntityKind::Pickup: return "Pickup";
     case EntityKind::AssassinationTarget: return "Target";
     case EntityKind::PositionMarker: return "Marker";
     }
@@ -5893,11 +5893,11 @@ void refresh_inspector() {
     g.inspector_dirty = 0;
     const bool enabled = g.selected >= 0 && g.selected < static_cast<int>(g.document.entities.size());
     const bool source_entity = enabled && g.document.entities[g.selected].source_entity_record;
-    const bool pickup = enabled && g.document.entities[g.selected].kind == EntityKind::PhysicalObject;
+    const bool pickup = enabled && g.document.entities[g.selected].kind == EntityKind::Pickup;
     bool selection_deletable = enabled;
     for (int index : g.selected_entities) {
         const Entity& entity = g.document.entities[index];
-        selection_deletable &= !entity.source_entity_record || entity.kind == EntityKind::PhysicalObject;
+        selection_deletable &= !entity.source_entity_record || entity.kind == EntityKind::Pickup;
     }
     if (g.rain_toggle) {
         SendMessageA(g.rain_toggle, BM_SETCHECK,
@@ -6009,7 +6009,7 @@ void refresh_inspector() {
         ShowWindow(g.sound_loop, SW_SHOW);
         ShowWindow(g.sound_browse, SW_SHOW);
         ShowWindow(g.sound_preview, SW_SHOW);
-    } else if (e.kind == EntityKind::PhysicalObject) {
+    } else if (e.kind == EntityKind::Pickup) {
         set_control_text(g.value_label[0], "Item type");
         set_control_text(g.value_label[1], "Object file ID");
         set_u32_hex(g.value[0], e.value_u32_a);
@@ -6191,7 +6191,7 @@ void apply_inspector() {
                 e.sound_phonon.m_uFlags = e.sound_loop ? (e.sound_phonon.m_uFlags | 1u)
                                                        : (e.sound_phonon.m_uFlags & ~1u);
             }
-        } else if (e.kind == EntityKind::PhysicalObject) {
+        } else if (e.kind == EntityKind::Pickup) {
             const LRESULT selected_item = SendMessageA(g.pickup_item, CB_GETCURSEL, 0, 0);
             const uint32_t requested_item = !changed(kInspectorDirtyPickup) || selected_item == CB_ERR
                                                 ? e.value_u32_a
@@ -6281,7 +6281,7 @@ bool open_obj_path(const std::string& path) {
 
 void add_entity_at(EntityKind kind, const Asura_Vector_3& p) {
     Entity e;
-    if (kind == EntityKind::PhysicalObject) {
+    if (kind == EntityKind::Pickup) {
         const PickupTemplate* pickup_template = find_pickup_template(g.document, SnipeItem_RifleAmmo, true);
         if (!pickup_template)
             pickup_template = find_pickup_template(g.document, 0, false);
@@ -6293,7 +6293,7 @@ void add_entity_at(EntityKind kind, const Asura_Vector_3& p) {
         adopt_pickup_template(&e, *pickup_template);
         e.entity_padding = pickup_template->entity_padding;
         e.source_entity_record = false;
-        e.source_entity_classification = SnipeEntityClass_PhysicalObject;
+        e.source_entity_classification = SnipeEntityClass_Pickup;
     }
     if (!g.history.begin(g.document, g.selected))
         return;
@@ -6322,7 +6322,7 @@ void add_entity_at(EntityKind kind, const Asura_Vector_3& p) {
         snprintf(name, sizeof(name), "Sound %zu", g.document.entities.size() + 1);
         e.value_a = 50;
         e.value_b = 250;
-    } else if (kind == EntityKind::PhysicalObject) {
+    } else if (kind == EntityKind::Pickup) {
         snprintf(name, sizeof(name), "%s %zu",
                  snipe_item_name(e.value_u32_a) ? snipe_item_name(e.value_u32_a) : "Pickup",
                  g.document.entities.size() + 1);
@@ -6344,7 +6344,7 @@ void begin_place(EntityKind kind) {
         MessageBoxA(g.window, "Open an environment OBJ or .PC first.", "Level Editor", MB_ICONINFORMATION);
         return;
     }
-    if (kind == EntityKind::PhysicalObject && !find_pickup_template(g.document, 0, false)) {
+    if (kind == EntityKind::Pickup && !find_pickup_template(g.document, 0, false)) {
         MessageBoxA(g.window, "Choose a Weapons donor .PC containing 0x0008 pickup definitions first.",
                     "Cannot create pickup", MB_ICONINFORMATION);
         return;
@@ -6436,7 +6436,7 @@ COLORREF entity_color(EntityKind kind) {
     case EntityKind::SpawnPoint: return RGB(80, 220, 120);
     case EntityKind::Light: return RGB(255, 220, 70);
     case EntityKind::Sound: return RGB(80, 190, 255);
-    case EntityKind::PhysicalObject: return RGB(255, 116, 46);
+    case EntityKind::Pickup: return RGB(255, 116, 46);
     case EntityKind::AssassinationTarget: return RGB(255, 38, 64);
     case EntityKind::PositionMarker: return RGB(190, 88, 255);
     default: return RGB(255, 120, 80);
@@ -6648,11 +6648,11 @@ bool draw_spawn_puppet(HDC dc, const Entity& entity, bool selected) {
     const SpawnPuppet* puppet = entity_render_model(entity);
     if (!puppet)
         return false;
-    COLORREF color = entity.kind == EntityKind::PhysicalObject
+    COLORREF color = entity.kind == EntityKind::Pickup
                          ? RGB(210, 92, 28)
                          : entity.value_u32_a == 5 ? RGB(135, 165, 67) : RGB(112, 128, 138);
     if (selected) {
-        color = entity.kind == EntityKind::PhysicalObject
+        color = entity.kind == EntityKind::Pickup
                     ? RGB(255, 188, 70)
                     : entity.value_u32_a == 5 ? RGB(220, 240, 105) : RGB(190, 218, 232);
     }
@@ -6703,7 +6703,7 @@ void draw_entities(HDC dc) {
             draw_gizmo_lines(dc, lines, selected ? 2 : 1,
                              selected ? RGB(255, 255, 255) : color);
         }
-        if ((e.kind == EntityKind::SpawnPoint || e.kind == EntityKind::PhysicalObject) &&
+        if ((e.kind == EntityKind::SpawnPoint || e.kind == EntityKind::Pickup) &&
             draw_spawn_puppet(dc, e, selected)) {
             if (selected)
                 TextOutA(dc, p.x + 10, p.y - 8, e.name.c_str(), static_cast<int>(e.name.size()));
@@ -6939,11 +6939,11 @@ void enrich_project_pickup_templates(Document* document, const Document& importe
         document->pickup_templates = imported.pickup_templates;
     size_t imported_pickups = 0, matched_pickups = 0;
     for (const Entity& source : imported.entities) {
-        if (source.kind != EntityKind::PhysicalObject || !source.source_entity_record)
+        if (source.kind != EntityKind::Pickup || !source.source_entity_record)
             continue;
         ++imported_pickups;
         for (Entity& saved : document->entities) {
-            if (saved.kind != EntityKind::PhysicalObject || saved.guid != source.guid)
+            if (saved.kind != EntityKind::Pickup || saved.guid != source.guid)
                 continue;
             ++matched_pickups;
             if (!saved.pickup_has_template) {
@@ -7890,7 +7890,7 @@ void command_weapons_donor() {
         return;
     }
     for (const Entity& entity : g.document.entities) {
-        if (entity.kind != EntityKind::PhysicalObject || entity.source_entity_record)
+        if (entity.kind != EntityKind::Pickup || entity.source_entity_record)
             continue;
         bool supported = false;
         for (const PickupTemplate& pickup : templates)
@@ -7910,7 +7910,7 @@ void command_weapons_donor() {
     if (g.document.source_pc_path.empty()) {
         g.document.pickup_templates = templates;
         for (Entity& entity : g.document.entities) {
-            if (entity.kind != EntityKind::PhysicalObject || entity.source_entity_record)
+            if (entity.kind != EntityKind::Pickup || entity.source_entity_record)
                 continue;
             for (const PickupTemplate& pickup : templates)
                 if (pickup.item_id == entity.value_u32_a) {
@@ -8189,7 +8189,7 @@ void delete_selected() {
         return;
     for (int index : g.selected_entities) {
         if (g.document.entities[index].source_entity_record &&
-            g.document.entities[index].kind != EntityKind::PhysicalObject) {
+            g.document.entities[index].kind != EntityKind::Pickup) {
             set_status("Imported target/marker records remain source-preserved and cannot be deleted yet.");
             return;
         }
@@ -8331,7 +8331,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
         else if (id == ID_ADD_SOUND)
             begin_place(EntityKind::Sound);
         else if (id == ID_ADD_PICKUP)
-            begin_place(EntityKind::PhysicalObject);
+            begin_place(EntityKind::Pickup);
         else if (id == ID_UNDO)
             command_undo();
         else if (id == ID_REDO)
@@ -8722,7 +8722,7 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
             return 12;
         size_t pickup_count = 0;
         for (const Entity& entity : document.entities) {
-            if (entity.kind != EntityKind::PhysicalObject)
+            if (entity.kind != EntityKind::Pickup)
                 continue;
             ++pickup_count;
             bool resolved = false;
@@ -8746,7 +8746,7 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
         uint32_t create_item_id = 0;
         for (size_t i = 0; i < document.entities.size(); ++i) {
             const Entity& entity = document.entities[i];
-            if (entity.kind != EntityKind::PhysicalObject)
+            if (entity.kind != EntityKind::Pickup)
                 continue;
             ++pickup_count;
             if (delete_index == SIZE_MAX) {
@@ -8760,8 +8760,8 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
         const uint32_t deleted_guid = document.entities[delete_index].guid;
         document.entities.erase(document.entities.begin() + delete_index);
         Entity created;
-        created.kind = EntityKind::PhysicalObject;
-        created.source_entity_classification = SnipeEntityClass_PhysicalObject;
+        created.kind = EntityKind::Pickup;
+        created.source_entity_classification = SnipeEntityClass_Pickup;
         created.entity_padding = creation_template->entity_padding;
         adopt_pickup_template(&created, *creation_template);
         created.source_entity_record = false;
@@ -8779,7 +8779,7 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
         size_t restored_pickups = 0;
         bool deleted_absent = true, created_present = false;
         for (const Entity& entity : restored.entities) {
-            if (entity.kind != EntityKind::PhysicalObject)
+            if (entity.kind != EntityKind::Pickup)
                 continue;
             ++restored_pickups;
             deleted_absent &= entity.guid != deleted_guid;
@@ -8802,7 +8802,7 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
         const PickupTemplate* mg42 = find_pickup_template(document, SnipeItem_MG42, true);
         Entity* changed = nullptr;
         for (Entity& entity : document.entities)
-            if (entity.kind == EntityKind::PhysicalObject && entity.source_entity_record) {
+            if (entity.kind == EntityKind::Pickup && entity.source_entity_record) {
                 changed = &entity;
                 break;
             }
@@ -8815,7 +8815,7 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
             !load_pc_level(__argv[3], &restored, &restored_mesh, &why, &restored_models))
             return 29;
         for (const Entity& entity : restored.entities) {
-            if (entity.kind != EntityKind::PhysicalObject || entity.guid != guid)
+            if (entity.kind != EntityKind::Pickup || entity.guid != guid)
                 continue;
             bool model_resolved = false;
             for (const PickupModel& model : restored_models)
@@ -8856,14 +8856,14 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
         if (!creation_template)
             creation_template = &document.pickup_templates.front();
         Entity created;
-        created.kind = EntityKind::PhysicalObject;
+        created.kind = EntityKind::Pickup;
         created.name = "Custom OBJ pickup smoke";
         created.guid = allocate_editor_guid(&document);
         if (!created.guid)
             return 33;
         created.position = {2.5f, -1.0f, 4.25f};
         created.rotation = {0.0f, 37.0f, 0.0f};
-        created.source_entity_classification = SnipeEntityClass_PhysicalObject;
+        created.source_entity_classification = SnipeEntityClass_Pickup;
         adopt_pickup_template(&created, *creation_template);
         const uint32_t created_guid = created.guid;
         const uint32_t created_item = created.value_u32_a;
@@ -8877,9 +8877,9 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
             !load_pc_level(__argv[4], &restored, &restored_mesh, &why, &restored_models))
             return 20;
         for (const Entity& entity : restored.entities) {
-            if (entity.kind != EntityKind::PhysicalObject || entity.guid != created_guid)
+            if (entity.kind != EntityKind::Pickup || entity.guid != created_guid)
                 continue;
-            Snipe_ServerEntity_PhysicalPickup_ChunkDataV0 wire{};
+            Snipe_ServerEntity_Pickup_ChunkDataV0 wire{};
             memcpy(&wire, entity.pickup_body.data(), sizeof(wire));
             bool model_resolved = false;
             for (const PickupModel& model : restored_models)
@@ -8938,7 +8938,7 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
         bool moved_object = false, moved_target = false, moved_marker = false;
         for (Entity& entity : doc.entities) {
             bool* moved = nullptr;
-            if (entity.kind == EntityKind::PhysicalObject)
+            if (entity.kind == EntityKind::Pickup)
                 moved = &moved_object;
             else if (entity.kind == EntityKind::AssassinationTarget)
                 moved = &moved_target;
@@ -9295,7 +9295,7 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
 
         int pickup_index = -1;
         for (int index = 0; index < static_cast<int>(g.document.entities.size()); ++index)
-            if (g.document.entities[index].kind == EntityKind::PhysicalObject) {
+            if (g.document.entities[index].kind == EntityKind::Pickup) {
                 pickup_index = index;
                 break;
             }
@@ -9439,7 +9439,7 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
         }
         bool pickups_resolved = !g.pickup_models.empty();
         for (const Entity& entity : g.document.entities)
-            if (entity.kind == EntityKind::PhysicalObject)
+            if (entity.kind == EntityKind::Pickup)
                 pickups_resolved &= pickup_model_for_skin(entity.pickup_skin_id) != nullptr;
         const bool rendered = loaded && gpu.ready && gpu.mesh_vertices && gpu.mesh_indices && gpu.mesh_index_count &&
                               list_double_click_focus &&

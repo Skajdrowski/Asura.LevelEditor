@@ -299,7 +299,7 @@ bool save_project(const Document& document, const char* path, std::string* why) 
             writer.u32(entity.sound_controller_padding);
             write_phonon(writer, entity.sound_phonon);
         }
-        if (entity.kind == EntityKind::PhysicalObject || entity.kind == EntityKind::AssassinationTarget ||
+        if (entity.kind == EntityKind::Pickup || entity.kind == EntityKind::AssassinationTarget ||
             entity.kind == EntityKind::PositionMarker) {
             writer.u32(entity.source_entity_record ? 1u : 0u);
             writer.u32(entity.source_entity_classification);
@@ -310,7 +310,7 @@ bool save_project(const Document& document, const char* path, std::string* why) 
             writer.f32(entity.source_bounds.MinZ);
             writer.f32(entity.source_bounds.MaxZ);
         }
-        if (entity.kind == EntityKind::PhysicalObject) {
+        if (entity.kind == EntityKind::Pickup) {
             writer.u32(entity.pickup_has_template ? 1u : 0u);
             writer.u32(entity.pickup_skin_id);
             writer.u32(entity.pickup_anim_id);
@@ -475,7 +475,7 @@ bool load_project(Document* document, const char* path, std::string* why) {
             entity.sound_controller_padding = static_cast<uint16_t>(reader.u32());
             entity.sound_phonon = read_phonon(reader);
         }
-        if (project_version >= 8 && kind >= static_cast<uint32_t>(EntityKind::PhysicalObject)) {
+        if (project_version >= 8 && kind >= static_cast<uint32_t>(EntityKind::Pickup)) {
             entity.source_entity_record = reader.u32() != 0;
             entity.source_entity_classification = static_cast<uint16_t>(reader.u32());
             entity.source_bounds.MinX = reader.f32();
@@ -485,7 +485,7 @@ bool load_project(Document* document, const char* path, std::string* why) {
             entity.source_bounds.MinZ = reader.f32();
             entity.source_bounds.MaxZ = reader.f32();
         }
-        if (project_version >= 9 && kind == static_cast<uint32_t>(EntityKind::PhysicalObject)) {
+        if (project_version >= 9 && kind == static_cast<uint32_t>(EntityKind::Pickup)) {
             entity.pickup_has_template = reader.u32() != 0;
             entity.pickup_skin_id = reader.u32();
             entity.pickup_anim_id = reader.u32();
