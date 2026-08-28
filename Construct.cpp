@@ -702,6 +702,14 @@ bool resolve_material(const MaterialMap& map, Str name, bool allow_unknown, uint
 Str material_texture_name_exact(const MaterialMap& map, uint32_t material_index) {
     if (!map.root || map.root->kind != JsonKind::Object)
         return {};
+    Json* indexed = json_get(map.root, "texture_by_material_index");
+    if (indexed && indexed->kind == JsonKind::Object) {
+        char key[32];
+        const int n = snprintf(key, sizeof(key), "%u", material_index);
+        Json* texture = json_get_i(indexed, {key, static_cast<uint32_t>(n)});
+        if (texture && texture->kind == JsonKind::String)
+            return texture->string;
+    }
     Json* orig = json_get(map.root, "orig_to_handle");
     Json* names = json_get(map.root, "handle_to_texname");
     if (orig && orig->kind == JsonKind::Object && names && names->kind == JsonKind::Object) {

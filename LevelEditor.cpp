@@ -1659,6 +1659,11 @@ bool replaced_pc_sound_resource(const Document& doc, const RscfInfo& resource) {
     return false;
 }
 
+bool append_pc_material_map_override(Buffer* out, const ChunkList& source,
+                                     const char* material_map_path, Arena* arena, Error* err);
+bool pc_environment_material_chunk_indices(const ChunkList& source, uint32_t* text_chunk_index,
+                                           uint32_t* material_chunk_index, Error* err);
+
 bool pack_pc_document(const Document& doc, const char* output_path, std::string* why) {
     Error err{};
     Arena arena{};
@@ -1667,6 +1672,11 @@ bool pack_pc_document(const Document& doc, const char* output_path, std::string*
     Sounds sounds{};
     bool ok = arena_init(&arena, 64 * MiB, &err) &&
               parse_chunks(doc.source_pc_path.c_str(), &source, &arena, &err);
+    uint32_t material_text_chunk = 0xffffffffu;
+    uint32_t material_chunk = 0xffffffffu;
+    if (ok && !doc.material_map.empty())
+        ok = pc_environment_material_chunk_indices(source, &material_text_chunk,
+                                                   &material_chunk, &err);
     uint64_t reserve = 0;
     if (ok) {
         if (source.file.size > UINT64_MAX - 64 * MiB)
@@ -1719,6 +1729,23 @@ bool pack_pc_document(const Document& doc, const char* output_path, std::string*
 
     for (uint32_t i = 0; ok && i < source.count; ++i) {
         const ChunkRef& chunk = source.chunks[i];
+        // MCP2 MTRL processing at 0x440440 calls sub_405AD0, which frees and
+        // recreates the original-index conversion array. The Env reader then
+        // resolves every strip through that array at 0x49E6AD. Replace the
+        // source table at its original stream position so the imported map is
+        // the one active for Env without leaving a duplicate material state.
+        if (!doc.material_map.empty() && i == material_text_chunk) {
+            ok = append_pc_material_map_override(&output, source, doc.material_map.c_str(),
+                                                 &arena, &err);
+            if (!ok)
+                break;
+            continue;
+        }
+        if (!doc.material_map.empty() &&
+            (i == material_chunk ||
+             (material_chunk != 0xffffffffu && i > material_text_chunk && i < material_chunk &&
+              chunk.cid == ASURA_CHUNK_TEXTUREFLAGS)))
+            continue;
         if (chunk.cid == ASURA_CHUNK_SKYBOX && doc.skybox.source_record) {
             if (!wrote_skybox) {
                 wrote_skybox = true;
@@ -2855,6 +2882,116 @@ bool pc_environment_material_bindings(const ChunkList& chunks,
     if (!reached_environment)
         return fail(err, "the PC environment resource is absent from the chunk stream");
     return true;
+}
+
+bool pc_environment_material_chunk_indices(const ChunkList& source, uint32_t* text_chunk_index,
+                                           uint32_t* material_chunk_index, Error* err) {
+    RscfInfo environment{};
+    if (!find_pc_environment(source, &environment))
+        return fail(err, "the .PC contains no PC environment RSCF");
+
+    uint32_t last_text = 0xffffffffu;
+    uint32_t active_text = 0xffffffffu;
+    uint32_t active_material = 0xffffffffu;
+    bool reached_environment = false;
+    for (uint32_t i = 0; i < source.count; ++i) {
+        const ChunkRef& chunk = source.chunks[i];
+        RscfInfo resource{};
+        if (rscf_info(chunk, &resource) && resource.payload == environment.payload) {
+            reached_environment = true;
+            break;
+        }
+        if (chunk.cid == ASURA_CHUNK_TEXTURENAMES) {
+            last_text = i;
+            if (chunk.version < 3) {
+                active_text = i;
+                active_material = 0xffffffffu;
+            }
+        } else if (chunk.cid == ASURA_CHUNK_MATERIAL) {
+            if (last_text == 0xffffffffu)
+                return fail(err, "the PC environment material table has no preceding TEXT chunk");
+            active_text = last_text;
+            active_material = i;
+        }
+    }
+    if (!reached_environment)
+        return fail(err, "the PC environment resource is absent from the chunk stream");
+    if (active_text == 0xffffffffu)
+        return fail(err, "the PC environment has no material table to override");
+    *text_chunk_index = active_text;
+    *material_chunk_index = active_material;
+    return true;
+}
+
+bool append_pc_material_map_override(Buffer* out, const ChunkList& source,
+                                     const char* material_map_path, Arena* arena, Error* err) {
+    MaterialMap material_map{};
+    Config config{};
+    config.material_map = material_map_path;
+    std::vector<PcEnvironmentMaterialBinding> source_materials;
+    bool ok = load_material_map(config, &material_map, arena, err) &&
+              pc_environment_material_bindings(source, &source_materials, err);
+    if (ok && source_materials.empty())
+        ok = fail(err, "the PC environment has no material bindings to override");
+
+    std::vector<Str> texture_names;
+    std::vector<int32_t> texture_indices;
+    std::vector<uint32_t> material_flags;
+    std::vector<uint32_t> texture_flags;
+    std::vector<uint32_t> surface_types;
+    if (ok) {
+        texture_names.resize(source_materials.size());
+        texture_indices.resize(source_materials.size());
+        material_flags.resize(source_materials.size());
+        texture_flags.resize(source_materials.size());
+        surface_types.resize(source_materials.size());
+        for (uint32_t material_index = 0;
+             material_index < static_cast<uint32_t>(source_materials.size()); ++material_index) {
+            const PcEnvironmentMaterialBinding& source_material = source_materials[material_index];
+            const Str mapped_name = material_texture_name(material_map, material_index);
+            texture_names[material_index] = mapped_name.size ? mapped_name : source_material.texture_name;
+            texture_indices[material_index] = texture_names[material_index].size
+                                                  ? static_cast<int32_t>(material_index)
+                                                  : -1;
+            material_flags[material_index] = material_override(
+                material_map, "transparency_flag_by_material_index", material_index,
+                source_material.flags);
+            texture_flags[material_index] = source_material.texture_flags;
+            surface_types[material_index] = material_override(
+                material_map, "surface_type_by_material_index", material_index,
+                source_material.surface_type);
+        }
+    }
+
+    const uint32_t count = static_cast<uint32_t>(source_materials.size());
+    if (ok) {
+        ChunkMark text = begin_chunk(out, ASURA_CHUNK_TEXTURENAMES, 3, 0, err);
+        ok = append_u32(out, count, err) != ~0ull;
+        for (uint32_t i = 0; ok && i < count; ++i)
+            ok = append_padded_cstr(out, texture_names[i], err);
+        ok = ok && end_chunk(out, text, err);
+    }
+    if (ok) {
+        ChunkMark txfl = begin_chunk(out, ASURA_CHUNK_TEXTUREFLAGS, 1, 0, err);
+        ok = append_u32(out, count, err) != ~0ull;
+        for (uint32_t i = 0; ok && i < count; ++i)
+            ok = append_u32(out, texture_flags[i], err) != ~0ull;
+        ok = ok && end_chunk(out, txfl, err);
+    }
+    if (ok) {
+        ChunkMark mtrl = begin_chunk(out, ASURA_CHUNK_MATERIAL, 1, 0, err);
+        ok = append_u32(out, count, err) != ~0ull;
+        for (uint32_t i = 0; ok && i < count; ++i) {
+            ok = append_u32(out, texture_indices[i] < 0
+                                     ? 0xffffffffu
+                                     : static_cast<uint32_t>(texture_indices[i]), err) != ~0ull &&
+                 append_u32(out, material_flags[i], err) != ~0ull &&
+                 append_u32(out, surface_types[i], err) != ~0ull;
+        }
+        ok = ok && end_chunk(out, mtrl, err);
+    }
+    unmap_file(&material_map.file);
+    return ok;
 }
 
 bool pc_texture_resource(const ChunkList& chunks, Str texture_name, RscfInfo* output);
@@ -8434,6 +8571,84 @@ bool entity_gizmo_smoke() {
     return lines.empty();
 }
 
+bool pc_material_map_roundtrip_smoke(const char* source_path, const char* material_map_path,
+                                     const char* output_path) {
+    struct ExpectedMaterial {
+        std::string texture_name;
+        uint32_t flags = 0;
+        uint32_t texture_flags = 0;
+        uint32_t surface_type = 0;
+    };
+
+    Error err{};
+    Arena arena{};
+    ChunkList source{};
+    MaterialMap material_map{};
+    Config config{};
+    config.material_map = material_map_path;
+    std::vector<PcEnvironmentMaterialBinding> source_materials;
+    std::vector<ExpectedMaterial> expected;
+    uint32_t source_text_chunk = 0xffffffffu;
+    uint32_t source_material_chunk = 0xffffffffu;
+    bool ok = arena_init(&arena, 64 * MiB, &err) &&
+              parse_chunks(source_path, &source, &arena, &err) &&
+              load_material_map(config, &material_map, &arena, &err) &&
+              pc_environment_material_bindings(source, &source_materials, &err) &&
+              pc_environment_material_chunk_indices(source, &source_text_chunk,
+                                                    &source_material_chunk, &err) &&
+              !source_materials.empty();
+    if (ok) {
+        expected.resize(source_materials.size());
+        for (uint32_t i = 0; i < static_cast<uint32_t>(source_materials.size()); ++i) {
+            const Str mapped_name = material_texture_name(material_map, i);
+            const Str expected_name = mapped_name.size ? mapped_name : source_materials[i].texture_name;
+            expected[i].texture_name.assign(expected_name.data ? expected_name.data : "", expected_name.size);
+            expected[i].flags = material_override(
+                material_map, "transparency_flag_by_material_index", i, source_materials[i].flags);
+            expected[i].texture_flags = source_materials[i].texture_flags;
+            expected[i].surface_type = material_override(
+                material_map, "surface_type_by_material_index", i, source_materials[i].surface_type);
+        }
+    }
+    unmap_file(&material_map.file);
+    unmap_file(&source.file);
+    arena_release(&arena);
+
+    Document document;
+    Mesh mesh;
+    std::string why;
+    if (!ok || !load_pc_level(source_path, &document, &mesh, &why))
+        return false;
+    document.material_map = material_map_path;
+    if (!pack_document(document, output_path, &why))
+        return false;
+
+    Arena output_arena{};
+    ChunkList output{};
+    std::vector<PcEnvironmentMaterialBinding> actual;
+    uint32_t actual_text_chunk = 0xffffffffu;
+    uint32_t actual_material_chunk = 0xffffffffu;
+    ok = arena_init(&output_arena, 64 * MiB, &err) &&
+         parse_chunks(output_path, &output, &output_arena, &err) &&
+         pc_environment_material_bindings(output, &actual, &err) &&
+         pc_environment_material_chunk_indices(output, &actual_text_chunk,
+                                               &actual_material_chunk, &err) &&
+         actual.size() == expected.size() && actual_text_chunk == source_text_chunk &&
+         (source_material_chunk == 0xffffffffu || actual_material_chunk == source_material_chunk);
+    for (uint32_t i = 0; ok && i < static_cast<uint32_t>(actual.size()); ++i) {
+        const Str actual_name = actual[i].texture_name;
+        ok = actual_name.size == expected[i].texture_name.size() &&
+             (!actual_name.size ||
+              memcmp(actual_name.data, expected[i].texture_name.data(), actual_name.size) == 0) &&
+             actual[i].flags == expected[i].flags &&
+             actual[i].texture_flags == expected[i].texture_flags &&
+             actual[i].surface_type == expected[i].surface_type;
+    }
+    unmap_file(&output.file);
+    arena_release(&output_arena);
+    return ok;
+}
+
 bool focused_edit_owns_clipboard_shortcut(const MSG& message) {
     if (message.message != WM_KEYDOWN || !(GetKeyState(VK_CONTROL) & 0x8000) ||
         (message.wParam != 'C' && message.wParam != 'V'))
@@ -8452,6 +8667,8 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
     using namespace editor;
     if (__argc == 2 && strcmp(__argv[1], "--entity-gizmo-smoke") == 0)
         return entity_gizmo_smoke() ? 0 : 40;
+    if (__argc == 5 && strcmp(__argv[1], "--pc-material-map-roundtrip") == 0)
+        return pc_material_map_roundtrip_smoke(__argv[2], __argv[3], __argv[4]) ? 0 : 44;
     if (__argc == 2 && strcmp(__argv[1], "--spawn-puppet-smoke") == 0) {
         if (!load_spawn_puppets())
             return 4;
