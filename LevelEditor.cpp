@@ -4967,17 +4967,14 @@ bool gpu_load_skybox(const std::string& directory, std::string* why) {
                                      g.document.skybox.right_texture_is_left_upside_down, why))
         return false;
     gpu.skybox_tint = {1, 1, 1, 1};
-    // Resolve the document's own path stems first. Newer-permutation SKYBs
-    // commonly repeat three files with level-specific names instead of using
-    // the constructor's fr/lf/bk/rt/up convention.
-    constexpr const char* default_stems[] = {"", "fr", "lf", "bk", "rt", "up"};
+    // Resolve exactly the document's path stems. Empty SKYB slots are
+    // intentional, so substituting default names here would make clearing a
+    // path in the properties window leave the old-looking face rendered.
     ID3D11ShaderResourceView* next[6]{};
     ID3D11ShaderResourceView* next_cloud = nullptr;
     uint32_t found = 0;
     for (uint32_t slot = 0; slot < _countof(next); ++slot) {
         std::string stem = skybox_texture_stem(g.document.skybox.texture_paths[slot]);
-        if (stem.empty())
-            stem = default_stems[slot];
         if (stem.empty())
             continue;
         char path[MAX_PATH * 4]{};
@@ -4993,7 +4990,7 @@ bool gpu_load_skybox(const std::string& directory, std::string* why) {
     for (uint32_t slot = 6; slot < ASURA_SKYBOX_V5_V7_TEXTURE_PATH_COUNT && !next_cloud; ++slot) {
         std::string stem = skybox_texture_stem(g.document.skybox.texture_paths[slot]);
         if (stem.empty())
-            stem = "ch_04_sky";
+            continue;
         char cloud_path[MAX_PATH * 4]{};
         if (find_skybox_texture(directory, stem.c_str(), cloud_path, sizeof(cloud_path))) {
             ++found;
@@ -5006,8 +5003,7 @@ bool gpu_load_skybox(const std::string& directory, std::string* why) {
     }
     if (!found) {
         if (why)
-            *why = "The selected folder contains no DDS files matching the SKYB path basenames or "
-                   "the default fr/lf/bk/rt/up/ch_04_sky names.";
+            *why = "The selected folder contains no DDS files matching the SKYB path basenames.";
         return false;
     }
     for (uint32_t i = 0; i < _countof(next); ++i)
@@ -5033,7 +5029,7 @@ bool pc_texture_resource(const ChunkList& chunks, Str skybox_name, RscfInfo* out
     return false;
 }
 
-bool gpu_load_pc_skybox(const std::string& pc_path, std::string* why) {
+bool gpu_load_pc_skybox(const std::string& pc_path, const SkyboxSettings& settings, std::string* why) {
     gpu_release_skybox_textures();
     refresh_scene_animation_timer();
     if (!gpu.ready) {
@@ -5045,36 +5041,42 @@ bool gpu_load_pc_skybox(const std::string& pc_path, std::string* why) {
     Arena arena{};
     ChunkList chunks{};
     bool ok = arena_init(&arena, 8 * MiB, &err) && parse_chunks(pc_path.c_str(), &chunks, &arena, &err);
-    PcSkyboxInfo info{};
+    PcSkyboxInfo source_info{};
     if (ok)
-        ok = pc_skybox_info(chunks, &info, &err);
+        ok = pc_skybox_info(chunks, &source_info, &err);
     if (ok)
-        ok = gpu_rebuild_skybox_vertices(info.orientation,
-                                         info.back_texture_is_front_upside_down,
-                                         info.right_texture_is_left_upside_down, why);
+        ok = gpu_rebuild_skybox_vertices(settings.orientation_radians,
+                                         settings.back_texture_is_front_upside_down,
+                                         settings.right_texture_is_left_upside_down, why);
 
     ID3D11ShaderResourceView* next_faces[6]{};
     ID3D11ShaderResourceView* next_cloud = nullptr;
     uint32_t loaded = 0;
     for (uint32_t slot = 0; ok && slot < 6; ++slot) {
+        const std::string& texture_path = settings.texture_paths[slot];
+        const Str texture_name{texture_path.data(), static_cast<uint32_t>(texture_path.size())};
         RscfInfo resource{};
-        if (!pc_texture_resource(chunks, info.names[slot], &resource))
+        if (!pc_texture_resource(chunks, texture_name, &resource))
             continue;
-        const std::string label(info.names[slot].data, info.names[slot].size);
+        const std::string label(texture_name.data, texture_name.size);
         ok = gpu_create_dds_view_from_memory(resource.payload, resource.payload_size, label.c_str(),
                                              &next_faces[slot], why);
         loaded += ok;
     }
-    if (ok && info.draw_clouds) {
+    if (ok && settings.draw_clouds) {
         RscfInfo resource{};
         uint32_t cloud_slot = 6;
-        bool have_cloud = pc_texture_resource(chunks, info.names[cloud_slot], &resource);
+        const std::string* texture_path = &settings.texture_paths[cloud_slot];
+        Str texture_name{texture_path->data(), static_cast<uint32_t>(texture_path->size())};
+        bool have_cloud = pc_texture_resource(chunks, texture_name, &resource);
         if (!have_cloud) {
             cloud_slot = 7;
-            have_cloud = pc_texture_resource(chunks, info.names[cloud_slot], &resource);
+            texture_path = &settings.texture_paths[cloud_slot];
+            texture_name = {texture_path->data(), static_cast<uint32_t>(texture_path->size())};
+            have_cloud = pc_texture_resource(chunks, texture_name, &resource);
         }
         if (have_cloud) {
-            const std::string label(info.names[cloud_slot].data, info.names[cloud_slot].size);
+            const std::string label(texture_name.data, texture_name.size);
             ok = gpu_create_dds_view_from_memory(resource.payload, resource.payload_size, label.c_str(),
                                                  &next_cloud, why);
             loaded += ok;
@@ -5088,9 +5090,9 @@ bool gpu_load_pc_skybox(const std::string& pc_path, std::string* why) {
         for (uint32_t face = 0; face < 6; ++face)
             gpu.skybox_faces[face] = next_faces[face];
         gpu.skybox_cloud = next_cloud;
-        gpu.skybox_tint = {std::clamp(info.red / 255.0f, 0.0f, 1.0f),
-                           std::clamp(info.green / 255.0f, 0.0f, 1.0f),
-                           std::clamp(info.blue / 255.0f, 0.0f, 1.0f), 1.0f};
+        gpu.skybox_tint = {std::clamp(settings.red / 255.0f, 0.0f, 1.0f),
+                           std::clamp(settings.green / 255.0f, 0.0f, 1.0f),
+                           std::clamp(settings.blue / 255.0f, 0.0f, 1.0f), 1.0f};
         gpu.skybox_active = true;
         refresh_scene_animation_timer();
     } else {
@@ -9057,7 +9059,7 @@ bool open_pc_path(const std::string& path) {
     set_single_selection_state(g.document.entities.empty() ? -1 : 0);
     g.pending_kind = -1;
     std::string skybox_why;
-    const bool skybox_loaded = gpu_load_pc_skybox(path, &skybox_why);
+    const bool skybox_loaded = gpu_load_pc_skybox(path, g.document.skybox, &skybox_why);
     frame_mesh();
     reset_history(true);
     refresh_list();
@@ -9107,7 +9109,7 @@ void command_save_project() {
 bool reload_skybox_preview(bool show_warning) {
     std::string why;
     const bool use_embedded = g.document.sky_texture_dir.empty() && !g.document.source_pc_path.empty();
-    const bool loaded = use_embedded ? gpu_load_pc_skybox(g.document.source_pc_path, &why)
+    const bool loaded = use_embedded ? gpu_load_pc_skybox(g.document.source_pc_path, g.document.skybox, &why)
                                      : gpu_load_skybox(g.document.sky_texture_dir, &why);
     if (loaded) {
         gpu_rebuild_skybox_vertices(g.document.skybox.orientation_radians,
@@ -10102,7 +10104,6 @@ struct SkyboxPropertiesState {
     HWND blue = nullptr;
     HWND orientation = nullptr;
     HWND paths[ASURA_SKYBOX_V5_V7_TEXTURE_PATH_COUNT]{};
-    HWND draw_clouds = nullptr;
     HWND version_6 = nullptr;
     HWND version_7 = nullptr;
     HWND back_flipped = nullptr;
@@ -10161,14 +10162,14 @@ void create_skybox_properties_controls(SkyboxPropertiesState* state) {
         SendMessageA(state->paths[i], EM_SETLIMITTEXT, 4096, 0);
     }
 
-    state->draw_clouds = make_skybox_control(state, "BUTTON", "Draw clouds", BS_AUTOCHECKBOX | WS_TABSTOP,
-                                              ID_SKYBOX_DRAW_CLOUDS, 14, 356, 128, 24);
+    make_skybox_control(state, "STATIC", "Clearing path 6 and 7 disables clouds animation.", SS_LEFT,
+                        0, 14, 359, 332, 22);
     state->version_6 = make_skybox_control(state, "BUTTON", "SKYB format version 6",
                                             BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP,
-                                            ID_SKYBOX_VERSION_6, 158, 356, 166, 24);
+                                            ID_SKYBOX_VERSION_6, 366, 356, 166, 24);
     state->version_7 = make_skybox_control(state, "BUTTON", "SKYB format version 7",
                                             BS_AUTORADIOBUTTON | WS_TABSTOP,
-                                            ID_SKYBOX_VERSION_7, 330, 356, 204, 24);
+                                            ID_SKYBOX_VERSION_7, 538, 356, 204, 24);
     state->back_flipped = make_skybox_control(
         state, "BUTTON", "Back texture is front upside down", BS_AUTOCHECKBOX | WS_TABSTOP,
         ID_SKYBOX_BACK_FLIPPED, 14, 386, 332, 24);
@@ -10194,7 +10195,6 @@ void create_skybox_properties_controls(SkyboxPropertiesState* state) {
     set_float(state->orientation, state->value.orientation_radians);
     for (int i = 0; i < static_cast<int>(_countof(state->paths)); ++i)
         SetWindowTextA(state->paths[i], state->value.texture_paths[i].c_str());
-    SendMessageA(state->draw_clouds, BM_SETCHECK, state->value.draw_clouds ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageA(state->version_6, BM_SETCHECK,
                  state->value.chunk_version == 6 ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageA(state->version_7, BM_SETCHECK,
@@ -10217,7 +10217,6 @@ void apply_skybox_properties(SkyboxPropertiesState* state) {
         GetWindowTextA(state->paths[i], path, sizeof(path));
         state->value.texture_paths[i] = path;
     }
-    state->value.draw_clouds = SendMessageA(state->draw_clouds, BM_GETCHECK, 0, 0) == BST_CHECKED;
     state->value.chunk_version =
         SendMessageA(state->version_6, BM_GETCHECK, 0, 0) == BST_CHECKED ? 6u : 7u;
     state->value.back_texture_is_front_upside_down =
@@ -12028,6 +12027,35 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
             }
         }
 
+        bool skybox_path_removal = false;
+        for (uint32_t face = 0; face < _countof(gpu.skybox_faces); ++face) {
+            if (!gpu.skybox_faces[face] || g.document.skybox.texture_paths[face].empty())
+                continue;
+            std::string original_path = g.document.skybox.texture_paths[face];
+            g.document.skybox.texture_paths[face].clear();
+            skybox_path_removal = reload_skybox_preview(false) && !gpu.skybox_faces[face];
+            g.document.skybox.texture_paths[face] = std::move(original_path);
+            skybox_path_removal = reload_skybox_preview(false) && gpu.skybox_faces[face] &&
+                                  skybox_path_removal;
+            break;
+        }
+
+        SkyboxPropertiesState skybox_properties_test{};
+        skybox_properties_test.value = g.document.skybox;
+        skybox_properties_test.value.draw_clouds = !skybox_properties_test.value.draw_clouds;
+        const bool preserved_cloud_flag = skybox_properties_test.value.draw_clouds;
+        HWND skybox_properties_test_window = CreateWindowExA(
+            WS_EX_TOOLWINDOW, "Asura2005SkyboxProperties", "Skybox properties test", WS_POPUP,
+            0, 0, 830, 565, window, nullptr, GetModuleHandle(nullptr), &skybox_properties_test);
+        bool skybox_cloud_toggle_removed = false;
+        if (skybox_properties_test_window) {
+            apply_skybox_properties(&skybox_properties_test);
+            skybox_cloud_toggle_removed =
+                !GetDlgItem(skybox_properties_test_window, ID_SKYBOX_DRAW_CLOUDS) &&
+                skybox_properties_test.value.draw_clouds == preserved_cloud_flag;
+            DestroyWindow(skybox_properties_test_window);
+        }
+
         const bool original_rain = g.document.rain_enabled;
         SendMessageA(g.rain_toggle, BM_SETCHECK,
                      original_rain ? BST_UNCHECKED : BST_CHECKED, 0);
@@ -12066,6 +12094,7 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
                                                                  g.document.ambient_stream_path.c_str()) == 0;
                                              });
         const bool valid = sorted && pickup_sorted && pickup_switch && skybox_uv &&
+                           skybox_path_removal && skybox_cloud_toggle_removed &&
                            rain_toggled && rain_undo && ambience_ui &&
                            g.document.skybox.chunk_version == 7;
         DestroyWindow(window);
