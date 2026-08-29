@@ -277,6 +277,28 @@ struct Asura_ServerEntity_PhysicalObject_ChunkDataV7 {
     float m_fAnimTimer;
 };
 
+// ENTI classification 0x0007 payload, excluding the common eight-byte ENTI
+// GUID/classification header. Recovered from the 2005 target's static-object
+// v3 -> physical-object v7 reader chain.
+struct Snipe_ServerEntity_StaticObject_ChunkDataV0 {
+    int32_t m_iStaticObjectVersion;
+    uint32_t m_uStaticObjectFlags;
+    int32_t m_iAsuraStaticObjectVersion;
+    int32_t m_iPhysicalObjectVersion;
+    uint32_t m_uTeam;
+    uint32_t m_uSnipePhysicalFlags;
+    uint32_t m_uSnipePhysicalPropertyA;
+    uint32_t m_uSnipePhysicalPropertyB;
+    uint32_t m_uSnipePhysicalPropertyC;
+    uint32_t m_uSnipePhysicalPropertyD;
+    uint32_t m_uSnipePhysicalPropertyE;
+    int32_t m_iAsuraPhysicalObjectVersion;
+    Asura_ServerEntity_PhysicalObject_ChunkDataV7 m_xPhysicalObject;
+    uint32_t m_uNumLinksToBlock;
+};
+static_assert(sizeof(Snipe_ServerEntity_StaticObject_ChunkDataV0) == 0x78,
+              "IDA-recovered static-object layout changed");
+
 // ENTI classification 0x0008 payload, excluding the common eight-byte ENTI
 // GUID/classification header.  Its writer is a chain of Pickup v2, static
 // object v3, Snipe physical object v7, and Asura physical object v7 records.

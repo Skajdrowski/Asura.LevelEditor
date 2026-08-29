@@ -9,6 +9,7 @@
 namespace editor {
 
 inline constexpr size_t kPickupBodySize = sizeof(Snipe_ServerEntity_Pickup_ChunkDataV0);
+inline constexpr size_t kStaticObjectBodySize = sizeof(Snipe_ServerEntity_StaticObject_ChunkDataV0);
 
 enum class EntityKind : uint32_t {
     SpawnPoint,
@@ -17,6 +18,9 @@ enum class EntityKind : uint32_t {
     Pickup,
     AssassinationTarget,
     PositionMarker,
+    StaticObject,
+    BuildingVolume,
+    InvisibleBarrier,
 };
 
 struct Entity {
@@ -56,6 +60,25 @@ struct Entity {
     uint32_t pickup_anim_id = 0;
     uint32_t pickup_anim_file_id = 0;
     std::array<uint8_t, kPickupBodySize> pickup_body{};
+    bool static_object_has_template = false;
+    std::array<uint8_t, kStaticObjectBodySize> static_object_body{};
+    // Invisible barriers are authored as flagged EMOD collision polygons, not
+    // ENTI records.  Source identity lets export remove or replace exactly the
+    // connected polygon component that produced this editor object.
+    bool barrier_source_record = false;
+    uint32_t barrier_source_chunk = 0xffffffffu;
+    uint32_t barrier_source_module = 0xffffffffu;
+    uint32_t barrier_source_component = 0xffffffffu;
+    uint16_t barrier_collision_flags = 0x0340u;
+    uint16_t barrier_collision_material = 0x0015u;
+};
+
+struct StaticObjectTemplate {
+    uint32_t file_id = 0;
+    std::string resource_name;
+    std::string donor_path;
+    uint16_t entity_padding = 0;
+    std::array<uint8_t, kStaticObjectBodySize> body{};
 };
 
 struct PickupTemplate {
@@ -96,9 +119,11 @@ struct Document {
     std::string material_map;
     std::string texture_dir;
     std::string weapons_donor;
+    std::vector<std::string> object_donors;
     std::string sky_texture_dir;
     std::vector<Entity> entities;
     std::vector<PickupTemplate> pickup_templates;
+    std::vector<StaticObjectTemplate> static_object_templates;
     uint32_t next_guid = asura::level::kToolCreatedGuidFirst;
     Asura_Vector_3 light_header_a{80, 80, 80};
     Asura_Vector_3 light_header_b{.3f, .3f, .3f};
@@ -116,6 +141,8 @@ struct Document {
     // True only when every source physical-object ENTI was imported. This
     // makes absence from entities an intentional deletion during export.
     bool source_pickup_inventory_complete = false;
+    bool source_static_object_inventory_complete = false;
+    bool source_barrier_inventory_complete = false;
     bool dirty = false;
 };
 
@@ -137,17 +164,35 @@ struct Mesh {
 struct SpawnPuppetVertex {
     Asura_Vector_3 position{};
     Asura_Vector_3 normal{};
+    Asura_Vector_2 texcoord{};
+};
+
+struct SpawnPuppetMaterial {
+    std::string texture_name;
+    uint32_t flags = 0;
+    uint32_t texture_flags = 0;
+    uint64_t texture_fingerprint = 0;
+    // Preview-only copy of the embedded DDS RSCF. Models are derived runtime
+    // data and are never serialized into an editor project.
+    std::vector<uint8_t> texture_bytes;
 };
 
 struct SpawnPuppet {
     std::string resource_name;
     std::vector<SpawnPuppetVertex> vertices;
     std::vector<std::array<uint16_t, 3>> faces;
+    std::vector<int32_t> face_materials;
+    std::vector<SpawnPuppetMaterial> materials;
     Asura_Vector_3 min{}, max{};
 };
 
 struct PickupModel {
     uint32_t skin_id = 0;
+    SpawnPuppet mesh;
+};
+
+struct StaticObjectModel {
+    uint32_t file_id = 0;
     SpawnPuppet mesh;
 };
 

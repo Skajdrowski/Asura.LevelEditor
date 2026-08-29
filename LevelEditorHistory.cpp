@@ -74,13 +74,27 @@ bool equal(const Entity& a, const Entity& b) {
            equal(a.source_bounds, b.source_bounds) &&
            a.pickup_has_template == b.pickup_has_template &&
            a.pickup_skin_id == b.pickup_skin_id && a.pickup_anim_id == b.pickup_anim_id &&
-           a.pickup_anim_file_id == b.pickup_anim_file_id && a.pickup_body == b.pickup_body;
+           a.pickup_anim_file_id == b.pickup_anim_file_id && a.pickup_body == b.pickup_body &&
+           a.static_object_has_template == b.static_object_has_template &&
+           a.static_object_body == b.static_object_body &&
+           a.barrier_source_record == b.barrier_source_record &&
+           a.barrier_source_chunk == b.barrier_source_chunk &&
+           a.barrier_source_module == b.barrier_source_module &&
+           a.barrier_source_component == b.barrier_source_component &&
+           a.barrier_collision_flags == b.barrier_collision_flags &&
+           a.barrier_collision_material == b.barrier_collision_material;
 }
 
 bool equal(const PickupTemplate& a, const PickupTemplate& b) {
     return a.item_id == b.item_id && equal(a.health, b.health) && a.file_id == b.file_id &&
            a.skin_id == b.skin_id && a.anim_id == b.anim_id &&
            a.anim_file_id == b.anim_file_id && a.entity_padding == b.entity_padding &&
+           a.body == b.body;
+}
+
+bool equal(const StaticObjectTemplate& a, const StaticObjectTemplate& b) {
+    return a.file_id == b.file_id && a.resource_name == b.resource_name &&
+           a.donor_path == b.donor_path && a.entity_padding == b.entity_padding &&
            a.body == b.body;
 }
 
@@ -104,11 +118,16 @@ bool equal_document_content(const Document& a, const Document& b) {
     return a.project_path == b.project_path && a.obj_path == b.obj_path &&
            a.source_pc_path == b.source_pc_path && a.output_path == b.output_path &&
            a.material_map == b.material_map && a.texture_dir == b.texture_dir &&
-           a.weapons_donor == b.weapons_donor && a.sky_texture_dir == b.sky_texture_dir &&
+           a.weapons_donor == b.weapons_donor && a.object_donors == b.object_donors &&
+           a.sky_texture_dir == b.sky_texture_dir &&
            equal_vectors(a.entities, b.entities,
                          [](const Entity& x, const Entity& y) { return equal(x, y); }) &&
            equal_vectors(a.pickup_templates, b.pickup_templates,
                          [](const PickupTemplate& x, const PickupTemplate& y) {
+                             return equal(x, y);
+                         }) &&
+           equal_vectors(a.static_object_templates, b.static_object_templates,
+                         [](const StaticObjectTemplate& x, const StaticObjectTemplate& y) {
                              return equal(x, y);
                          }) &&
            a.next_guid == b.next_guid && equal(a.light_header_a, b.light_header_a) &&
@@ -119,12 +138,16 @@ bool equal_document_content(const Document& a, const Document& b) {
            a.ambient_stream_path == b.ambient_stream_path &&
            equal(a.ambient_volume, b.ambient_volume) &&
            a.ambient_source_record == b.ambient_source_record &&
-           a.source_pickup_inventory_complete == b.source_pickup_inventory_complete;
+           a.source_pickup_inventory_complete == b.source_pickup_inventory_complete &&
+           a.source_static_object_inventory_complete == b.source_static_object_inventory_complete &&
+           a.source_barrier_inventory_complete == b.source_barrier_inventory_complete;
 }
 
 bool authorable(EntityKind kind) {
     return kind == EntityKind::SpawnPoint || kind == EntityKind::Light ||
-           kind == EntityKind::Sound || kind == EntityKind::Pickup;
+           kind == EntityKind::Sound || kind == EntityKind::Pickup ||
+           kind == EntityKind::StaticObject || kind == EntityKind::BuildingVolume ||
+           kind == EntityKind::InvisibleBarrier;
 }
 
 void set_error(std::string* error, const char* message) {
@@ -132,30 +155,49 @@ void set_error(std::string* error, const char* message) {
         *error = message;
 }
 
-bool find_fresh_guid(const Document& document, uint32_t* guid, uint32_t* next_guid) {
+bool find_fresh_guids(const Document& document, size_t requested,
+                      std::vector<uint32_t>* guids, uint32_t* next_guid) {
     constexpr uint32_t first = asura::level::kToolCreatedGuidFirst;
     constexpr uint32_t last = asura::level::kToolCreatedGuidLast;
     constexpr uint32_t count = last - first + 1;
 
+    guids->clear();
+    if (!requested || requested > count)
+        return false;
+    guids->reserve(requested);
     uint32_t candidate = document.next_guid;
     if (candidate < first || candidate > last)
         candidate = first;
-    for (uint32_t attempt = 0; attempt < count; ++attempt) {
-        const bool used = std::any_of(document.entities.begin(), document.entities.end(),
-                                      [candidate](const Entity& entity) {
-                                          return entity.guid == candidate;
-                                      });
-        if (!used) {
-            *guid = candidate;
-            *next_guid = candidate == last ? first : candidate + 1;
-            return true;
+    for (size_t wanted = 0; wanted < requested; ++wanted) {
+        bool found = false;
+        for (uint32_t attempt = 0; attempt < count; ++attempt) {
+            const bool used_by_document = std::any_of(
+                document.entities.begin(), document.entities.end(),
+                [candidate](const Entity& entity) { return entity.guid == candidate; });
+            const bool already_allocated =
+                std::find(guids->begin(), guids->end(), candidate) != guids->end();
+            if (!used_by_document && !already_allocated) {
+                guids->push_back(candidate);
+                candidate = candidate == last ? first : candidate + 1;
+                found = true;
+                break;
+            }
+            candidate = candidate == last ? first : candidate + 1;
         }
-        candidate = candidate == last ? first : candidate + 1;
+        if (!found) {
+            guids->clear();
+            return false;
+        }
     }
-    return false;
+    *next_guid = candidate;
+    return true;
 }
 
 void canonicalize_clone(Entity* entity) {
+    const Asura_Vector_3 bounds_size{
+        entity->source_bounds.MaxX - entity->source_bounds.MinX,
+        entity->source_bounds.MaxY - entity->source_bounds.MinY,
+        entity->source_bounds.MaxZ - entity->source_bounds.MinZ};
     entity->source_entity_record = false;
     entity->source_entity_classification = 0;
     entity->source_bounds = {};
@@ -180,6 +222,26 @@ void canonicalize_clone(Entity* entity) {
         entity->source_entity_classification = SnipeEntityClass_Pickup;
         // pickup_has_template, pickup_body, IDs, padding, and the user-visible
         // asset properties are the recovered authored template and stay intact.
+        break;
+    case EntityKind::StaticObject:
+        entity->source_entity_classification = SnipeEntityClass_StaticObject;
+        break;
+    case EntityKind::BuildingVolume:
+        entity->source_entity_classification = SnipeEntityClass_BuildingVolume;
+        entity->source_bounds = {
+            entity->position.x - bounds_size.x * .5f, entity->position.x + bounds_size.x * .5f,
+            entity->position.y - bounds_size.y * .5f, entity->position.y + bounds_size.y * .5f,
+            entity->position.z - bounds_size.z * .5f, entity->position.z + bounds_size.z * .5f};
+        break;
+    case EntityKind::InvisibleBarrier:
+        entity->barrier_source_record = false;
+        entity->barrier_source_chunk = 0xffffffffu;
+        entity->barrier_source_module = 0xffffffffu;
+        entity->barrier_source_component = 0xffffffffu;
+        entity->source_bounds = {
+            entity->position.x - bounds_size.x * .5f, entity->position.x + bounds_size.x * .5f,
+            entity->position.y - bounds_size.y * .5f, entity->position.y + bounds_size.y * .5f,
+            entity->position.z - bounds_size.z * .5f, entity->position.z + bounds_size.z * .5f};
         break;
     case EntityKind::Light:
     case EntityKind::AssassinationTarget:
@@ -338,33 +400,60 @@ uint64_t LevelEditorHistory::saved_revision() const {
     return saved_revision_;
 }
 
-bool LevelEditorHistory::copy(const Document& document, int selected_index, std::string* error) {
-    if (selected_index < 0 || selected_index >= static_cast<int>(document.entities.size())) {
-        set_error(error, "Select an entity to copy.");
+bool LevelEditorHistory::copy(const Document& document, const std::vector<int>& selected_indices,
+                              std::string* error) {
+    if (selected_indices.empty()) {
+        set_error(error, "Select one or more entities to copy.");
         return false;
     }
-    const Entity& entity = document.entities[static_cast<size_t>(selected_index)];
-    if (!authorable(entity.kind)) {
-        set_error(error, "Imported targets and position markers cannot be authored or pasted.");
+    std::vector<Entity> next;
+    next.reserve(selected_indices.size());
+    std::vector<int> seen;
+    seen.reserve(selected_indices.size());
+    std::optional<EntityKind> kind;
+    for (int selected_index : selected_indices) {
+        if (selected_index < 0 || selected_index >= static_cast<int>(document.entities.size())) {
+            set_error(error, "The selection contains an invalid entity.");
+            return false;
+        }
+        if (std::find(seen.begin(), seen.end(), selected_index) != seen.end())
+            continue;
+        seen.push_back(selected_index);
+        const Entity& entity = document.entities[static_cast<size_t>(selected_index)];
+        if (!authorable(entity.kind)) {
+            set_error(error, "Imported targets and position markers cannot be authored or pasted.");
+            return false;
+        }
+        if (kind && *kind != entity.kind) {
+            set_error(error, "Copying multiple entities is limited to one entity type.");
+            return false;
+        }
+        kind = entity.kind;
+        next.push_back(entity);
+    }
+    if (next.empty()) {
+        set_error(error, "Select one or more entities to copy.");
         return false;
     }
-    clipboard_ = entity;
+    clipboard_ = std::move(next);
     if (error)
         error->clear();
     return true;
 }
 
 bool LevelEditorHistory::can_paste() const {
-    return clipboard_.has_value() && authorable(clipboard_->kind) && !transaction_start_;
+    return !clipboard_.empty() && !transaction_start_;
 }
 
-bool LevelEditorHistory::paste(Document* document, int* selected_index, std::string* error) {
-    if (!document || !selected_index) {
+bool LevelEditorHistory::paste(Document* document, int* selected_index,
+                               std::vector<int>* pasted_indices, std::string* error) {
+    if (!document || !selected_index || !pasted_indices) {
         set_error(error, "Paste requires a document and selection.");
         return false;
     }
-    if (!clipboard_ || !authorable(clipboard_->kind)) {
-        set_error(error, "The clipboard does not contain an authorable entity.");
+    pasted_indices->clear();
+    if (clipboard_.empty()) {
+        set_error(error, "The clipboard does not contain authorable entities.");
         return false;
     }
     if (transaction_start_) {
@@ -372,10 +461,10 @@ bool LevelEditorHistory::paste(Document* document, int* selected_index, std::str
         return false;
     }
 
-    uint32_t guid = 0;
+    std::vector<uint32_t> guids;
     uint32_t following_guid = 0;
-    if (!find_fresh_guid(*document, &guid, &following_guid)) {
-        set_error(error, "No free editor GUID remains for the pasted entity.");
+    if (!find_fresh_guids(*document, clipboard_.size(), &guids, &following_guid)) {
+        set_error(error, "Not enough free editor GUIDs remain for the pasted entities.");
         return false;
     }
 
@@ -384,12 +473,16 @@ bool LevelEditorHistory::paste(Document* document, int* selected_index, std::str
         return false;
     }
 
-    Entity clone = *clipboard_;
-    clone.guid = guid;
-    canonicalize_clone(&clone);
+    pasted_indices->reserve(clipboard_.size());
+    for (size_t index = 0; index < clipboard_.size(); ++index) {
+        Entity clone = clipboard_[index];
+        clone.guid = guids[index];
+        canonicalize_clone(&clone);
+        document->entities.push_back(std::move(clone));
+        pasted_indices->push_back(static_cast<int>(document->entities.size() - 1));
+    }
     document->next_guid = following_guid;
-    document->entities.push_back(std::move(clone));
-    *selected_index = static_cast<int>(document->entities.size() - 1);
+    *selected_index = pasted_indices->back();
     const bool committed = commit(document, *selected_index);
     if (!committed) {
         cancel_transaction();
@@ -402,7 +495,7 @@ bool LevelEditorHistory::paste(Document* document, int* selected_index, std::str
 }
 
 void LevelEditorHistory::clear_clipboard() {
-    clipboard_.reset();
+    clipboard_.clear();
 }
 
 } // namespace editor

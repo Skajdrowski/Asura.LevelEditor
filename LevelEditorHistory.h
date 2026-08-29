@@ -40,11 +40,13 @@ public:
     uint64_t current_revision() const;
     uint64_t saved_revision() const;
 
-    // The clipboard deliberately contains only authorable entities.  Paste is
-    // an atomic history transaction and selects the newly appended clone.
-    bool copy(const Document& document, int selected_index, std::string* error = nullptr);
+    // The clipboard deliberately contains only authorable, same-type entities.
+    // A multi-entity paste is one atomic history transaction.
+    bool copy(const Document& document, const std::vector<int>& selected_indices,
+              std::string* error = nullptr);
     bool can_paste() const;
-    bool paste(Document* document, int* selected_index, std::string* error = nullptr);
+    bool paste(Document* document, int* selected_index, std::vector<int>* pasted_indices,
+               std::string* error = nullptr);
     void clear_clipboard();
 
 private:
@@ -64,7 +66,7 @@ private:
     std::vector<Snapshot> undo_;
     std::vector<Snapshot> redo_;
     std::optional<Snapshot> transaction_start_;
-    std::optional<Entity> clipboard_;
+    std::vector<Entity> clipboard_;
     uint64_t current_revision_ = 1;
     uint64_t saved_revision_ = 1;
     uint64_t next_revision_ = 2;

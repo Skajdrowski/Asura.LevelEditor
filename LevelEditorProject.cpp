@@ -12,7 +12,7 @@ namespace editor {
 namespace {
 
 constexpr char kProjectMagic[8] = {'A', 'L', 'E', 'V', '2', '0', '0', '5'};
-constexpr uint32_t kProjectVersion = 12;
+constexpr uint32_t kProjectVersion = 15;
 
 struct BinaryWriter {
     std::vector<uint8_t> bytes;
@@ -264,6 +264,19 @@ bool save_project(const Document& document, const char* path, std::string* why) 
     writer.str(document.ambient_stream_path);
     writer.f32(document.ambient_volume);
     writer.u32(document.ambient_source_record ? 1u : 0u);
+    writer.u32(document.source_static_object_inventory_complete ? 1u : 0u);
+    writer.u32(document.source_barrier_inventory_complete ? 1u : 0u);
+    writer.u32(static_cast<uint32_t>(document.object_donors.size()));
+    for (const std::string& donor : document.object_donors)
+        writer.str(donor);
+    writer.u32(static_cast<uint32_t>(document.static_object_templates.size()));
+    for (const StaticObjectTemplate& object : document.static_object_templates) {
+        writer.u32(object.file_id);
+        writer.str(object.resource_name);
+        writer.str(object.donor_path);
+        writer.u32(object.entity_padding);
+        writer.raw(object.body.data(), object.body.size());
+    }
     writer.u32(static_cast<uint32_t>(document.entities.size()));
     for (const Entity& entity : document.entities) {
         writer.u32(static_cast<uint32_t>(entity.kind));
@@ -300,7 +313,8 @@ bool save_project(const Document& document, const char* path, std::string* why) 
             write_phonon(writer, entity.sound_phonon);
         }
         if (entity.kind == EntityKind::Pickup || entity.kind == EntityKind::AssassinationTarget ||
-            entity.kind == EntityKind::PositionMarker) {
+            entity.kind == EntityKind::PositionMarker || entity.kind == EntityKind::StaticObject ||
+            entity.kind == EntityKind::BuildingVolume || entity.kind == EntityKind::InvisibleBarrier) {
             writer.u32(entity.source_entity_record ? 1u : 0u);
             writer.u32(entity.source_entity_classification);
             writer.f32(entity.source_bounds.MinX);
@@ -316,6 +330,18 @@ bool save_project(const Document& document, const char* path, std::string* why) 
             writer.u32(entity.pickup_anim_id);
             writer.u32(entity.pickup_anim_file_id);
             writer.raw(entity.pickup_body.data(), entity.pickup_body.size());
+        }
+        if (entity.kind == EntityKind::StaticObject) {
+            writer.u32(entity.static_object_has_template ? 1u : 0u);
+            writer.raw(entity.static_object_body.data(), entity.static_object_body.size());
+        }
+        if (entity.kind == EntityKind::InvisibleBarrier) {
+            writer.u32(entity.barrier_source_record ? 1u : 0u);
+            writer.u32(entity.barrier_source_chunk);
+            writer.u32(entity.barrier_source_module);
+            writer.u32(entity.barrier_source_component);
+            writer.u32(entity.barrier_collision_flags);
+            writer.u32(entity.barrier_collision_material);
         }
     }
 
@@ -421,6 +447,30 @@ bool load_project(Document* document, const char* path, std::string* why) {
                 }
             }
         }
+        if (project_version >= 13) {
+            next.source_static_object_inventory_complete = reader.u32() != 0;
+            if (project_version >= 15)
+                next.source_barrier_inventory_complete = reader.u32() != 0;
+            const uint32_t donor_count = reader.u32();
+            if (donor_count > 256)
+                reader.ok = false;
+            next.object_donors.reserve(reader.ok ? donor_count : 0);
+            for (uint32_t index = 0; index < donor_count && reader.ok; ++index)
+                next.object_donors.push_back(reader.str());
+            const uint32_t object_template_count = reader.u32();
+            if (object_template_count > 100000)
+                reader.ok = false;
+            next.static_object_templates.reserve(reader.ok ? object_template_count : 0);
+            for (uint32_t index = 0; index < object_template_count && reader.ok; ++index) {
+                StaticObjectTemplate object;
+                object.file_id = reader.u32();
+                object.resource_name = reader.str();
+                object.donor_path = reader.str();
+                object.entity_padding = static_cast<uint16_t>(reader.u32());
+                reader.raw(object.body.data(), object.body.size());
+                next.static_object_templates.push_back(std::move(object));
+            }
+        }
     }
     if (project_version <= 4)
         skip_legacy_project_records(reader);
@@ -437,11 +487,24 @@ bool load_project(Document* document, const char* path, std::string* why) {
                                           ? 3u
                                           : project_version <= 7
                                                 ? static_cast<uint32_t>(EntityKind::Sound)
-                                                : static_cast<uint32_t>(EntityKind::PositionMarker);
+                                                : project_version <= 12
+                                                      ? static_cast<uint32_t>(EntityKind::PositionMarker)
+                                                      : project_version <= 13
+                                                            ? static_cast<uint32_t>(EntityKind::StaticObject)
+                                                            : project_version <= 14
+                                                                  ? static_cast<uint32_t>(EntityKind::BuildingVolume)
+                                                                  : static_cast<uint32_t>(EntityKind::InvisibleBarrier);
         if (kind > maximum_kind)
             reader.ok = false;
-        const bool supported = kind <= (project_version <= 7 ? static_cast<uint32_t>(EntityKind::Sound)
-                                                             : static_cast<uint32_t>(EntityKind::PositionMarker));
+        const bool supported = kind <= (project_version <= 7
+                                             ? static_cast<uint32_t>(EntityKind::Sound)
+                                             : project_version <= 12
+                                                   ? static_cast<uint32_t>(EntityKind::PositionMarker)
+                                                   : project_version <= 13
+                                                         ? static_cast<uint32_t>(EntityKind::StaticObject)
+                                                         : project_version <= 14
+                                                               ? static_cast<uint32_t>(EntityKind::BuildingVolume)
+                                                               : static_cast<uint32_t>(EntityKind::InvisibleBarrier));
         if (supported)
             entity.kind = static_cast<EntityKind>(kind);
         entity.name = reader.str();
@@ -491,6 +554,18 @@ bool load_project(Document* document, const char* path, std::string* why) {
             entity.pickup_anim_id = reader.u32();
             entity.pickup_anim_file_id = reader.u32();
             reader.raw(entity.pickup_body.data(), entity.pickup_body.size());
+        }
+        if (project_version >= 13 && kind == static_cast<uint32_t>(EntityKind::StaticObject)) {
+            entity.static_object_has_template = reader.u32() != 0;
+            reader.raw(entity.static_object_body.data(), entity.static_object_body.size());
+        }
+        if (project_version >= 15 && kind == static_cast<uint32_t>(EntityKind::InvisibleBarrier)) {
+            entity.barrier_source_record = reader.u32() != 0;
+            entity.barrier_source_chunk = reader.u32();
+            entity.barrier_source_module = reader.u32();
+            entity.barrier_source_component = reader.u32();
+            entity.barrier_collision_flags = static_cast<uint16_t>(reader.u32());
+            entity.barrier_collision_material = static_cast<uint16_t>(reader.u32());
         }
         if (supported)
             next.entities.push_back(std::move(entity));

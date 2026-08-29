@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <cfloat>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -256,6 +257,257 @@ bool decode_pc_environment(const RscfInfo& resource, Mesh* mesh, Arena* arena, E
     return true;
 }
 
+constexpr uint16_t kPcInvisibleBarrierCollisionMask = 0x0340u;
+
+struct PcCollisionView {
+    const uint8_t* data = nullptr;
+    uint32_t size = 0;
+    uint32_t vertex_count = 0;
+    uint32_t polygon_count = 0;
+    bool per_polygon_flags = false;
+    bool per_polygon_materials = false;
+    uint16_t overall_flags = 0;
+    uint16_t overall_material = 0xffffu;
+    uint64_t vertices_at = 0;
+    uint64_t polygons_at = 0;
+    uint64_t flags_at = 0;
+    uint64_t materials_at = 0;
+    uint64_t required = 0;
+};
+
+struct PcBarrierComponent {
+    std::vector<uint32_t> polygons;
+    Asura_Bounding_Box bounds{};
+    uint16_t flags = kPcInvisibleBarrierCollisionMask;
+    uint16_t material = 0x0015u;
+};
+
+bool pc_collision_view(const uint8_t* collision, uint32_t collision_size,
+                       PcCollisionView* view, Error* err, uint32_t module_index) {
+    if (collision_size < 52 || read_u32(collision) != 3)
+        return false;
+    PcCollisionView next{};
+    next.data = collision;
+    next.size = collision_size;
+    next.vertex_count = read_u32(collision + 4);
+    next.polygon_count = read_u32(collision + 8);
+    next.per_polygon_flags = read_u32(collision + 12) != 0;
+    next.per_polygon_materials = read_u32(collision + 16) != 0;
+    next.overall_flags = read_u16(collision + 20);
+    next.overall_material = read_u16(collision + 22);
+    next.vertices_at = 52;
+    next.polygons_at = next.vertices_at + static_cast<uint64_t>(next.vertex_count) * 12;
+    next.flags_at = next.polygons_at + static_cast<uint64_t>(next.polygon_count) * 8;
+    next.materials_at = next.flags_at +
+                        (next.per_polygon_flags ? static_cast<uint64_t>(next.polygon_count) * 2 : 0);
+    next.required = next.materials_at +
+                    (next.per_polygon_materials ? static_cast<uint64_t>(next.polygon_count) * 2 : 0);
+    if (next.required > collision_size) {
+        fail(err, "the .PC EMOD collision arrays for module %u are truncated", module_index);
+        return false;
+    }
+    *view = next;
+    return true;
+}
+
+uint16_t pc_collision_polygon_flags(const PcCollisionView& view, uint32_t polygon) {
+    return view.per_polygon_flags
+               ? read_u16(view.data + view.flags_at + static_cast<uint64_t>(polygon) * 2)
+               : view.overall_flags;
+}
+
+uint16_t pc_collision_polygon_material(const PcCollisionView& view, uint32_t polygon) {
+    return view.per_polygon_materials
+               ? read_u16(view.data + view.materials_at + static_cast<uint64_t>(polygon) * 2)
+               : view.overall_material;
+}
+
+bool pc_barrier_components(const PcCollisionView& view, const Asura_Vector_3& translation,
+                           std::vector<PcBarrierComponent>* components, Error* err,
+                           uint32_t module_index) {
+    std::vector<int32_t> parent(view.vertex_count, -1);
+    auto root = [&](uint32_t vertex) {
+        uint32_t current = vertex;
+        while (parent[current] != static_cast<int32_t>(current)) {
+            parent[current] = parent[static_cast<uint32_t>(parent[current])];
+            current = static_cast<uint32_t>(parent[current]);
+        }
+        return current;
+    };
+    auto unite = [&](uint32_t first, uint32_t second) {
+        if (parent[first] < 0)
+            parent[first] = static_cast<int32_t>(first);
+        if (parent[second] < 0)
+            parent[second] = static_cast<int32_t>(second);
+        const uint32_t first_root = root(first), second_root = root(second);
+        if (first_root != second_root)
+            parent[second_root] = static_cast<int32_t>(first_root);
+    };
+
+    std::vector<uint32_t> barrier_polygons;
+    for (uint32_t polygon_index = 0; polygon_index < view.polygon_count; ++polygon_index) {
+        const uint16_t flags = pc_collision_polygon_flags(view, polygon_index);
+        if ((flags & kPcInvisibleBarrierCollisionMask) != kPcInvisibleBarrierCollisionMask)
+            continue;
+        std::array<uint16_t, 4> vertices{};
+        memcpy(vertices.data(), view.data + view.polygons_at + static_cast<uint64_t>(polygon_index) * 8,
+               sizeof(vertices));
+        if (vertices[0] >= view.vertex_count || vertices[1] >= view.vertex_count ||
+            vertices[2] >= view.vertex_count ||
+            (vertices[3] != 0xffffu && vertices[3] >= view.vertex_count))
+            return fail(err, "the .PC invisible barrier in module %u has an invalid vertex", module_index);
+        unite(vertices[0], vertices[1]);
+        unite(vertices[1], vertices[2]);
+        if (vertices[3] != 0xffffu)
+            unite(vertices[2], vertices[3]);
+        barrier_polygons.push_back(polygon_index);
+    }
+
+    std::vector<int32_t> component_slot(view.vertex_count, -1);
+    for (uint32_t polygon_index : barrier_polygons) {
+        std::array<uint16_t, 4> polygon{};
+        memcpy(polygon.data(), view.data + view.polygons_at + static_cast<uint64_t>(polygon_index) * 8,
+               sizeof(polygon));
+        const uint32_t component = root(polygon[0]);
+        int32_t& slot = component_slot[component];
+        if (slot < 0) {
+            slot = static_cast<int32_t>(components->size());
+            PcBarrierComponent next{};
+            next.flags = pc_collision_polygon_flags(view, polygon_index);
+            next.material = pc_collision_polygon_material(view, polygon_index);
+            components->push_back(std::move(next));
+        }
+        PcBarrierComponent& output = (*components)[slot];
+        output.polygons.push_back(polygon_index);
+        for (uint16_t vertex : polygon) {
+            if (vertex == 0xffffu)
+                continue;
+            const uint8_t* source = view.data + view.vertices_at + static_cast<uint64_t>(vertex) * 12;
+            const Asura_Vector_3 position{read_f32(source) + translation.x,
+                                          read_f32(source + 4) + translation.y,
+                                          read_f32(source + 8) + translation.z};
+            if (!isfinite(position.x) || !isfinite(position.y) || !isfinite(position.z))
+                return fail(err, "the .PC invisible barrier in module %u is non-finite", module_index);
+            if (output.polygons.size() == 1 && vertex == polygon[0]) {
+                output.bounds = {position.x, position.x, position.y, position.y,
+                                 position.z, position.z};
+            } else {
+                output.bounds.MinX = fminf(output.bounds.MinX, position.x);
+                output.bounds.MaxX = fmaxf(output.bounds.MaxX, position.x);
+                output.bounds.MinY = fminf(output.bounds.MinY, position.y);
+                output.bounds.MaxY = fmaxf(output.bounds.MaxY, position.y);
+                output.bounds.MinZ = fminf(output.bounds.MinZ, position.z);
+                output.bounds.MaxZ = fmaxf(output.bounds.MaxZ, position.z);
+            }
+        }
+    }
+    return true;
+}
+
+void make_pc_barrier_entity(const PcBarrierComponent& component, uint32_t chunk_index,
+                            uint32_t module_index, uint32_t component_index,
+                            uint32_t number, Entity* entity) {
+    *entity = {};
+    entity->kind = EntityKind::InvisibleBarrier;
+    entity->name = "Invisible barrier " + std::to_string(number);
+    entity->position = {(component.bounds.MinX + component.bounds.MaxX) * .5f,
+                        (component.bounds.MinY + component.bounds.MaxY) * .5f,
+                        (component.bounds.MinZ + component.bounds.MaxZ) * .5f};
+    Asura_Vector_3 size{component.bounds.MaxX - component.bounds.MinX,
+                        component.bounds.MaxY - component.bounds.MinY,
+                        component.bounds.MaxZ - component.bounds.MinZ};
+    const float largest = fmaxf(size.x, fmaxf(size.y, size.z));
+    const float preview_thickness = fmaxf(.1f, largest * .01f);
+    if (size.x < preview_thickness)
+        size.x = preview_thickness;
+    if (size.y < preview_thickness)
+        size.y = preview_thickness;
+    if (size.z < preview_thickness)
+        size.z = preview_thickness;
+    entity->source_bounds = {entity->position.x - size.x * .5f, entity->position.x + size.x * .5f,
+                             entity->position.y - size.y * .5f, entity->position.y + size.y * .5f,
+                             entity->position.z - size.z * .5f, entity->position.z + size.z * .5f};
+    entity->value_a = size.x;
+    entity->value_b = size.z;
+    entity->barrier_source_record = true;
+    entity->barrier_source_chunk = chunk_index;
+    entity->barrier_source_module = module_index;
+    entity->barrier_source_component = component_index;
+    entity->barrier_collision_flags = component.flags;
+    entity->barrier_collision_material = component.material;
+}
+
+bool decode_pc_invisible_barriers(const ChunkList& chunks, Document* document, Error* err) {
+    uint32_t barrier_number = 0;
+    for (uint32_t chunk_index = 0; chunk_index < chunks.count; ++chunk_index) {
+        const ChunkRef& chunk = chunks.chunks[chunk_index];
+        if (chunk.cid != ASURA_CHUNK_ENVIRONMENT_MODULELIST || chunk.version != 6)
+            continue;
+        if (chunk.size < sizeof(Asura_Chunk_Header) + sizeof(uint32_t))
+            return fail(err, "the .PC EMOD chunk is truncated");
+
+        const uint32_t module_count = read_u32(chunk.data + sizeof(Asura_Chunk_Header));
+        uint64_t at = sizeof(Asura_Chunk_Header) + sizeof(uint32_t);
+        const Str environment_name = padded_string_at(chunk.data, chunk.size, static_cast<uint32_t>(at));
+        if (!environment_name.data)
+            return fail(err, "the .PC EMOD environment name is truncated");
+        at += align_up(static_cast<uint64_t>(environment_name.size) + 1, 4);
+
+        for (uint32_t module_index = 0; module_index < module_count; ++module_index) {
+            if (at > UINT32_MAX)
+                return fail(err, "the .PC EMOD module table is invalid");
+            const Str module_name = padded_string_at(chunk.data, chunk.size, static_cast<uint32_t>(at));
+            if (!module_name.data)
+                return fail(err, "the .PC EMOD module name is truncated");
+            at += align_up(static_cast<uint64_t>(module_name.size) + 1, 4);
+            if (at + sizeof(Asura_Chunk_Environment_ModuleList_EntryV6) > chunk.size)
+                return fail(err, "the .PC EMOD module %u is truncated", module_index);
+
+            Asura_Chunk_Environment_ModuleList_EntryV6 module{};
+            memcpy(&module, chunk.data + at, sizeof(module));
+            at += sizeof(module);
+            if (module.m_uCollisionDataSize > chunk.size - at)
+                return fail(err, "the .PC EMOD collision module %u is truncated", module_index);
+
+            const uint8_t* collision = chunk.data + at;
+            const uint32_t collision_size = module.m_uCollisionDataSize;
+            at += collision_size;
+            PcCollisionView view{};
+            if (!pc_collision_view(collision, collision_size, &view, err, module_index)) {
+                if (err->set)
+                    return false;
+                continue;
+            }
+            std::vector<PcBarrierComponent> components;
+            if (!pc_barrier_components(view, module.m_xTranslation, &components, err, module_index))
+                return false;
+            for (uint32_t component_index = 0; component_index < components.size(); ++component_index) {
+                Entity entity;
+                make_pc_barrier_entity(components[component_index], chunk_index, module_index,
+                                       component_index, ++barrier_number, &entity);
+                uint32_t candidate = document->next_guid;
+                for (;;) {
+                    bool used = false;
+                    for (const Entity& existing : document->entities)
+                        used |= existing.guid == candidate;
+                    if (!used)
+                        break;
+                    candidate = candidate == asura::level::kToolCreatedGuidLast
+                                    ? asura::level::kToolCreatedGuidFirst
+                                    : candidate + 1;
+                }
+                entity.guid = candidate;
+                document->next_guid = candidate == asura::level::kToolCreatedGuidLast
+                                          ? asura::level::kToolCreatedGuidFirst
+                                          : candidate + 1;
+                document->entities.push_back(std::move(entity));
+            }
+        }
+    }
+    document->source_barrier_inventory_complete = true;
+    return true;
+}
+
 const RscfInfo* find_pc_environment(const ChunkList& chunks, RscfInfo* storage) {
     bool have_fallback = false;
     RscfInfo fallback{};
@@ -414,6 +666,327 @@ uint32_t asura_lower_name_hash(const std::string& name) {
     return asura_lower_name_hash(Str{name.data(), static_cast<uint32_t>(name.size())});
 }
 
+bool valid_static_object_body(const Snipe_ServerEntity_StaticObject_ChunkDataV0& body) {
+    return body.m_iStaticObjectVersion == 3 && body.m_iAsuraStaticObjectVersion == 0 &&
+           body.m_iPhysicalObjectVersion == 7 && body.m_iAsuraPhysicalObjectVersion == 7;
+}
+
+StaticObjectTemplate make_canonical_static_object_template(uint32_t file_id, Str resource_name,
+                                                            const std::string& donor_path) {
+    StaticObjectTemplate object;
+    object.file_id = file_id;
+    object.resource_name.assign(resource_name.data, resource_name.size);
+    object.donor_path = donor_path;
+    Snipe_ServerEntity_StaticObject_ChunkDataV0 body{};
+    body.m_iStaticObjectVersion = 3;
+    body.m_iAsuraStaticObjectVersion = 0;
+    body.m_iPhysicalObjectVersion = 7;
+    body.m_uSnipePhysicalPropertyA = 999;
+    body.m_uSnipePhysicalPropertyC = 999;
+    body.m_uSnipePhysicalPropertyD = 999;
+    body.m_iAsuraPhysicalObjectVersion = 7;
+    body.m_xPhysicalObject.m_xOrientation.w = 1.0f;
+    body.m_xPhysicalObject.m_fHealth = 100.0f;
+    body.m_xPhysicalObject.m_uFileID = file_id;
+    body.m_xPhysicalObject.m_iAnimFlags = 1;
+    body.m_xPhysicalObject.m_iBBIndex = -1;
+    body.m_xPhysicalObject.m_uStateBits = 0x40;
+    body.m_xPhysicalObject.m_uPhysicalObjectFlags = 2;
+    memcpy(object.body.data(), &body, sizeof(body));
+    return object;
+}
+
+std::string static_object_resource_name(const ChunkList& chunks, uint32_t file_id, uint32_t skin_id) {
+    for (uint32_t i = 0; i < chunks.count; ++i) {
+        RscfInfo resource{};
+        if (!rscf_info(chunks.chunks[i], &resource) ||
+            resource.type != ASURA_RESOURCEFILE_TYPE_PLATFORMSPECIFIC)
+            continue;
+        if (resource.subtype == ASURA_RESOURCEFILE_TYPE_PC_OBJECT && resource.payload_size >= 4 &&
+            read_u32(resource.payload) == file_id)
+            return std::string(resource.name.data, resource.name.size);
+        if (resource.subtype == ASURA_RESOURCEFILE_TYPE_PC_OBJECTHIERARCHY && skin_id &&
+            asura_lower_name_hash(resource.name) == skin_id)
+            return std::string(resource.name.data, resource.name.size);
+    }
+    return {};
+}
+
+StaticObjectTemplate static_object_template_from_entity(const Entity& entity, const std::string& donor_path) {
+    Snipe_ServerEntity_StaticObject_ChunkDataV0 body{};
+    memcpy(&body, entity.static_object_body.data(), sizeof(body));
+    StaticObjectTemplate object = make_canonical_static_object_template(
+        entity.value_u32_b, Str{entity.name.data(), static_cast<uint32_t>(entity.name.size())}, donor_path);
+    object.entity_padding = entity.entity_padding;
+    if (entity.static_object_has_template && valid_static_object_body(body) && !body.m_uNumLinksToBlock)
+        object.body = entity.static_object_body;
+    return object;
+}
+
+void note_static_object_template(Document* document, const Entity& entity, const std::string& donor_path = {}) {
+    for (const StaticObjectTemplate& object : document->static_object_templates)
+        if (object.file_id == entity.value_u32_b)
+            return;
+    document->static_object_templates.push_back(static_object_template_from_entity(entity, donor_path));
+}
+
+bool decode_pc_model_materials(const ChunkList& chunks, uint32_t before_chunk,
+                               std::vector<SpawnPuppetMaterial>* output, Error* err) {
+    struct MaterialRecord {
+        int32_t texture_index = -1;
+        uint32_t flags = 0;
+        uint32_t texture_flags = 0;
+    };
+    std::vector<std::string> texture_names;
+    std::vector<uint32_t> texture_flags;
+    std::vector<MaterialRecord> materials;
+    for (uint32_t chunk_index = 0; chunk_index < before_chunk; ++chunk_index) {
+        const ChunkRef& chunk = chunks.chunks[chunk_index];
+        if (chunk.cid == ASURA_CHUNK_TEXTURENAMES) {
+            if (chunk.version > 3 || chunk.size < sizeof(Asura_Chunk_TextureNames))
+                return fail(err, "Object preview encountered an unsupported or truncated TEXT chunk");
+            const uint32_t count = read_u32(chunk.data + sizeof(Asura_Chunk_Header));
+            texture_names.clear();
+            texture_names.reserve(count);
+            texture_flags.assign(count, 0);
+            uint64_t at = sizeof(Asura_Chunk_TextureNames);
+            for (uint32_t texture_index = 0; texture_index < count; ++texture_index) {
+                if (at > chunk.size)
+                    return fail(err, "Object preview TEXT table is truncated");
+                const Str name = padded_string_at(chunk.data, chunk.size, static_cast<uint32_t>(at));
+                if (!name.data)
+                    return fail(err, "Object preview TEXT string is unterminated");
+                texture_names.emplace_back(name.data, name.size);
+                at = align_up(at + name.size + 1, 4);
+            }
+            if (chunk.version < 3) {
+                materials.assign(count, {});
+                for (uint32_t texture_index = 0; texture_index < count; ++texture_index)
+                    materials[texture_index].texture_index = static_cast<int32_t>(texture_index);
+            }
+        } else if (chunk.cid == ASURA_CHUNK_TEXTUREFLAGS) {
+            if (chunk.version > 1 || chunk.size < sizeof(Asura_Chunk_Header) + sizeof(uint32_t))
+                return fail(err, "Object preview encountered an unsupported or truncated TXFL chunk");
+            const uint32_t count = read_u32(chunk.data + sizeof(Asura_Chunk_Header));
+            const uint64_t values_at = sizeof(Asura_Chunk_Header) + sizeof(uint32_t);
+            if (count > (chunk.size - values_at) / sizeof(uint32_t) || count > texture_flags.size())
+                return fail(err, "Object preview TXFL table exceeds its TEXT table");
+            for (uint32_t texture_index = 0; texture_index < count; ++texture_index) {
+                uint32_t value = read_u32(chunk.data + values_at + texture_index * sizeof(uint32_t));
+                if (!chunk.version) {
+                    if (texture_index < materials.size())
+                        materials[texture_index].flags |= value & 0xDE87u;
+                    value &= 0xFFFF2178u;
+                }
+                texture_flags[texture_index] |= value;
+            }
+        } else if (chunk.cid == ASURA_CHUNK_MATERIAL) {
+            if (chunk.version > 1 || chunk.size < sizeof(Asura_Chunk_Header) + sizeof(uint32_t))
+                return fail(err, "Object preview encountered an unsupported or truncated MTRL chunk");
+            const uint32_t count = read_u32(chunk.data + sizeof(Asura_Chunk_Header));
+            const uint32_t stride = chunk.version ? sizeof(Asura_PC_Material_V1) : 8u;
+            const uint64_t records_at = sizeof(Asura_Chunk_Header) + sizeof(uint32_t);
+            if (count > (chunk.size - records_at) / stride)
+                return fail(err, "Object preview MTRL table is truncated");
+            materials.assign(count, {});
+            for (uint32_t material_index = 0; material_index < count; ++material_index) {
+                const uint8_t* record = chunk.data + records_at + static_cast<uint64_t>(material_index) * stride;
+                materials[material_index].texture_index = static_cast<int32_t>(read_u32(record));
+                materials[material_index].flags = read_u32(record + 4);
+            }
+        }
+    }
+
+    output->assign(materials.size(), {});
+    for (uint32_t material_index = 0; material_index < materials.size(); ++material_index) {
+        const MaterialRecord& source = materials[material_index];
+        SpawnPuppetMaterial& material = (*output)[material_index];
+        material.flags = source.flags;
+        if (source.texture_index < 0 || static_cast<uint32_t>(source.texture_index) >= texture_names.size())
+            continue;
+        material.texture_name = texture_names[source.texture_index];
+        if (static_cast<uint32_t>(source.texture_index) < texture_flags.size())
+            material.texture_flags = texture_flags[source.texture_index];
+        const Str wanted{material.texture_name.data(), static_cast<uint32_t>(material.texture_name.size())};
+        for (uint32_t resource_index = 0; resource_index < chunks.count; ++resource_index) {
+            RscfInfo texture{};
+            if (!rscf_info(chunks.chunks[resource_index], &texture) ||
+                texture.type != ASURA_RESOURCEFILE_TYPE_TEXTURE ||
+                !text_name_matches_resource(wanted, texture.name))
+                continue;
+            material.texture_bytes.assign(texture.payload, texture.payload + texture.payload_size);
+            material.texture_fingerprint = 1469598103934665603ull;
+            for (uint8_t byte : material.texture_bytes) {
+                material.texture_fingerprint ^= byte;
+                material.texture_fingerprint *= 1099511628211ull;
+            }
+            break;
+        }
+    }
+    return true;
+}
+
+bool decode_pc_static_object_model(const ChunkList& chunks, uint32_t chunk_index,
+                                   const RscfInfo& resource, StaticObjectModel* output, Error* err) {
+    constexpr uint32_t header_size = 20;
+    constexpr uint32_t vertex_stride = 32;
+    if (resource.type != ASURA_RESOURCEFILE_TYPE_PLATFORMSPECIFIC ||
+        resource.subtype != ASURA_RESOURCEFILE_TYPE_PC_OBJECT || resource.payload_size < header_size)
+        return false;
+    const uint32_t file_id = read_u32(resource.payload);
+    const uint32_t triangle_count = read_u32(resource.payload + 4);
+    const uint32_t vertex_count = read_u32(resource.payload + 8);
+    const uint32_t index_count = read_u32(resource.payload + 12);
+    const uint64_t indices_at = header_size + static_cast<uint64_t>(vertex_count) * vertex_stride;
+    const uint64_t required = indices_at + static_cast<uint64_t>(index_count) * sizeof(uint16_t) + 8;
+    if (!triangle_count || !vertex_count)
+        return false;
+    if (vertex_count > 65535 || index_count < 3 || triangle_count > index_count - 2 ||
+        required > resource.payload_size)
+        return fail(err, "Object resource '%.*s' has invalid geometry counts", resource.name.size,
+                    resource.name.data);
+
+    StaticObjectModel next;
+    next.file_id = file_id;
+    next.mesh.resource_name.assign(resource.name.data, resource.name.size);
+    if (!decode_pc_model_materials(chunks, chunk_index, &next.mesh.materials, err))
+        return false;
+    next.mesh.vertices.resize(vertex_count);
+    for (uint32_t i = 0; i < vertex_count; ++i) {
+        const uint8_t* source = resource.payload + header_size + static_cast<uint64_t>(i) * vertex_stride;
+        SpawnPuppetVertex& vertex = next.mesh.vertices[i];
+        vertex.position = {read_f32(source), read_f32(source + 4), read_f32(source + 8)};
+        vertex.normal = {read_f32(source + 12), read_f32(source + 16), read_f32(source + 20)};
+        vertex.texcoord = {read_f32(source + 24), read_f32(source + 28)};
+        if (!isfinite(vertex.position.x) || !isfinite(vertex.position.y) || !isfinite(vertex.position.z) ||
+            !isfinite(vertex.normal.x) || !isfinite(vertex.normal.y) || !isfinite(vertex.normal.z) ||
+            !isfinite(vertex.texcoord.x) || !isfinite(vertex.texcoord.y))
+            return fail(err, "Object resource '%.*s' contains non-finite vertices", resource.name.size,
+                        resource.name.data);
+        const float length = sqrtf(vertex.normal.x * vertex.normal.x + vertex.normal.y * vertex.normal.y +
+                                   vertex.normal.z * vertex.normal.z);
+        if (length > 1.0e-5f) {
+            vertex.normal.x /= length;
+            vertex.normal.y /= length;
+            vertex.normal.z /= length;
+        } else {
+            vertex.normal = {0, -1, 0};
+        }
+        if (!i) {
+            next.mesh.min = next.mesh.max = vertex.position;
+        } else {
+            next.mesh.min.x = fminf(next.mesh.min.x, vertex.position.x);
+            next.mesh.min.y = fminf(next.mesh.min.y, vertex.position.y);
+            next.mesh.min.z = fminf(next.mesh.min.z, vertex.position.z);
+            next.mesh.max.x = fmaxf(next.mesh.max.x, vertex.position.x);
+            next.mesh.max.y = fmaxf(next.mesh.max.y, vertex.position.y);
+            next.mesh.max.z = fmaxf(next.mesh.max.z, vertex.position.z);
+        }
+    }
+    const uint8_t* indices = resource.payload + indices_at;
+    next.mesh.faces.reserve(triangle_count);
+    for (uint32_t triangle = 0; triangle < triangle_count; ++triangle) {
+        uint16_t a = read_u16(indices + static_cast<uint64_t>(triangle) * 2);
+        uint16_t b = read_u16(indices + static_cast<uint64_t>(triangle + 1) * 2);
+        uint16_t c = read_u16(indices + static_cast<uint64_t>(triangle + 2) * 2);
+        if (triangle & 1)
+            std::swap(a, b);
+        if (a == 0xffff || b == 0xffff || c == 0xffff)
+            continue;
+        if (a >= vertex_count || b >= vertex_count || c >= vertex_count)
+            return fail(err, "Object resource '%.*s' has an out-of-range index", resource.name.size,
+                        resource.name.data);
+        if (a != b && b != c && a != c) {
+            next.mesh.faces.push_back({a, b, c});
+            next.mesh.face_materials.push_back(static_cast<int32_t>(read_u32(resource.payload + 16)));
+        }
+    }
+    if (next.mesh.faces.empty())
+        return false;
+    *output = std::move(next);
+    return true;
+}
+
+bool donor_has_static_shape(const ChunkList& chunks, uint32_t file_id) {
+    for (uint32_t i = 0; i < chunks.count; ++i) {
+        const ChunkRef& chunk = chunks.chunks[i];
+        if (chunk.cid == ASURA_CHUNK_SHAPE && chunk.size >= sizeof(Asura_Chunk_Header) + 4 &&
+            read_u32(chunk.data + sizeof(Asura_Chunk_Header)) == file_id)
+            return true;
+    }
+    return false;
+}
+
+bool load_static_object_donors(const std::vector<std::string>& paths,
+                               std::vector<StaticObjectTemplate>* templates,
+                               std::vector<StaticObjectModel>* models, std::string* why) {
+    Error err{};
+    Arena arena{};
+    std::vector<StaticObjectTemplate> next_templates;
+    std::vector<StaticObjectModel> next_models;
+    bool ok = arena_init(&arena, 128 * MiB, &err);
+    for (const std::string& path : paths) {
+        ArenaMark mark = arena_mark(&arena);
+        ChunkList chunks{};
+        ok = ok && parse_chunks(path.c_str(), &chunks, &arena, &err);
+        for (uint32_t resource_index = 0; ok && resource_index < chunks.count; ++resource_index) {
+            RscfInfo resource{};
+            if (!rscf_info(chunks.chunks[resource_index], &resource) ||
+                resource.type != ASURA_RESOURCEFILE_TYPE_PLATFORMSPECIFIC ||
+                resource.subtype != ASURA_RESOURCEFILE_TYPE_PC_OBJECT || resource.payload_size < 20)
+                continue;
+            const uint32_t file_id = read_u32(resource.payload);
+            bool duplicate = false;
+            for (const StaticObjectTemplate& existing : next_templates)
+                duplicate |= existing.file_id == file_id;
+            if (duplicate || !donor_has_static_shape(chunks, file_id))
+                continue;
+
+            StaticObjectTemplate object = make_canonical_static_object_template(file_id, resource.name, path);
+            for (uint32_t entity_index = 0; entity_index < chunks.count; ++entity_index) {
+                const ChunkRef& chunk = chunks.chunks[entity_index];
+                if (chunk.cid != ASURA_CHUNK_ENTITY || chunk.version != 0 ||
+                    chunk.size < sizeof(Asura_Chunk_Entity) + kStaticObjectBodySize)
+                    continue;
+                const uint8_t* payload = chunk.data + sizeof(Asura_Chunk_Header);
+                if (read_u16(payload + offsetof(Asura_Chunk_Entity_PayloadHeader, Classification)) !=
+                    SnipeEntityClass_StaticObject)
+                    continue;
+                Snipe_ServerEntity_StaticObject_ChunkDataV0 body{};
+                memcpy(&body, payload + sizeof(Asura_Chunk_Entity_PayloadHeader), sizeof(body));
+                if (valid_static_object_body(body) && !body.m_uNumLinksToBlock &&
+                    body.m_xPhysicalObject.m_uFileID == file_id) {
+                    object.entity_padding =
+                        read_u16(payload + offsetof(Asura_Chunk_Entity_PayloadHeader, m_usPadding));
+                    memcpy(object.body.data(), &body, sizeof(body));
+                    break;
+                }
+            }
+            next_templates.push_back(std::move(object));
+            StaticObjectModel model;
+            if (decode_pc_static_object_model(chunks, resource_index, resource, &model, &err))
+                next_models.push_back(std::move(model));
+            else if (err.set)
+                ok = false;
+        }
+        unmap_file(&chunks.file);
+        arena_reset(&arena, mark);
+        if (!ok)
+            break;
+    }
+    if (ok && next_templates.empty())
+        ok = fail(&err, "the selected Object donors contain no class-0x7 Object resources with shapes");
+    if (ok) {
+        *templates = std::move(next_templates);
+        if (models)
+            *models = std::move(next_models);
+    } else if (why) {
+        *why = err.set ? err.message : "Could not load Object definitions from the selected donors.";
+    }
+    arena_release(&arena);
+    return ok;
+}
+
 struct PickupResourceDefinition {
     uint32_t item_id;
     const char* model_name;
@@ -501,7 +1074,8 @@ void add_resource_backed_pickup_templates(const ChunkList& chunks, Document* cat
 
 bool pickup_skin_is_referenced(const Document& document, uint32_t skin_id) {
     for (const Entity& entity : document.entities)
-        if (entity.kind == EntityKind::Pickup && entity.pickup_skin_id == skin_id)
+        if ((entity.kind == EntityKind::Pickup || entity.kind == EntityKind::StaticObject) &&
+            entity.pickup_skin_id == skin_id)
             return true;
     for (const PickupTemplate& pickup : document.pickup_templates)
         if (pickup.skin_id == skin_id)
@@ -509,7 +1083,89 @@ bool pickup_skin_is_referenced(const Document& document, uint32_t skin_id) {
     return false;
 }
 
-bool decode_pc_pickup_model(const RscfInfo& resource, uint32_t skin_id, PickupModel* output, Error* err) {
+struct HierarchyBindTransform {
+    Asura_Vector_3 position{};
+    Asura_Quat orientation{0, 0, 0, 1};
+};
+
+Asura_Vector_3 hierarchy_rotate(Asura_Vector_3 value, const Asura_Quat& rotation) {
+    const Asura_Vector_3 q{rotation.x, rotation.y, rotation.z};
+    const Asura_Vector_3 twice_cross{2.0f * (q.y * value.z - q.z * value.y),
+                                     2.0f * (q.z * value.x - q.x * value.z),
+                                     2.0f * (q.x * value.y - q.y * value.x)};
+    const Asura_Vector_3 second_cross{q.y * twice_cross.z - q.z * twice_cross.y,
+                                      q.z * twice_cross.x - q.x * twice_cross.z,
+                                      q.x * twice_cross.y - q.y * twice_cross.x};
+    return {value.x + rotation.w * twice_cross.x + second_cross.x,
+            value.y + rotation.w * twice_cross.y + second_cross.y,
+            value.z + rotation.w * twice_cross.z + second_cross.z};
+}
+
+Asura_Quat hierarchy_multiply(const Asura_Quat& a, const Asura_Quat& b) {
+    return {a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+            a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+            a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+            a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z};
+}
+
+HierarchyBindTransform hierarchy_compose(const HierarchyBindTransform& parent,
+                                         const HierarchyBindTransform& local) {
+    const Asura_Vector_3 offset = hierarchy_rotate(local.position, parent.orientation);
+    return {{parent.position.x + offset.x, parent.position.y + offset.y, parent.position.z + offset.z},
+            hierarchy_multiply(parent.orientation, local.orientation)};
+}
+
+bool decode_pc_hierarchy_bind_pose(const ChunkList& chunks, uint32_t before_chunk, Str hierarchy_name,
+                                   uint32_t strip_count, std::vector<HierarchyBindTransform>* output,
+                                   Error* err) {
+    output->clear();
+    for (uint32_t scan = before_chunk; scan > 0; --scan) {
+        const ChunkRef& chunk = chunks.chunks[scan - 1];
+        if (chunk.cid != ASURA_CHUNK_HIERARCHY_SKIN)
+            continue;
+        if (chunk.version < 4 || chunk.version > 6 || chunk.size < sizeof(Asura_Chunk_Header) + 12)
+            return fail(err, "ObjectHierarchy '%.*s' has an unsupported HSKN", hierarchy_name.size,
+                        hierarchy_name.data);
+        const uint8_t* payload = chunk.data + sizeof(Asura_Chunk_Header);
+        const uint32_t payload_size = chunk.size - sizeof(Asura_Chunk_Header);
+        const uint32_t weighted_vertex_count = read_u32(payload);
+        const uint32_t bone_count = read_u32(payload + 4);
+        const Str skin_name = padded_string_at(payload, payload_size, 8);
+        if (!skin_name.data || !str_ieq(skin_name, hierarchy_name))
+            continue;
+        if (!bone_count || bone_count > 65535 || bone_count < strip_count)
+            return fail(err, "ObjectHierarchy '%.*s' HSKN has fewer bones than strips", hierarchy_name.size,
+                        hierarchy_name.data);
+        uint64_t at = 8 + align_up(static_cast<uint64_t>(skin_name.size) + 1, 4);
+        at += static_cast<uint64_t>(weighted_vertex_count) * 72;
+        const uint64_t transforms_at = at + static_cast<uint64_t>(bone_count) * sizeof(uint32_t);
+        if (transforms_at + static_cast<uint64_t>(bone_count) * 28 > payload_size)
+            return fail(err, "ObjectHierarchy '%.*s' HSKN bind pose is truncated", hierarchy_name.size,
+                        hierarchy_name.data);
+        std::vector<uint32_t> parents(bone_count);
+        std::vector<HierarchyBindTransform> local(bone_count), global(bone_count);
+        for (uint32_t bone = 0; bone < bone_count; ++bone) {
+            parents[bone] = read_u32(payload + at + static_cast<uint64_t>(bone) * 4);
+            const uint8_t* transform = payload + transforms_at + static_cast<uint64_t>(bone) * 28;
+            local[bone].position = {read_f32(transform), read_f32(transform + 4), read_f32(transform + 8)};
+            local[bone].orientation = {read_f32(transform + 12), read_f32(transform + 16),
+                                       read_f32(transform + 20), read_f32(transform + 24)};
+        }
+        for (uint32_t bone = 0; bone < bone_count; ++bone) {
+            const uint32_t parent = parents[bone];
+            global[bone] = bone && parent < bone ? hierarchy_compose(global[parent], local[bone]) : local[bone];
+        }
+        output->assign(global.begin(), global.begin() + strip_count);
+        return true;
+    }
+    // One-bone pickup assets from some toolchains omit HSKN. Their vertices
+    // are already root-local, so absence remains a supported identity pose.
+    output->assign(strip_count, {});
+    return true;
+}
+
+bool decode_pc_pickup_model(const ChunkList& chunks, uint32_t chunk_index, const RscfInfo& resource,
+                            uint32_t skin_id, PickupModel* output, Error* err) {
     if (resource.type != ASURA_RESOURCEFILE_TYPE_PLATFORMSPECIFIC ||
         resource.subtype != ASURA_RESOURCEFILE_TYPE_PC_OBJECTHIERARCHY ||
         asura_lower_name_hash(resource.name) != skin_id)
@@ -538,14 +1194,21 @@ bool decode_pc_pickup_model(const RscfInfo& resource, uint32_t skin_id, PickupMo
     PickupModel next;
     next.skin_id = skin_id;
     next.mesh.resource_name.assign(resource.name.data, resource.name.size);
-    next.mesh.vertices.resize(vertex_count);
+    if (!decode_pc_model_materials(chunks, chunk_index, &next.mesh.materials, err))
+        return false;
+    std::vector<HierarchyBindTransform> bind_pose;
+    if (!decode_pc_hierarchy_bind_pose(chunks, chunk_index, resource.name, strip_count, &bind_pose, err))
+        return false;
+    std::vector<SpawnPuppetVertex> source_vertices(vertex_count);
     for (uint32_t i = 0; i < vertex_count; ++i) {
         const uint8_t* source = resource.payload + vertices_at + static_cast<uint64_t>(i) * vertex_stride;
-        SpawnPuppetVertex& vertex = next.mesh.vertices[i];
+        SpawnPuppetVertex& vertex = source_vertices[i];
         vertex.position = {read_f32(source), read_f32(source + 4), read_f32(source + 8)};
         vertex.normal = {read_f32(source + 12), read_f32(source + 16), read_f32(source + 20)};
+        vertex.texcoord = {read_f32(source + 24), read_f32(source + 28)};
         if (!isfinite(vertex.position.x) || !isfinite(vertex.position.y) || !isfinite(vertex.position.z) ||
-            !isfinite(vertex.normal.x) || !isfinite(vertex.normal.y) || !isfinite(vertex.normal.z))
+            !isfinite(vertex.normal.x) || !isfinite(vertex.normal.y) || !isfinite(vertex.normal.z) ||
+            !isfinite(vertex.texcoord.x) || !isfinite(vertex.texcoord.y))
             return fail(err, "pickup ObjectHierarchy '%.*s' contains non-finite vertices",
                         resource.name.size, resource.name.data);
         const float normal_length = sqrtf(vertex.normal.x * vertex.normal.x + vertex.normal.y * vertex.normal.y +
@@ -557,16 +1220,6 @@ bool decode_pc_pickup_model(const RscfInfo& resource, uint32_t skin_id, PickupMo
         } else {
             vertex.normal = {0, -1, 0};
         }
-        if (i == 0) {
-            next.mesh.min = next.mesh.max = vertex.position;
-        } else {
-            next.mesh.min.x = fminf(next.mesh.min.x, vertex.position.x);
-            next.mesh.min.y = fminf(next.mesh.min.y, vertex.position.y);
-            next.mesh.min.z = fminf(next.mesh.min.z, vertex.position.z);
-            next.mesh.max.x = fmaxf(next.mesh.max.x, vertex.position.x);
-            next.mesh.max.y = fmaxf(next.mesh.max.y, vertex.position.y);
-            next.mesh.max.z = fmaxf(next.mesh.max.z, vertex.position.z);
-        }
     }
 
     const uint8_t* indices = resource.payload + indices_at;
@@ -577,6 +1230,7 @@ bool decode_pc_pickup_model(const RscfInfo& resource, uint32_t skin_id, PickupMo
         return fail(err, "pickup ObjectHierarchy '%.*s' has too many triangles", resource.name.size,
                     resource.name.data);
     next.mesh.faces.reserve(static_cast<size_t>(triangle_capacity));
+    next.mesh.vertices.reserve(vertex_count);
     for (uint32_t strip_index = 0; strip_index < strip_count; ++strip_index) {
         const uint8_t* strip = resource.payload + strips_at + static_cast<uint64_t>(strip_index) * strip_stride;
         const uint32_t triangle_count = read_u32(strip);
@@ -587,6 +1241,9 @@ bool decode_pc_pickup_model(const RscfInfo& resource, uint32_t skin_id, PickupMo
             static_cast<uint64_t>(lowest_vertex) + number_vertices > vertex_count)
             return fail(err, "pickup ObjectHierarchy '%.*s' has an invalid strip", resource.name.size,
                         resource.name.data);
+        const HierarchyBindTransform& bind = bind_pose[strip_index];
+        std::vector<uint16_t> remapped(number_vertices, 0xffffu);
+        const int32_t material_index = static_cast<int32_t>(read_u32(strip + 8));
         for (uint32_t triangle = 0; triangle < triangle_count; ++triangle) {
             uint16_t a = read_u16(indices + static_cast<uint64_t>(start_index + triangle) * 2);
             uint16_t b = read_u16(indices + static_cast<uint64_t>(start_index + triangle + 1) * 2);
@@ -598,13 +1255,52 @@ bool decode_pc_pickup_model(const RscfInfo& resource, uint32_t skin_id, PickupMo
             if (a >= vertex_count || b >= vertex_count || c >= vertex_count)
                 return fail(err, "pickup ObjectHierarchy '%.*s' has an out-of-range index",
                             resource.name.size, resource.name.data);
-            if (a != b && b != c && a != c)
-                next.mesh.faces.push_back({a, b, c});
+            if (a != b && b != c && a != c) {
+                const uint16_t source_indices[3] = {a, b, c};
+                uint16_t destination_indices[3]{};
+                for (uint32_t corner = 0; corner < 3; ++corner) {
+                    const uint32_t source_index = source_indices[corner];
+                    if (source_index < lowest_vertex || source_index >= lowest_vertex + number_vertices)
+                        return fail(err, "pickup ObjectHierarchy '%.*s' strip index exceeds its vertex range",
+                                    resource.name.size, resource.name.data);
+                    uint16_t& destination = remapped[source_index - lowest_vertex];
+                    if (destination == 0xffffu) {
+                        if (next.mesh.vertices.size() >= 65535)
+                            return fail(err, "pickup ObjectHierarchy '%.*s' expands beyond preview limits",
+                                        resource.name.size, resource.name.data);
+                        SpawnPuppetVertex vertex = source_vertices[source_index];
+                        const Asura_Vector_3 rotated_position = hierarchy_rotate(vertex.position, bind.orientation);
+                        vertex.position = {rotated_position.x + bind.position.x,
+                                           rotated_position.y + bind.position.y,
+                                           rotated_position.z + bind.position.z};
+                        vertex.normal = hierarchy_rotate(vertex.normal, bind.orientation);
+                        destination = static_cast<uint16_t>(next.mesh.vertices.size());
+                        next.mesh.vertices.push_back(vertex);
+                    }
+                    destination_indices[corner] = destination;
+                }
+                next.mesh.faces.push_back(
+                    {destination_indices[0], destination_indices[1], destination_indices[2]});
+                next.mesh.face_materials.push_back(material_index);
+            }
         }
     }
     if (next.mesh.faces.empty())
         return fail(err, "pickup ObjectHierarchy '%.*s' has no renderable triangles",
                     resource.name.size, resource.name.data);
+    for (uint32_t i = 0; i < next.mesh.vertices.size(); ++i) {
+        const Asura_Vector_3 position = next.mesh.vertices[i].position;
+        if (!i) {
+            next.mesh.min = next.mesh.max = position;
+        } else {
+            next.mesh.min.x = fminf(next.mesh.min.x, position.x);
+            next.mesh.min.y = fminf(next.mesh.min.y, position.y);
+            next.mesh.min.z = fminf(next.mesh.min.z, position.z);
+            next.mesh.max.x = fmaxf(next.mesh.max.x, position.x);
+            next.mesh.max.y = fmaxf(next.mesh.max.y, position.y);
+            next.mesh.max.z = fmaxf(next.mesh.max.z, position.z);
+        }
+    }
     *output = std::move(next);
     return true;
 }
@@ -627,7 +1323,7 @@ bool decode_pc_pickup_models(const ChunkList& chunks, const Document& document,
         if (duplicate)
             continue;
         PickupModel model;
-        if (!decode_pc_pickup_model(resource, skin_id, &model, err))
+        if (!decode_pc_pickup_model(chunks, chunk_index, resource, skin_id, &model, err))
             return false;
         models->push_back(std::move(model));
     }
@@ -741,7 +1437,7 @@ bool normalise_editor_guids(Document* document, std::string* why) {
         // Lights have no ENTI GUID on disk. Source-backed records retain their
         // original IDs exactly; only editor-authored ENTI records are migrated.
         const bool has_enti_guid = entity.kind == EntityKind::SpawnPoint || entity.kind == EntityKind::Sound ||
-                                   entity.kind == EntityKind::Pickup;
+                                   entity.kind == EntityKind::Pickup || entity.kind == EntityKind::StaticObject;
         if (!has_enti_guid || entity.source_entity_record || entity.sound_source_record)
             continue;
         bool duplicate = false;
@@ -762,8 +1458,8 @@ bool normalise_editor_guids(Document* document, std::string* why) {
 }
 
 bool import_pc_entities(const ChunkList& chunks, Document* document, Error* err) {
-    uint32_t light_number = 0, sound_number = 0, spawn_number = 0, object_number = 0;
-    uint32_t target_number = 0, marker_number = 0;
+    uint32_t light_number = 0, sound_number = 0, spawn_number = 0, object_number = 0, static_number = 0;
+    uint32_t target_number = 0, marker_number = 0, volume_number = 0;
     for (uint32_t chunk_index = 0; chunk_index < chunks.count; ++chunk_index) {
         const ChunkRef& chunk = chunks.chunks[chunk_index];
         if (chunk.cid != ASURA_CHUNK_LIGHTS)
@@ -874,6 +1570,39 @@ bool import_pc_entities(const ChunkList& chunks, Document* document, Error* err)
                 note_document_guid(document, entity.guid);
                 break;
             }
+        } else if (classification == SnipeEntityClass_StaticObject) {
+            if (chunk.version != 0 || chunk.size < sizeof(Asura_Chunk_Entity) + kStaticObjectBodySize)
+                return fail(err, "static-object ENTI chunk %u is truncated or unsupported", chunk_index);
+            const uint8_t* body_bytes = payload + sizeof(Asura_Chunk_Entity_PayloadHeader);
+            Snipe_ServerEntity_StaticObject_ChunkDataV0 body{};
+            memcpy(&body, body_bytes, sizeof(body));
+            if (!valid_static_object_body(body))
+                return fail(err, "static-object ENTI chunk %u has unsupported payload versions", chunk_index);
+            Entity entity;
+            entity.kind = EntityKind::StaticObject;
+            entity.guid = read_u32(payload);
+            entity.source_entity_record = true;
+            entity.source_entity_classification = classification;
+            entity.entity_padding = read_u16(payload + offsetof(Asura_Chunk_Entity_PayloadHeader, m_usPadding));
+            entity.value_a = body.m_xPhysicalObject.m_fHealth;
+            entity.value_u32_b = body.m_xPhysicalObject.m_uFileID;
+            entity.pickup_skin_id = body.m_xPhysicalObject.m_uSkinID;
+            entity.pickup_anim_id = body.m_xPhysicalObject.m_uAnimID;
+            entity.pickup_anim_file_id = body.m_xPhysicalObject.m_uAnimFileID;
+            entity.static_object_has_template = true;
+            memcpy(entity.static_object_body.data(), body_bytes, entity.static_object_body.size());
+            entity.position = body.m_xPhysicalObject.m_xPosition;
+            entity.rotation = quaternion_euler(body.m_xPhysicalObject.m_xOrientation);
+            entity.name = static_object_resource_name(chunks, entity.value_u32_b, entity.pickup_skin_id);
+            if (entity.name.empty()) {
+                char name[96]{};
+                snprintf(name, sizeof(name), "Object %u (%08X)", ++static_number, entity.value_u32_b);
+                entity.name = name;
+            } else {
+                ++static_number;
+            }
+            note_static_object_template(document, entity);
+            document->entities.push_back(std::move(entity));
         } else if (classification == SnipeEntityClass_Pickup) {
             if (chunk.version != 0 || chunk.size < sizeof(Asura_Chunk_Entity) + kPickupBodySize)
                 return fail(err, "physical-object ENTI chunk %u is truncated or unsupported", chunk_index);
@@ -930,18 +1659,24 @@ bool import_pc_entities(const ChunkList& chunks, Document* document, Error* err)
             entity.rotation = quaternion_euler(orientation);
             entity.name = "Assassination target " + std::to_string(++target_number);
             document->entities.push_back(std::move(entity));
-        } else if (classification == SnipeEntityClass_PositionMarker) {
+        } else if (classification == SnipeEntityClass_PositionMarker ||
+                   classification == SnipeEntityClass_BuildingVolume) {
+            const bool building_volume = classification == SnipeEntityClass_BuildingVolume;
             constexpr uint32_t body_size = 0x74;
             if (chunk.version != 0 || chunk.size < sizeof(Asura_Chunk_Entity) + body_size)
-                return fail(err, "position-marker ENTI chunk %u is truncated or unsupported", chunk_index);
+                return fail(err, "%s ENTI chunk %u is truncated or unsupported",
+                            building_volume ? "building-volume" : "position-marker", chunk_index);
             const uint8_t* body = payload + sizeof(Asura_Chunk_Entity_PayloadHeader);
             if (read_u32(body) != 0)
-                return fail(err, "position-marker ENTI chunk %u has unsupported payload version", chunk_index);
+                return fail(err, "%s ENTI chunk %u has unsupported payload version",
+                            building_volume ? "building-volume" : "position-marker", chunk_index);
             Entity entity;
-            entity.kind = EntityKind::PositionMarker;
+            entity.kind = building_volume ? EntityKind::BuildingVolume : EntityKind::PositionMarker;
             entity.guid = read_u32(payload);
             entity.source_entity_record = true;
             entity.source_entity_classification = classification;
+            entity.entity_padding = read_u16(
+                payload + offsetof(Asura_Chunk_Entity_PayloadHeader, m_usPadding));
             memcpy(&entity.source_bounds, body + 0x4c, sizeof(entity.source_bounds));
             memcpy(&entity.position, body + 0x64, sizeof(entity.position));
             float orientation[9]{};
@@ -950,11 +1685,40 @@ bool import_pc_entities(const ChunkList& chunks, Document* document, Error* err)
             entity.value_a = entity.source_bounds.MaxX - entity.source_bounds.MinX;
             entity.value_b = entity.source_bounds.MaxZ - entity.source_bounds.MinZ;
             entity.value_u32_a = read_u32(body + 0x70);
-            entity.name = "Position marker " + std::to_string(++marker_number);
+            entity.name = building_volume
+                              ? "Building volume " + std::to_string(++volume_number)
+                              : "Position marker " + std::to_string(++marker_number);
             document->entities.push_back(std::move(entity));
         }
     }
     document->source_pickup_inventory_complete = true;
+    document->source_static_object_inventory_complete = true;
+    return true;
+}
+
+bool decode_pc_static_object_models(const ChunkList& chunks, const Document& document,
+                                    std::vector<StaticObjectModel>* models, Error* err) {
+    models->clear();
+    for (uint32_t chunk_index = 0; chunk_index < chunks.count; ++chunk_index) {
+        RscfInfo resource{};
+        if (!rscf_info(chunks.chunks[chunk_index], &resource) ||
+            resource.type != ASURA_RESOURCEFILE_TYPE_PLATFORMSPECIFIC ||
+            resource.subtype != ASURA_RESOURCEFILE_TYPE_PC_OBJECT || resource.payload_size < 20)
+            continue;
+        const uint32_t file_id = read_u32(resource.payload);
+        bool referenced = false;
+        for (const Entity& entity : document.entities)
+            referenced |= entity.kind == EntityKind::StaticObject && entity.value_u32_b == file_id;
+        for (const StaticObjectTemplate& object : document.static_object_templates)
+            referenced |= object.file_id == file_id;
+        if (!referenced)
+            continue;
+        StaticObjectModel model;
+        if (decode_pc_static_object_model(chunks, chunk_index, resource, &model, err))
+            models->push_back(std::move(model));
+        else if (err->set)
+            return false;
+    }
     return true;
 }
 
@@ -1034,13 +1798,15 @@ bool source_ambience_info(const ChunkRef& chunk, std::string* path, float* volum
                           uint32_t* tail_offset, Error* err);
 
 bool load_pc_level(const std::string& path, Document* document, Mesh* mesh, std::string* why,
-                   std::vector<PickupModel>* pickup_models = nullptr) {
+                   std::vector<PickupModel>* pickup_models = nullptr,
+                   std::vector<StaticObjectModel>* object_models = nullptr) {
     Error err{};
     Arena arena{};
     ChunkList chunks{};
     Document next_document;
     Mesh next_mesh;
     std::vector<PickupModel> next_pickup_models;
+    std::vector<StaticObjectModel> next_object_models;
     bool ok = arena_init(&arena, 64 * MiB, &err) && parse_chunks(path.c_str(), &chunks, &arena, &err);
     bool source_has_skybox = false;
     for (uint32_t chunk_index = 0; ok && chunk_index < chunks.count; ++chunk_index)
@@ -1074,11 +1840,18 @@ bool load_pc_level(const std::string& path, Document* document, Mesh* mesh, std:
         ok = fail(&err, "the .PC contains no PC environment RSCF");
     if (ok)
         ok = decode_pc_environment(environment, &next_mesh, &arena, &err) &&
-             import_pc_entities(chunks, &next_document, &err);
+             import_pc_entities(chunks, &next_document, &err) &&
+             decode_pc_invisible_barriers(chunks, &next_document, &err);
     if (ok)
         add_resource_backed_pickup_templates(chunks, &next_document);
+    if (ok) {
+        for (StaticObjectTemplate& object : next_document.static_object_templates)
+            object.donor_path = path;
+    }
     if (ok && pickup_models)
         ok = decode_pc_pickup_models(chunks, next_document, &next_pickup_models, &err);
+    if (ok && object_models)
+        ok = decode_pc_static_object_models(chunks, next_document, &next_object_models, &err);
     if (ok) {
         next_document.source_pc_path = path;
         next_document.output_path = edited_pc_path(path);
@@ -1087,6 +1860,8 @@ bool load_pc_level(const std::string& path, Document* document, Mesh* mesh, std:
         *mesh = std::move(next_mesh);
         if (pickup_models)
             *pickup_models = std::move(next_pickup_models);
+        if (object_models)
+            *object_models = std::move(next_object_models);
     } else if (why) {
         *why = err.set ? err.message : "Could not load the PC level.";
     }
@@ -1391,6 +2166,45 @@ bool append_editor_pickups(Buffer* out, const Document& doc, Error* err) {
     return true;
 }
 
+void make_static_object_body(const Entity& entity,
+                             std::array<uint8_t, kStaticObjectBodySize>* body) {
+    Snipe_ServerEntity_StaticObject_ChunkDataV0 wire{};
+    if (entity.static_object_has_template)
+        memcpy(&wire, entity.static_object_body.data(), sizeof(wire));
+    else
+        memcpy(&wire, make_canonical_static_object_template(entity.value_u32_b, {}, {}).body.data(),
+               sizeof(wire));
+    wire.m_xPhysicalObject.m_xPosition = entity.position;
+    wire.m_xPhysicalObject.m_xOrientation = euler_quaternion(entity.rotation);
+    wire.m_xPhysicalObject.m_fHealth = entity.value_a;
+    wire.m_xPhysicalObject.m_uFileID = entity.value_u32_b;
+    wire.m_xPhysicalObject.m_uSkinID = entity.pickup_skin_id;
+    wire.m_xPhysicalObject.m_uAnimID = entity.pickup_anim_id;
+    wire.m_xPhysicalObject.m_uAnimFileID = entity.pickup_anim_file_id;
+    memcpy(body->data(), &wire, sizeof(wire));
+}
+
+bool append_editor_static_objects(Buffer* out, const Document& doc, Error* err) {
+    for (const Entity& entity : doc.entities) {
+        if (entity.kind != EntityKind::StaticObject || entity.source_entity_record)
+            continue;
+        if (!entity.static_object_has_template)
+            return fail(err, "Object '%s' has no resolved asset profile", entity.name.c_str());
+        ChunkMark chunk = begin_chunk(out, ASURA_CHUNK_ENTITY, 0, 0, err);
+        Asura_Chunk_Entity_PayloadHeader header{};
+        header.Guid = entity.guid;
+        header.Classification = SnipeEntityClass_StaticObject;
+        header.m_usPadding = entity.entity_padding;
+        std::array<uint8_t, kStaticObjectBodySize> body{};
+        make_static_object_body(entity, &body);
+        buffer_append(out, &header, sizeof(header), err);
+        buffer_append(out, body.data(), body.size(), err);
+        if (!end_chunk(out, chunk, err))
+            return false;
+    }
+    return true;
+}
+
 Asura_Vector_3 collision_sub(Asura_Vector_3 a, Asura_Vector_3 b) {
     return {a.x - b.x, a.y - b.y, a.z - b.z};
 }
@@ -1507,6 +2321,25 @@ bool nearly_equal(const Asura_Vector_3& a, const Asura_Vector_3& b) {
     return nearly_equal(a.x, b.x) && nearly_equal(a.y, b.y) && nearly_equal(a.z, b.z);
 }
 
+Asura_Vector_3 oriented_box_dimensions(const Entity& entity) {
+    return {entity.source_bounds.MaxX - entity.source_bounds.MinX,
+            entity.source_bounds.MaxY - entity.source_bounds.MinY,
+            entity.source_bounds.MaxZ - entity.source_bounds.MinZ};
+}
+
+Asura_Bounding_Box centered_oriented_box_bounds(const Entity& entity) {
+    const Asura_Vector_3 size = oriented_box_dimensions(entity);
+    return {entity.position.x - size.x * .5f, entity.position.x + size.x * .5f,
+            entity.position.y - size.y * .5f, entity.position.y + size.y * .5f,
+            entity.position.z - size.z * .5f, entity.position.z + size.z * .5f};
+}
+
+bool valid_oriented_box_dimensions(const Entity& entity) {
+    const Asura_Vector_3 size = oriented_box_dimensions(entity);
+    return isfinite(size.x) && isfinite(size.y) && isfinite(size.z) &&
+           size.x > 0.0f && size.y > 0.0f && size.z > 0.0f;
+}
+
 bool nearly_equal_rotation(const Asura_Vector_3& a, const Asura_Vector_3& b) {
     auto equal_angle = [](float x, float y) {
         float difference = fmodf(fabsf(x - y), 360.0f);
@@ -1547,6 +2380,8 @@ bool append_source_entity_copy(Buffer* out, const ChunkRef& chunk, const Documen
     if (!entity) {
         if (classification == SnipeEntityClass_Pickup && doc.source_pickup_inventory_complete)
             return true;
+        if (classification == SnipeEntityClass_StaticObject && doc.source_static_object_inventory_complete)
+            return true;
         return append_chunk_copy(out, chunk, err);
     }
 
@@ -1573,15 +2408,42 @@ bool append_source_entity_copy(Buffer* out, const ChunkRef& chunk, const Documen
         memcpy(patched.data() + sizeof(Asura_Chunk_Entity), patched_body.data(), patched_body.size());
         return buffer_append(out, patched.data(), patched.size(), err) != ~0ull;
     }
+    if (classification == SnipeEntityClass_StaticObject && entity->static_object_has_template) {
+        if (chunk.size < sizeof(Asura_Chunk_Entity) + kStaticObjectBodySize)
+            return fail(err, "source static-object ENTI is truncated");
+        Asura_Vector_3 source_position{};
+        Asura_Quat source_orientation{};
+        memcpy(&source_position, body + 0x30, sizeof(source_position));
+        memcpy(&source_orientation, body + 0x3c, sizeof(source_orientation));
+        const bool template_changed =
+            memcmp(entity->static_object_body.data(), body, entity->static_object_body.size()) != 0 ||
+            entity->value_u32_b != read_u32(body + 0x50) ||
+            entity->pickup_skin_id != read_u32(body + 0x54) ||
+            entity->pickup_anim_id != read_u32(body + 0x58) ||
+            entity->pickup_anim_file_id != read_u32(body + 0x5c);
+        if (!template_changed && nearly_equal(entity->position, source_position) &&
+            nearly_equal_rotation(entity->rotation, quaternion_euler(source_orientation)))
+            return append_chunk_copy(out, chunk, err);
+        std::vector<uint8_t> patched(chunk.data, chunk.data + chunk.size);
+        std::array<uint8_t, kStaticObjectBodySize> patched_body{};
+        make_static_object_body(*entity, &patched_body);
+        memcpy(patched.data() + sizeof(Asura_Chunk_Entity), patched_body.data(), patched_body.size());
+        return buffer_append(out, patched.data(), patched.size(), err) != ~0ull;
+    }
 
+    const bool oriented_box = classification == SnipeEntityClass_PositionMarker ||
+                              classification == SnipeEntityClass_BuildingVolume;
     uint32_t position_offset = 0, orientation_offset = 0;
-    if (classification == SnipeEntityClass_Pickup) {
+    if (classification == SnipeEntityClass_StaticObject) {
+        position_offset = 0x30;
+        orientation_offset = 0x3c;
+    } else if (classification == SnipeEntityClass_Pickup) {
         position_offset = 0x4c;
         orientation_offset = 0x58;
     } else if (classification == SnipeEntityClass_AssassinationTarget) {
         position_offset = 0x38;
         orientation_offset = 0x44;
-    } else if (classification == SnipeEntityClass_PositionMarker) {
+    } else if (oriented_box) {
         position_offset = 0x64;
     } else {
         return append_chunk_copy(out, chunk, err);
@@ -1592,9 +2454,9 @@ bool append_source_entity_copy(Buffer* out, const ChunkRef& chunk, const Documen
     Asura_Vector_3 source_position{};
     memcpy(&source_position, body + position_offset, sizeof(source_position));
     Asura_Vector_3 source_rotation{};
-    if (classification == SnipeEntityClass_PositionMarker) {
+    if (oriented_box) {
         if (sizeof(Asura_Chunk_Entity) + 0x70 + sizeof(uint32_t) > chunk.size)
-            return fail(err, "source position-marker ENTI is truncated");
+            return fail(err, "source oriented-box ENTI 0x%04X is truncated", classification);
         float source_matrix[9]{};
         memcpy(source_matrix, body + 4, sizeof(source_matrix));
         source_rotation = matrix_euler(source_matrix);
@@ -1608,31 +2470,32 @@ bool append_source_entity_copy(Buffer* out, const ChunkRef& chunk, const Documen
 
     const bool position_changed = !nearly_equal(entity->position, source_position);
     const bool rotation_changed = !nearly_equal_rotation(entity->rotation, source_rotation);
-    if (!position_changed && !rotation_changed)
+    bool bounds_changed = false, flags_changed = false;
+    Asura_Bounding_Box source_bounds{}, desired_bounds{};
+    if (oriented_box) {
+        memcpy(&source_bounds, body + 0x4c, sizeof(source_bounds));
+        if (!valid_oriented_box_dimensions(*entity))
+            return fail(err, "oriented-box ENTI 0x%04X has invalid bounds", classification);
+        const Asura_Vector_3 source_size{source_bounds.MaxX - source_bounds.MinX,
+                                         source_bounds.MaxY - source_bounds.MinY,
+                                         source_bounds.MaxZ - source_bounds.MinZ};
+        const Asura_Vector_3 edited_size = oriented_box_dimensions(*entity);
+        bounds_changed = position_changed || !nearly_equal(source_size, edited_size);
+        desired_bounds = centered_oriented_box_bounds(*entity);
+        flags_changed = entity->value_u32_a != read_u32(body + 0x70);
+    }
+    if (!position_changed && !rotation_changed && !bounds_changed && !flags_changed)
         return append_chunk_copy(out, chunk, err);
 
     std::vector<uint8_t> patched(chunk.data, chunk.data + chunk.size);
     uint8_t* patched_body = patched.data() + sizeof(Asura_Chunk_Entity);
-    if (position_changed) {
-        if (classification == SnipeEntityClass_PositionMarker) {
-            const Asura_Vector_3 delta{entity->position.x - source_position.x,
-                                      entity->position.y - source_position.y,
-                                      entity->position.z - source_position.z};
-            Asura_Bounding_Box bounds{};
-            memcpy(&bounds, body + 0x4c, sizeof(bounds));
-            bounds.MinX += delta.x;
-            bounds.MaxX += delta.x;
-            bounds.MinY += delta.y;
-            bounds.MaxY += delta.y;
-            bounds.MinZ += delta.z;
-            bounds.MaxZ += delta.z;
-            memcpy(patched_body + 0x4c, &bounds, sizeof(bounds));
-        }
+    if (bounds_changed)
+        memcpy(patched_body + 0x4c, &desired_bounds, sizeof(desired_bounds));
+    if (position_changed || bounds_changed)
         memcpy(patched_body + position_offset, &entity->position, sizeof(entity->position));
-    }
     if (rotation_changed) {
         const Asura_Quat orientation = euler_quaternion(entity->rotation);
-        if (classification == SnipeEntityClass_PositionMarker) {
+        if (oriented_box) {
             float matrix[9]{}, transpose[9]{};
             quaternion_matrix(orientation, matrix);
             for (uint32_t row = 0; row < 3; ++row)
@@ -1644,7 +2507,366 @@ bool append_source_entity_copy(Buffer* out, const ChunkRef& chunk, const Documen
             memcpy(patched_body + orientation_offset, &orientation, sizeof(orientation));
         }
     }
+    if (flags_changed)
+        memcpy(patched_body + 0x70, &entity->value_u32_a, sizeof(entity->value_u32_a));
     return buffer_append(out, patched.data(), patched.size(), err) != ~0ull;
+}
+
+bool append_editor_building_volumes(Buffer* out, const Document& doc, Error* err) {
+    for (const Entity& entity : doc.entities) {
+        if (entity.kind != EntityKind::BuildingVolume || entity.source_entity_record)
+            continue;
+        if (!valid_oriented_box_dimensions(entity))
+            return fail(err, "building volume '%s' has invalid bounds", entity.name.c_str());
+
+        ChunkMark chunk = begin_chunk(out, ASURA_CHUNK_ENTITY, 0, 0, err);
+        Asura_Chunk_Entity_PayloadHeader header{};
+        header.Guid = entity.guid;
+        header.Classification = SnipeEntityClass_BuildingVolume;
+        header.m_usPadding = entity.entity_padding;
+        std::array<uint8_t, 0x74> body{};
+        float matrix[9]{}, transpose[9]{};
+        quaternion_matrix(euler_quaternion(entity.rotation), matrix);
+        for (uint32_t row = 0; row < 3; ++row)
+            for (uint32_t column = 0; column < 3; ++column)
+                transpose[row * 3 + column] = matrix[column * 3 + row];
+        const Asura_Bounding_Box bounds = centered_oriented_box_bounds(entity);
+        memcpy(body.data() + 4, matrix, sizeof(matrix));
+        memcpy(body.data() + 0x28, transpose, sizeof(transpose));
+        memcpy(body.data() + 0x4c, &bounds, sizeof(bounds));
+        memcpy(body.data() + 0x64, &entity.position, sizeof(entity.position));
+        memcpy(body.data() + 0x70, &entity.value_u32_a, sizeof(entity.value_u32_a));
+        buffer_append(out, &header, sizeof(header), err);
+        buffer_append(out, body.data(), body.size(), err);
+        if (!end_chunk(out, chunk, err))
+            return false;
+    }
+    return true;
+}
+
+struct PcEmodModuleView {
+    const uint8_t* name = nullptr;
+    uint32_t name_bytes = 0;
+    Asura_Chunk_Environment_ModuleList_EntryV6 module{};
+    const uint8_t* collision = nullptr;
+};
+
+bool pc_emod_modules(const ChunkRef& chunk, const uint8_t** environment_name,
+                     uint32_t* environment_name_bytes, std::vector<PcEmodModuleView>* modules,
+                     Error* err) {
+    if (chunk.cid != ASURA_CHUNK_ENVIRONMENT_MODULELIST || chunk.version != 6 ||
+        chunk.size < sizeof(Asura_Chunk_Header) + sizeof(uint32_t))
+        return fail(err, "the source EMOD chunk is unsupported or truncated");
+    const uint32_t module_count = read_u32(chunk.data + sizeof(Asura_Chunk_Header));
+    uint64_t at = sizeof(Asura_Chunk_Header) + sizeof(uint32_t);
+    const Str env_name = padded_string_at(chunk.data, chunk.size, static_cast<uint32_t>(at));
+    if (!env_name.data)
+        return fail(err, "the source EMOD environment name is truncated");
+    *environment_name = chunk.data + at;
+    *environment_name_bytes = static_cast<uint32_t>(align_up(static_cast<uint64_t>(env_name.size) + 1, 4));
+    at += *environment_name_bytes;
+    modules->clear();
+    modules->reserve(module_count);
+    for (uint32_t module_index = 0; module_index < module_count; ++module_index) {
+        if (at > UINT32_MAX)
+            return fail(err, "the source EMOD module table is invalid");
+        const Str module_name = padded_string_at(chunk.data, chunk.size, static_cast<uint32_t>(at));
+        if (!module_name.data)
+            return fail(err, "the source EMOD module name %u is truncated", module_index);
+        PcEmodModuleView next{};
+        next.name = chunk.data + at;
+        next.name_bytes = static_cast<uint32_t>(align_up(static_cast<uint64_t>(module_name.size) + 1, 4));
+        at += next.name_bytes;
+        if (at + sizeof(next.module) > chunk.size)
+            return fail(err, "the source EMOD module record %u is truncated", module_index);
+        memcpy(&next.module, chunk.data + at, sizeof(next.module));
+        at += sizeof(next.module);
+        if (next.module.m_uCollisionDataSize > chunk.size - at)
+            return fail(err, "the source EMOD collision module %u is truncated", module_index);
+        next.collision = chunk.data + at;
+        at += next.module.m_uCollisionDataSize;
+        modules->push_back(next);
+    }
+    if (at != chunk.size)
+        return fail(err, "the source EMOD chunk has an unsupported trailing payload");
+    return true;
+}
+
+const Entity* find_source_barrier(const Document& doc, uint32_t chunk_index,
+                                  uint32_t module_index, uint32_t component_index) {
+    for (const Entity& entity : doc.entities) {
+        if (entity.kind == EntityKind::InvisibleBarrier && entity.barrier_source_record &&
+            entity.barrier_source_chunk == chunk_index &&
+            entity.barrier_source_module == module_index &&
+            entity.barrier_source_component == component_index)
+            return &entity;
+    }
+    return nullptr;
+}
+
+bool equal_barrier_geometry(const Entity& entity, const PcBarrierComponent& source,
+                            uint32_t chunk_index, uint32_t module_index,
+                            uint32_t component_index) {
+    Entity original;
+    make_pc_barrier_entity(source, chunk_index, module_index, component_index, 0, &original);
+    return nearly_equal(entity.position, original.position) &&
+           nearly_equal_rotation(entity.rotation, original.rotation) &&
+           nearly_equal(oriented_box_dimensions(entity), oriented_box_dimensions(original));
+}
+
+Asura_Vector_3 barrier_subtract(const Asura_Vector_3& first, const Asura_Vector_3& second) {
+    return {first.x - second.x, first.y - second.y, first.z - second.z};
+}
+
+Asura_Vector_3 barrier_rotate(const Asura_Vector_3& value, const Asura_Quat& q) {
+    const Asura_Vector_3 twice_cross{2.0f * (q.y * value.z - q.z * value.y),
+                                     2.0f * (q.z * value.x - q.x * value.z),
+                                     2.0f * (q.x * value.y - q.y * value.x)};
+    return {value.x + q.w * twice_cross.x + q.y * twice_cross.z - q.z * twice_cross.y,
+            value.y + q.w * twice_cross.y + q.z * twice_cross.x - q.x * twice_cross.z,
+            value.z + q.w * twice_cross.z + q.x * twice_cross.y - q.y * twice_cross.x};
+}
+
+void append_barrier_rectangle(const Entity& entity, const Asura_Vector_3& translation,
+                              std::vector<Asura_Vector_3>* vertices,
+                              std::vector<std::array<uint16_t, 4>>* polygons,
+                              std::vector<uint16_t>* flags, std::vector<uint16_t>* materials) {
+    const Asura_Vector_3 size = oriented_box_dimensions(entity);
+    const float half[3] = {size.x * .5f, size.y * .5f, size.z * .5f};
+    uint32_t normal_axis = 0;
+    if (size.y < size.x)
+        normal_axis = 1;
+    if ((normal_axis == 0 ? size.x : size.y) > size.z)
+        normal_axis = 2;
+    const uint32_t first_axis = normal_axis == 0 ? 1 : 0;
+    const uint32_t second_axis = normal_axis == 2 ? 1 : 2;
+    Asura_Vector_3 local[4]{};
+    float* coordinates[4][3] = {{&local[0].x, &local[0].y, &local[0].z},
+                                {&local[1].x, &local[1].y, &local[1].z},
+                                {&local[2].x, &local[2].y, &local[2].z},
+                                {&local[3].x, &local[3].y, &local[3].z}};
+    const float signs[4][2] = {{-1, -1}, {1, -1}, {1, 1}, {-1, 1}};
+    for (uint32_t corner = 0; corner < 4; ++corner) {
+        *coordinates[corner][first_axis] = signs[corner][0] * half[first_axis];
+        *coordinates[corner][second_axis] = signs[corner][1] * half[second_axis];
+    }
+    const Asura_Quat orientation = euler_quaternion(entity.rotation);
+    const uint16_t first_vertex = static_cast<uint16_t>(vertices->size());
+    for (const Asura_Vector_3& corner : local) {
+        const Asura_Vector_3 rotated = barrier_rotate(corner, orientation);
+        const Asura_Vector_3 world{entity.position.x + rotated.x, entity.position.y + rotated.y,
+                                   entity.position.z + rotated.z};
+        vertices->push_back(barrier_subtract(world, translation));
+    }
+    polygons->push_back({first_vertex, static_cast<uint16_t>(first_vertex + 1),
+                         static_cast<uint16_t>(first_vertex + 2), 0xffffu});
+    polygons->push_back({first_vertex, static_cast<uint16_t>(first_vertex + 2),
+                         static_cast<uint16_t>(first_vertex + 3), 0xffffu});
+    flags->push_back(entity.barrier_collision_flags);
+    flags->push_back(entity.barrier_collision_flags);
+    materials->push_back(entity.barrier_collision_material);
+    materials->push_back(entity.barrier_collision_material);
+}
+
+bool append_edited_collision_v3(Buffer* out, const PcCollisionView& view,
+                                const Asura_Vector_3& translation,
+                                const std::vector<PcBarrierComponent>& components,
+                                const std::vector<const Entity*>& additions,
+                                const std::vector<bool>& omitted_polygons, Error* err) {
+    std::vector<Asura_Vector_3> vertices;
+    vertices.reserve(static_cast<size_t>(view.vertex_count) + additions.size() * 4);
+    for (uint32_t vertex = 0; vertex < view.vertex_count; ++vertex) {
+        const uint8_t* source = view.data + view.vertices_at + static_cast<uint64_t>(vertex) * 12;
+        vertices.push_back({read_f32(source), read_f32(source + 4), read_f32(source + 8)});
+    }
+    std::vector<std::array<uint16_t, 4>> polygons;
+    std::vector<uint16_t> polygon_flags, polygon_materials;
+    polygons.reserve(static_cast<size_t>(view.polygon_count) + additions.size() * 2);
+    polygon_flags.reserve(polygons.capacity());
+    polygon_materials.reserve(polygons.capacity());
+    for (uint32_t polygon = 0; polygon < view.polygon_count; ++polygon) {
+        if (polygon < omitted_polygons.size() && omitted_polygons[polygon])
+            continue;
+        std::array<uint16_t, 4> indices{};
+        memcpy(indices.data(), view.data + view.polygons_at + static_cast<uint64_t>(polygon) * 8,
+               sizeof(indices));
+        polygons.push_back(indices);
+        polygon_flags.push_back(pc_collision_polygon_flags(view, polygon));
+        polygon_materials.push_back(pc_collision_polygon_material(view, polygon));
+    }
+    for (const Entity* entity : additions) {
+        if (!valid_oriented_box_dimensions(*entity))
+            return fail(err, "invisible barrier '%s' has invalid bounds", entity->name.c_str());
+        if (vertices.size() > 65531)
+            return fail(err, "an EMOD module exceeds 65535 collision vertices after adding barriers");
+        append_barrier_rectangle(*entity, translation, &vertices, &polygons,
+                                 &polygon_flags, &polygon_materials);
+    }
+    if (polygons.empty())
+        return fail(err, "editing invisible barriers would leave an EMOD module without collision polygons");
+    if (polygons.size() > kMaxAabbTreeObjects)
+        return fail(err, "an EMOD module exceeds 65535 collision polygons after editing barriers");
+
+    Asura_Vector_3 minimum = vertices.front(), maximum = vertices.front();
+    for (const Asura_Vector_3& vertex : vertices) {
+        minimum.x = fminf(minimum.x, vertex.x);
+        minimum.y = fminf(minimum.y, vertex.y);
+        minimum.z = fminf(minimum.z, vertex.z);
+        maximum.x = fmaxf(maximum.x, vertex.x);
+        maximum.y = fmaxf(maximum.y, vertex.y);
+        maximum.z = fmaxf(maximum.z, vertex.z);
+    }
+    const float bounds[6] = {minimum.x, maximum.x, minimum.y, maximum.y, minimum.z, maximum.z};
+    const float dx = maximum.x - minimum.x, dy = maximum.y - minimum.y, dz = maximum.z - minimum.z;
+    const float radius = .5f * sqrtf(dx * dx + dy * dy + dz * dz);
+    append_u32(out, 3, err);
+    append_u32(out, static_cast<uint32_t>(vertices.size()), err);
+    append_u32(out, static_cast<uint32_t>(polygons.size()), err);
+    append_u32(out, 1, err);
+    append_u32(out, 1, err);
+    append_u16(out, view.overall_flags, err);
+    append_u16(out, view.overall_material, err);
+    buffer_append(out, bounds, sizeof(bounds), err);
+    append_f32(out, radius, err);
+    buffer_append(out, vertices.data(), vertices.size() * sizeof(vertices[0]), err);
+    buffer_append(out, polygons.data(), polygons.size() * sizeof(polygons[0]), err);
+    buffer_append(out, polygon_flags.data(), polygon_flags.size() * sizeof(polygon_flags[0]), err);
+    buffer_append(out, polygon_materials.data(), polygon_materials.size() * sizeof(polygon_materials[0]), err);
+    (void)components;
+    return !err->set;
+}
+
+bool append_editor_emod_copy(Buffer* out, const ChunkRef& chunk, const Document& doc,
+                             bool include_authored, Error* err) {
+    const uint8_t* environment_name = nullptr;
+    uint32_t environment_name_bytes = 0;
+    std::vector<PcEmodModuleView> modules;
+    if (!pc_emod_modules(chunk, &environment_name, &environment_name_bytes, &modules, err))
+        return false;
+
+    std::vector<std::vector<const Entity*>> authored(modules.size());
+    if (include_authored) {
+        for (const Entity& entity : doc.entities) {
+            if (entity.kind != EntityKind::InvisibleBarrier || entity.barrier_source_record)
+                continue;
+            if (!valid_oriented_box_dimensions(entity))
+                return fail(err, "invisible barrier '%s' has invalid bounds", entity.name.c_str());
+            uint32_t nearest = 0xffffffffu;
+            float nearest_distance = FLT_MAX;
+            for (uint32_t module_index = 0; module_index < modules.size(); ++module_index) {
+                PcCollisionView collision{};
+                Error ignored{};
+                if (!pc_collision_view(modules[module_index].collision,
+                                       modules[module_index].module.m_uCollisionDataSize,
+                                       &collision, &ignored, module_index))
+                    continue;
+                const Asura_Vector_3 delta = barrier_subtract(
+                    entity.position, modules[module_index].module.m_xTranslation);
+                const float distance = delta.x * delta.x + delta.y * delta.y + delta.z * delta.z;
+                if (distance < nearest_distance) {
+                    nearest = module_index;
+                    nearest_distance = distance;
+                }
+            }
+            if (nearest == 0xffffffffu)
+                return fail(err, "the source EMOD has no version-3 collision module for a new invisible barrier");
+            authored[nearest].push_back(&entity);
+        }
+    }
+
+    struct ModuleEdit {
+        PcCollisionView collision{};
+        std::vector<PcBarrierComponent> components;
+        std::vector<bool> omitted;
+        std::vector<const Entity*> additions;
+        bool changed = false;
+    };
+    std::vector<ModuleEdit> edits(modules.size());
+    bool any_changed = false;
+    for (uint32_t module_index = 0; module_index < modules.size(); ++module_index) {
+        ModuleEdit& edit = edits[module_index];
+        if (!pc_collision_view(modules[module_index].collision,
+                               modules[module_index].module.m_uCollisionDataSize,
+                               &edit.collision, err, module_index)) {
+            if (err->set)
+                return false;
+            if (!authored[module_index].empty())
+                return fail(err, "cannot add an invisible barrier to non-version-3 collision module %u",
+                            module_index);
+            continue;
+        }
+        if (!pc_barrier_components(edit.collision, modules[module_index].module.m_xTranslation,
+                                   &edit.components, err, module_index))
+            return false;
+        edit.omitted.assign(edit.collision.polygon_count, false);
+        for (uint32_t component_index = 0; component_index < edit.components.size(); ++component_index) {
+            const PcBarrierComponent& component = edit.components[component_index];
+            const Entity* entity = find_source_barrier(doc, chunk.index, module_index, component_index);
+            const bool remove = !entity && doc.source_barrier_inventory_complete;
+            const bool replace = entity && !equal_barrier_geometry(*entity, component, chunk.index,
+                                                                    module_index, component_index);
+            if (!remove && !replace)
+                continue;
+            for (uint32_t polygon : component.polygons)
+                edit.omitted[polygon] = true;
+            if (replace)
+                edit.additions.push_back(entity);
+            edit.changed = true;
+        }
+        edit.additions.insert(edit.additions.end(), authored[module_index].begin(), authored[module_index].end());
+        edit.changed |= !authored[module_index].empty();
+        if (edit.changed && edit.collision.required != edit.collision.size)
+            return fail(err, "collision module %u has unsupported trailing data", module_index);
+        any_changed |= edit.changed;
+    }
+    if (!any_changed)
+        return append_chunk_copy(out, chunk, err);
+
+    ChunkMark output_chunk = begin_chunk(out, ASURA_CHUNK_ENVIRONMENT_MODULELIST,
+                                         chunk.version, chunk.flags, err);
+    append_u32(out, static_cast<uint32_t>(modules.size()), err);
+    buffer_append(out, environment_name, environment_name_bytes, err);
+    for (uint32_t module_index = 0; module_index < modules.size(); ++module_index) {
+        const PcEmodModuleView& source = modules[module_index];
+        const ModuleEdit& edit = edits[module_index];
+        buffer_append(out, source.name, source.name_bytes, err);
+        Asura_Chunk_Environment_ModuleList_EntryV6 module = source.module;
+        const uint64_t module_at = out->size;
+        buffer_append(out, &module, sizeof(module), err);
+        const uint64_t collision_at = out->size;
+        if (edit.changed) {
+            if (!append_edited_collision_v3(out, edit.collision, module.m_xTranslation,
+                                            edit.components, edit.additions, edit.omitted, err))
+                return false;
+        } else {
+            buffer_append(out, source.collision, module.m_uCollisionDataSize, err);
+        }
+        if (out->size - collision_at > UINT32_MAX)
+            return fail(err, "edited EMOD collision module %u exceeds 4 GiB", module_index);
+        patch_u32(out, module_at + offsetof(Asura_Chunk_Environment_ModuleList_EntryV6,
+                                           m_uCollisionDataSize),
+                  static_cast<uint32_t>(out->size - collision_at), err);
+    }
+    return end_chunk(out, output_chunk, err);
+}
+
+bool append_editor_generated_emod(Buffer* out, const Document& doc, const EnvView& view,
+                                  uint32_t module_count, const Config& cfg,
+                                  const MaterialMap& materials, Arena* scratch,
+                                  ModuleMetric* metrics, Error* err) {
+    Buffer generated{};
+    if (!buffer_init(&generated, cfg.output_reserve, err))
+        return false;
+    const bool built = append_emod(&generated, view, module_count, cfg, materials,
+                                    scratch, metrics, err);
+    bool ok = built;
+    if (ok) {
+        ChunkRef chunk{generated.base, static_cast<uint32_t>(generated.size),
+                       ASURA_CHUNK_ENVIRONMENT_MODULELIST, 6, 0, 0};
+        ok = append_editor_emod_copy(out, chunk, doc, true, err);
+    }
+    buffer_release(&generated);
+    return ok;
 }
 
 bool replaced_pc_sound_resource(const Document& doc, const RscfInfo& resource) {
@@ -1661,6 +2883,231 @@ bool append_pc_material_map_override(Buffer* out, const ChunkList& source,
                                      const char* material_map_path, Arena* arena, Error* err);
 bool pc_environment_material_chunk_indices(const ChunkList& source, uint32_t* text_chunk_index,
                                            uint32_t* material_chunk_index, Error* err);
+
+bool contains_u32(const std::vector<uint32_t>& values, uint32_t value) {
+    return std::find(values.begin(), values.end(), value) != values.end();
+}
+
+std::string normalized_resource_path(Str value) {
+    std::string result;
+    result.reserve(value.size + 1);
+    for (uint32_t i = 0; i < value.size; ++i) {
+        char c = value.data[i];
+        if (c == '/')
+            c = '\\';
+        if (c >= 'A' && c <= 'Z')
+            c = static_cast<char>(c + ('a' - 'A'));
+        result.push_back(c);
+    }
+    return result;
+}
+
+bool static_text_references(const ChunkRef& chunk, Str resource_name) {
+    if (chunk.cid != ASURA_CHUNK_TEXTURENAMES || chunk.size < sizeof(Asura_Chunk_TextureNames))
+        return false;
+    std::string resource = normalized_resource_path(resource_name);
+    std::string relative = resource;
+    constexpr const char* graphics = "\\graphics";
+    if (relative.rfind(graphics, 0) == 0)
+        relative.erase(0, strlen(graphics));
+    while (!relative.empty() && relative.front() == '\\')
+        relative.erase(relative.begin());
+    const uint8_t* payload = chunk.data + sizeof(Asura_Chunk_Header);
+    const uint32_t payload_size = chunk.size - sizeof(Asura_Chunk_Header);
+    const uint32_t count = read_u32(payload);
+    uint32_t at = 4;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (at >= payload_size)
+            return false;
+        uint32_t end = at;
+        while (end < payload_size && payload[end])
+            ++end;
+        if (end == payload_size)
+            return false;
+        std::string name = normalized_resource_path(
+            {reinterpret_cast<const char*>(payload + at), end - at});
+        while (!name.empty() && name.front() == '\\')
+            name.erase(name.begin());
+        if (name == relative || name == resource)
+            return true;
+        const uint64_t next = align_up(static_cast<uint64_t>(end) + 1, 4);
+        if (next > payload_size)
+            return false;
+        at = static_cast<uint32_t>(next);
+    }
+    return false;
+}
+
+bool append_static_object_support(Buffer* out, const Document& document,
+                                  const ChunkList* existing, Error* err) {
+    std::vector<uint32_t> required_roots;
+    for (const Entity& entity : document.entities) {
+        if (entity.kind != EntityKind::StaticObject)
+            continue;
+        bool needs_donor = !entity.source_entity_record;
+        if (entity.source_entity_record) {
+            needs_donor = false;
+            for (const StaticObjectTemplate& object : document.static_object_templates)
+                if (object.file_id == entity.value_u32_b && !object.donor_path.empty() &&
+                    object.donor_path != document.source_pc_path) {
+                    needs_donor = true;
+                    break;
+                }
+        }
+        if (needs_donor && !contains_u32(required_roots, entity.value_u32_b))
+            required_roots.push_back(entity.value_u32_b);
+    }
+    if (required_roots.empty())
+        return true;
+
+    std::vector<uint32_t> present_objects, present_shapes;
+    std::vector<std::string> present_textures;
+    if (existing) {
+        for (uint32_t i = 0; i < existing->count; ++i) {
+            const ChunkRef& chunk = existing->chunks[i];
+            RscfInfo resource{};
+            if (rscf_info(chunk, &resource)) {
+                if (resource.type == ASURA_RESOURCEFILE_TYPE_PLATFORMSPECIFIC &&
+                    resource.subtype == ASURA_RESOURCEFILE_TYPE_PC_OBJECT && resource.payload_size >= 4)
+                    present_objects.push_back(read_u32(resource.payload));
+                else if (resource.type == ASURA_RESOURCEFILE_TYPE_TEXTURE)
+                    present_textures.push_back(normalized_resource_path(resource.name));
+            } else if (chunk.cid == ASURA_CHUNK_SHAPE &&
+                       chunk.size >= sizeof(Asura_Chunk_Header) + 4) {
+                present_shapes.push_back(read_u32(chunk.data + sizeof(Asura_Chunk_Header)));
+            }
+        }
+    }
+
+    Arena scratch{};
+    if (!arena_init(&scratch, 128 * MiB, err))
+        return false;
+    for (const std::string& donor_path : document.object_donors) {
+        bool donor_needed = false;
+        for (const StaticObjectTemplate& object : document.static_object_templates)
+            donor_needed |= object.donor_path == donor_path && contains_u32(required_roots, object.file_id) &&
+                            (!contains_u32(present_objects, object.file_id) ||
+                             !contains_u32(present_shapes, object.file_id));
+        if (!donor_needed)
+            continue;
+        ArenaMark mark = arena_mark(&scratch);
+        ChunkList donor{};
+        if (!parse_chunks(donor_path.c_str(), &donor, &scratch, err)) {
+            arena_release(&scratch);
+            return false;
+        }
+        std::vector<uint8_t> wanted(donor.count, 0);
+        std::vector<uint32_t> donor_ids;
+        for (const StaticObjectTemplate& object : document.static_object_templates)
+            if (object.donor_path == donor_path && contains_u32(required_roots, object.file_id) &&
+                !contains_u32(donor_ids, object.file_id))
+                donor_ids.push_back(object.file_id);
+
+        const uint32_t support_ids[] = {ASURA_CHUNK_TEXTURENAMES, ASURA_CHUNK_TEXTUREFLAGS,
+                                        ASURA_CHUNK_MATERIAL, ASURA_CHUNK_MATERIALNAMES};
+        auto is_material_support = [&](uint32_t cid) {
+            for (uint32_t support : support_ids)
+                if (cid == support)
+                    return true;
+            return false;
+        };
+        for (size_t id_index = 0; id_index < donor_ids.size(); ++id_index) {
+            const uint32_t id = donor_ids[id_index];
+            for (uint32_t i = 0; i < donor.count; ++i) {
+                RscfInfo resource{};
+                if (!rscf_info(donor.chunks[i], &resource) ||
+                    resource.type != ASURA_RESOURCEFILE_TYPE_PLATFORMSPECIFIC ||
+                    resource.subtype != ASURA_RESOURCEFILE_TYPE_PC_OBJECT || resource.payload_size < 20 ||
+                    read_u32(resource.payload) != id)
+                    continue;
+                if (!contains_u32(present_objects, id)) {
+                    wanted[i] = 1;
+                    for (int32_t before = static_cast<int32_t>(i) - 1;
+                         before >= 0 && is_material_support(donor.chunks[before].cid); --before)
+                        wanted[before] = 1;
+                }
+                const uint32_t vertex_count = read_u32(resource.payload + 8);
+                const uint32_t index_count = read_u32(resource.payload + 12);
+                const uint64_t lod_at = 20ull + static_cast<uint64_t>(vertex_count) * 32 +
+                                        static_cast<uint64_t>(index_count) * 2;
+                if (lod_at + 8 <= resource.payload_size) {
+                    const uint32_t next_lod = read_u32(resource.payload + lod_at + 4);
+                    if (next_lod && !contains_u32(donor_ids, next_lod))
+                        donor_ids.push_back(next_lod);
+                }
+                break;
+            }
+            if (!contains_u32(present_shapes, id)) {
+                for (uint32_t i = 0; i < donor.count; ++i) {
+                    const ChunkRef& shape = donor.chunks[i];
+                    if (shape.cid != ASURA_CHUNK_SHAPE ||
+                        shape.size < sizeof(Asura_Chunk_Header) + 4 ||
+                        read_u32(shape.data + sizeof(Asura_Chunk_Header)) != id)
+                        continue;
+                    wanted[i] = 1;
+                    if (i + 1 < donor.count && donor.chunks[i + 1].cid == ASURA_CHUNK_SHAPEDATA)
+                        wanted[i + 1] = 1;
+                    break;
+                }
+            }
+        }
+        for (uint32_t i = 0; i < donor.count; ++i) {
+            RscfInfo resource{};
+            if (!rscf_info(donor.chunks[i], &resource) || resource.type != ASURA_RESOURCEFILE_TYPE_TEXTURE)
+                continue;
+            const std::string normalized = normalized_resource_path(resource.name);
+            if (std::find(present_textures.begin(), present_textures.end(), normalized) != present_textures.end())
+                continue;
+            for (uint32_t text_index = 0; text_index < donor.count; ++text_index) {
+                if (wanted[text_index] && static_text_references(donor.chunks[text_index], resource.name)) {
+                    wanted[i] = 1;
+                    break;
+                }
+            }
+        }
+        for (uint32_t i = 0; i < donor.count && !err->set; ++i) {
+            if (!wanted[i])
+                continue;
+            RscfInfo resource{};
+            if (rscf_info(donor.chunks[i], &resource)) {
+                if (resource.type == ASURA_RESOURCEFILE_TYPE_PLATFORMSPECIFIC &&
+                    resource.subtype == ASURA_RESOURCEFILE_TYPE_PC_OBJECT && resource.payload_size >= 4) {
+                    const uint32_t id = read_u32(resource.payload);
+                    if (contains_u32(present_objects, id))
+                        continue;
+                    present_objects.push_back(id);
+                } else if (resource.type == ASURA_RESOURCEFILE_TYPE_TEXTURE) {
+                    const std::string normalized = normalized_resource_path(resource.name);
+                    if (std::find(present_textures.begin(), present_textures.end(), normalized) !=
+                        present_textures.end())
+                        continue;
+                    present_textures.push_back(normalized);
+                }
+            } else if (donor.chunks[i].cid == ASURA_CHUNK_SHAPE &&
+                       donor.chunks[i].size >= sizeof(Asura_Chunk_Header) + 4) {
+                const uint32_t id = read_u32(donor.chunks[i].data + sizeof(Asura_Chunk_Header));
+                if (contains_u32(present_shapes, id))
+                    continue;
+                present_shapes.push_back(id);
+            }
+            append_chunk_copy(out, donor.chunks[i], err);
+        }
+        unmap_file(&donor.file);
+        arena_reset(&scratch, mark);
+        if (err->set)
+            break;
+    }
+    if (!err->set) {
+        for (uint32_t id : required_roots) {
+            if (!contains_u32(present_objects, id) || !contains_u32(present_shapes, id)) {
+                fail(err, "Object %08X is not available from the selected Object donors", id);
+                break;
+            }
+        }
+    }
+    arena_release(&scratch);
+    return !err->set;
+}
 
 bool pack_pc_document(const Document& doc, const char* output_path, std::string* why) {
     Error err{};
@@ -1690,6 +3137,7 @@ bool pack_pc_document(const Document& doc, const char* output_path, std::string*
 
     bool source_has_lights = false, source_has_phonons = false, source_has_editable_entities = false;
     bool source_has_ambience = false;
+    uint32_t first_emod_chunk = 0xffffffffu;
     if (ok) {
         for (uint32_t i = 0; i < source.count; ++i) {
             source_has_lights |= source.chunks[i].cid == ASURA_CHUNK_LIGHTS;
@@ -1697,9 +3145,14 @@ bool pack_pc_document(const Document& doc, const char* output_path, std::string*
             source_has_editable_entities |= editable_pc_entity_chunk(source.chunks[i]);
             source_has_ambience |=
                 source.chunks[i].cid == ASURA_CHUNK_STREAMINGBACKGROUNDSOUND;
+            if (first_emod_chunk == 0xffffffffu &&
+                source.chunks[i].cid == ASURA_CHUNK_ENVIRONMENT_MODULELIST &&
+                source.chunks[i].version == 6)
+                first_emod_chunk = i;
         }
     }
     bool wrote_lights = false, wrote_phonons = false, wrote_entities = false, wrote_sound_resources = false;
+    bool wrote_object_support = false;
     bool wrote_skybox = false;
     auto write_lights = [&]() {
         if (!wrote_lights) {
@@ -1717,11 +3170,19 @@ bool pack_pc_document(const Document& doc, const char* output_path, std::string*
             ok = ok && append_phon(&output, sounds, &err);
         }
     };
+    auto write_object_support = [&]() {
+        if (!wrote_object_support) {
+            wrote_object_support = true;
+            ok = ok && append_static_object_support(&output, doc, &source, &err);
+        }
+    };
     auto write_entities = [&]() {
         if (!wrote_entities) {
+            write_object_support();
             wrote_entities = true;
             ok = ok && append_sound_entities(&output, sounds, &err) && append_editor_spawnpoints(&output, doc, &err) &&
-                 append_editor_pickups(&output, doc, &err);
+                 append_editor_pickups(&output, doc, &err) && append_editor_static_objects(&output, doc, &err) &&
+                 append_editor_building_volumes(&output, doc, &err);
         }
     };
 
@@ -1784,7 +3245,12 @@ bool pack_pc_document(const Document& doc, const char* output_path, std::string*
             write_phonons();
             continue;
         }
+        if (chunk.cid == ASURA_CHUNK_ENVIRONMENT_MODULELIST && chunk.version == 6) {
+            ok = append_editor_emod_copy(&output, chunk, doc, i == first_emod_chunk, &err);
+            continue;
+        }
         if (chunk.cid == ASURA_CHUNK_ENTITY) {
+            write_object_support();
             if (!source_has_lights)
                 write_lights();
             if (!source_has_phonons)
@@ -1800,6 +3266,12 @@ bool pack_pc_document(const Document& doc, const char* output_path, std::string*
         ok = ok && append_chunk_copy(&output, chunk, &err);
     }
     if (ok) {
+        for (const Entity& entity : doc.entities) {
+            if (entity.kind == EntityKind::InvisibleBarrier && first_emod_chunk == 0xffffffffu) {
+                ok = fail(&err, "the source .PC has no EMOD collision data for invisible barriers");
+                break;
+            }
+        }
         write_lights();
         write_phonons();
         write_entities();
@@ -1830,12 +3302,19 @@ bool pack_document(Document& doc, const char* output_path, std::string* why) {
             *why = "Open an OBJ before exporting.";
         return false;
     }
-    bool has_pickups = false;
-    for (const Entity& entity : doc.entities)
+    bool has_pickups = false, has_static_objects = false;
+    for (const Entity& entity : doc.entities) {
         has_pickups |= entity.kind == EntityKind::Pickup;
+        has_static_objects |= entity.kind == EntityKind::StaticObject;
+    }
     if (has_pickups && doc.weapons_donor.empty()) {
         if (why)
             *why = "Choose a Weapons donor .PC before exporting pickups from a custom level.";
+        return false;
+    }
+    if (has_static_objects && doc.object_donors.empty()) {
+        if (why)
+            *why = "Choose at least one Object donor .PC before exporting Objects from a custom level.";
         return false;
     }
     Error err{};
@@ -1888,6 +3367,7 @@ bool pack_document(Document& doc, const char* output_path, std::string* why) {
         buffer_append(&output, kAsuraMagic, sizeof(kAsuraMagic), &err);
         ok = append_fnfo(&output, &err) && append_rsfl(&output, cfg, &scratch, &err) &&
              append_weapon_support(&output, cfg, &scratch, &err) &&
+             append_static_object_support(&output, doc, nullptr, &err) &&
              append_sky_resources(&output, cfg, &scratch, &err) &&
              append_textures(&output, cfg, view, material_map, &arena, &scratch, &textures, &err) &&
              append_rscf(&output, str_from_c(cfg.env_name), ASURA_RESOURCEFILE_TYPE_PLATFORMSPECIFIC,
@@ -1897,12 +3377,14 @@ bool pack_document(Document& doc, const char* output_path, std::string* why) {
              (doc.ambient_stream_path.empty() || append_editor_ambience(&output, doc, &err)) &&
              append_editor_lights(&output, doc, &err) &&
              append_phon(&output, sounds, &err) &&
-             append_emod(&output, view, view.module_count, cfg, material_map, &scratch, metrics, &err) &&
+             append_editor_generated_emod(&output, doc, view, view.module_count, cfg, material_map,
+                                           &scratch, metrics, &err) &&
              append_mlin(&output, metrics, view.module_count, &err) &&
              append_mrvb(&output, view.module_count, &err) && append_nav1(&output, view.module_count, &err) &&
-             append_sound_entities(&output, sounds, &err) && append_editor_spawnpoints(&output, doc, &err) &&
-              append_editor_pickups(&output, doc, &err) &&
-              append_editor_skybox(&output, doc.skybox, &err) &&
+              append_sound_entities(&output, sounds, &err) && append_editor_spawnpoints(&output, doc, &err) &&
+               append_editor_pickups(&output, doc, &err) && append_editor_static_objects(&output, doc, &err) &&
+               append_editor_building_volumes(&output, doc, &err) &&
+               append_editor_skybox(&output, doc.skybox, &err) &&
              append_fog(&output, &err) && append_editor_weather(&output, doc, &err) &&
              buffer_append(&output, nullptr, sizeof(Asura_Chunk_Header), &err) != ~0ull &&
              write_entire_file(output_path, output.base, output.size, &err);
@@ -1932,6 +3414,7 @@ enum ControlId : int {
     ID_EXPORT_MATERIAL_MAP,
     ID_TEXTURE_DIR,
     ID_WEAPONS_DONOR,
+    ID_OBJECT_DONOR,
     ID_SKYBOX_TEXTURES,
     ID_TOGGLE_RAIN,
     ID_AMBIENCE_PROPERTIES,
@@ -1940,6 +3423,9 @@ enum ControlId : int {
     ID_ADD_LIGHT,
     ID_ADD_SOUND,
     ID_ADD_PICKUP,
+    ID_ADD_STATIC_OBJECT,
+    ID_ADD_BUILDING_VOLUME,
+    ID_ADD_INVISIBLE_BARRIER,
     ID_DELETE_ENTITY,
     ID_UNDO,
     ID_REDO,
@@ -1956,6 +3442,7 @@ enum ControlId : int {
     ID_ROT_Z,
     ID_VALUE_A,
     ID_VALUE_B,
+    ID_VALUE_C,
     ID_PICKUP_ITEM,
     ID_LIGHT_PROPERTIES,
     ID_SOUND_LOOP,
@@ -1977,6 +3464,7 @@ constexpr uint32_t kInspectorDirtyRotY = 1u << 5;
 constexpr uint32_t kInspectorDirtyRotZ = 1u << 6;
 constexpr uint32_t kInspectorDirtyValueA = 1u << 7;
 constexpr uint32_t kInspectorDirtyValueB = 1u << 8;
+constexpr uint32_t kInspectorDirtyValueC = 1u << 21;
 constexpr uint32_t kInspectorDirtyPickup = 1u << 9;
 constexpr uint32_t kInspectorDirtySoundLoop = 1u << 10;
 constexpr int kInspectorDirtySpawnTeamShift = 11;
@@ -1995,8 +3483,8 @@ struct AppState {
     HWND name = nullptr;
     HWND pos[3]{};
     HWND rot[3]{};
-    HWND value[2]{};
-    HWND value_label[2]{};
+    HWND value[3]{};
+    HWND value_label[3]{};
     HWND pickup_item = nullptr;
     HWND rain_toggle = nullptr;
     HWND ambience_properties = nullptr;
@@ -2018,6 +3506,7 @@ struct AppState {
     std::array<SpawnPuppet, 3> spawn_puppets;
     std::string spawn_puppet_source;
     std::vector<PickupModel> pickup_models;
+    std::vector<StaticObjectModel> static_object_models;
     std::vector<uint8_t> sound_preview_bytes;
     int sound_preview_entity = -1;
     Camera camera;
@@ -2084,6 +3573,7 @@ void record_inspector_edit(int id, int notification) {
         case ID_ROT_Z: g.inspector_dirty |= kInspectorDirtyRotZ; break;
         case ID_VALUE_A: g.inspector_dirty |= kInspectorDirtyValueA; break;
         case ID_VALUE_B: g.inspector_dirty |= kInspectorDirtyValueB; break;
+        case ID_VALUE_C: g.inspector_dirty |= kInspectorDirtyValueC; break;
         }
     } else if (id == ID_PICKUP_ITEM && notification == CBN_SELCHANGE) {
         g.inspector_dirty |= kInspectorDirtyPickup;
@@ -2161,11 +3651,23 @@ const SpawnPuppet* pickup_model_for_skin(uint32_t skin_id) {
     return nullptr;
 }
 
+const SpawnPuppet* static_object_model_for_file(uint32_t file_id) {
+    for (const StaticObjectModel& model : g.static_object_models)
+        if (model.file_id == file_id && !model.mesh.faces.empty())
+            return &model.mesh;
+    return nullptr;
+}
+
 const SpawnPuppet* entity_render_model(const Entity& entity) {
     if (entity.kind == EntityKind::SpawnPoint)
         return spawn_puppet_for_team(entity.value_u32_a);
     if (entity.kind == EntityKind::Pickup)
         return pickup_model_for_skin(entity.pickup_skin_id);
+    if (entity.kind == EntityKind::StaticObject) {
+        if (const SpawnPuppet* direct = static_object_model_for_file(entity.value_u32_b))
+            return direct;
+        return pickup_model_for_skin(entity.pickup_skin_id);
+    }
     return nullptr;
 }
 
@@ -2469,6 +3971,19 @@ struct GpuMaterialRange {
     bool source_pc_material = false;
 };
 
+struct GpuPuppetRange {
+    uint32_t start_vertex = 0;
+    uint32_t vertex_count = 0;
+    const SpawnPuppetMaterial* material = nullptr;
+    bool selected = false;
+};
+
+struct GpuModelTexture {
+    std::string name;
+    uint64_t fingerprint = 0;
+    ID3D11ShaderResourceView* view = nullptr;
+};
+
 bool gpu_material_uses_alpha(const GpuMaterialRange& range) {
     return range.texture && (range.material_flags & 0x2u) != 0;
 }
@@ -2542,6 +4057,7 @@ struct GpuRenderer {
     uint32_t rain_capacity = 0;
     uint32_t rain_vertex_count = 0;
     std::vector<GpuMaterialRange> material_ranges;
+    std::vector<GpuModelTexture> model_textures;
     uint32_t width = 0, height = 0;
     DirectX::XMFLOAT4 skybox_tint{1, 1, 1, 1};
     bool environment_wet_weather = false;
@@ -2578,6 +4094,12 @@ void gpu_release_skybox_textures() {
         gpu_release(face);
     gpu_release(gpu.skybox_cloud);
     gpu.skybox_active = false;
+}
+
+void gpu_release_model_textures() {
+    for (GpuModelTexture& texture : gpu.model_textures)
+        gpu_release(texture.view);
+    gpu.model_textures.clear();
 }
 
 void gpu_release_environment_textures() {
@@ -2729,6 +4251,25 @@ bool gpu_create_dds_view_from_memory(const uint8_t* bytes, size_t byte_count, co
         return false;
     }
     return true;
+}
+
+ID3D11ShaderResourceView* gpu_model_texture_view(const SpawnPuppetMaterial* material) {
+    if (!material || material->texture_bytes.empty())
+        return gpu.white_texture;
+    for (const GpuModelTexture& cached : gpu.model_textures) {
+        if (cached.fingerprint == material->texture_fingerprint && cached.name == material->texture_name)
+            return cached.view ? cached.view : gpu.white_texture;
+    }
+
+    GpuModelTexture cached;
+    cached.name = material->texture_name;
+    cached.fingerprint = material->texture_fingerprint;
+    std::string ignored_error;
+    gpu_create_dds_view_from_memory(material->texture_bytes.data(), material->texture_bytes.size(),
+                                    material->texture_name.c_str(), &cached.view, &ignored_error);
+    gpu.model_textures.push_back(std::move(cached));
+    ID3D11ShaderResourceView* view = gpu.model_textures.back().view;
+    return view ? view : gpu.white_texture;
 }
 
 bool gpu_create_dds_view(const char* path, ID3D11ShaderResourceView** output, std::string* why) {
@@ -3577,6 +5118,7 @@ void gpu_shutdown() {
         gpu.context->ClearState();
     gpu_release_targets();
     gpu_release_skybox_textures();
+    gpu_release_model_textures();
     gpu_release_environment_textures();
     gpu.material_ranges.clear();
     gpu_release(gpu.white_texture);
@@ -3760,14 +5302,19 @@ VSOutput VSMain(VSInput input) {
     output.worldPosition = input.position;
     return output;
 }
+Texture2D modelTexture : register(t0);
+SamplerState modelSampler : register(s0);
 float4 PSMain(VSOutput input) : SV_TARGET {
     if (input.color.a > 0.5)
         return input.color;
+    float4 albedo = modelTexture.Sample(modelSampler, input.uv);
+    if (albedo.a <= 10.0 / 255.0)
+        discard;
     float light = 0.28 + 0.72 * abs(dot(normalize(input.normal), normalize(float3(-0.35, 0.8, -0.45))));
     float3 baseColor = dot(abs(input.color.rgb), float3(1.0, 1.0, 1.0)) > 0.001
                            ? input.color.rgb
                            : float3(0.32, 0.39, 0.43);
-    return float4(baseColor * light, 1.0);
+    return float4(baseColor * albedo.rgb * light, 1.0);
 }
 Texture2D environmentTexture : register(t2);
 Texture2D environmentAuxiliary : register(t3);
@@ -4171,6 +5718,7 @@ float4 SkyCloudPSMain(SkyVSOutput input) : SV_TARGET {
 }
 
 bool gpu_upload_mesh() {
+    gpu_release_model_textures();
     gpu_release_environment_textures();
     gpu.material_ranges.clear();
     gpu_release(gpu.mesh_indices);
@@ -4399,10 +5947,13 @@ void gpu_render_skybox(const DirectX::XMFLOAT4X4& view_projection) {
     gpu.context->PSSetShaderResources(0, _countof(none), none);
 }
 
-void append_gpu_spawn_puppet(const Entity& entity, bool selected, std::vector<GpuVertex>* output) {
+void append_gpu_spawn_puppet(const Entity& entity, bool selected, std::vector<GpuVertex>* output,
+                             std::vector<GpuPuppetRange>* ranges = nullptr) {
     const SpawnPuppet* puppet = spawn_puppet_for_team(entity.value_u32_a);
     if (!puppet)
         return;
+
+    const uint32_t start_vertex = static_cast<uint32_t>(output->size());
 
     DirectX::XMFLOAT4 color;
     if (entity.value_u32_a == 4 || entity.value_u32_a == 5) {
@@ -4426,25 +5977,125 @@ void append_gpu_spawn_puppet(const Entity& entity, bool selected, std::vector<Gp
             const SpawnPuppetVertex& source = puppet->vertices[index];
             const Asura_Vector_3 position = spawn_puppet_view_position(source.position, entity);
             const Asura_Vector_3 normal = normalized(spawn_puppet_view_vector(source.normal, entity));
-            output->push_back({{position.x, position.y, position.z}, {normal.x, normal.y, normal.z}, color});
+            output->push_back({{position.x, position.y, position.z}, {normal.x, normal.y, normal.z}, color,
+                               {source.texcoord.x, source.texcoord.y}});
         }
     }
+    if (ranges && output->size() > start_vertex)
+        ranges->push_back({start_vertex, static_cast<uint32_t>(output->size()) - start_vertex, nullptr, selected});
 }
 
-void append_gpu_pickup_model(const Entity& entity, bool selected, std::vector<GpuVertex>* output) {
-    const SpawnPuppet* model = pickup_model_for_skin(entity.pickup_skin_id);
+void append_gpu_entity_model(const Entity& entity, bool selected, std::vector<GpuVertex>* output,
+                             std::vector<GpuPuppetRange>* ranges = nullptr) {
+    const SpawnPuppet* model = entity_render_model(entity);
     if (!model)
         return;
-    DirectX::XMFLOAT4 color = selected ? DirectX::XMFLOAT4{1.0f, .68f, .22f, 0}
-                                       : DirectX::XMFLOAT4{.72f, .31f, .08f, 0};
-    for (const auto& face : model->faces) {
+    for (uint32_t face_index = 0; face_index < model->faces.size(); ++face_index) {
+        const auto& face = model->faces[face_index];
+        const int32_t material_index = face_index < model->face_materials.size()
+                                           ? model->face_materials[face_index]
+                                           : -1;
+        const SpawnPuppetMaterial* material = material_index >= 0 &&
+                                                       static_cast<uint32_t>(material_index) < model->materials.size()
+                                                   ? &model->materials[material_index]
+                                                   : nullptr;
+        const bool textured = material && !material->texture_bytes.empty();
+        DirectX::XMFLOAT4 color = entity.kind == EntityKind::StaticObject
+                                      ? DirectX::XMFLOAT4{.12f, .62f, .48f, 0}
+                                      : DirectX::XMFLOAT4{.72f, .31f, .08f, 0};
+        if (textured)
+            color = selected ? DirectX::XMFLOAT4{1.0f, .82f, .58f, 0}
+                             : DirectX::XMFLOAT4{1.0f, 1.0f, 1.0f, 0};
+        else if (selected)
+            color = entity.kind == EntityKind::StaticObject ? DirectX::XMFLOAT4{.42f, 1.0f, .82f, 0}
+                                                             : DirectX::XMFLOAT4{1.0f, .68f, .22f, 0};
+        const uint32_t start_vertex = static_cast<uint32_t>(output->size());
         for (uint16_t index : face) {
             const SpawnPuppetVertex& source = model->vertices[index];
             const Asura_Vector_3 position = spawn_puppet_view_position(source.position, entity);
             const Asura_Vector_3 normal = normalized(spawn_puppet_view_vector(source.normal, entity));
-            output->push_back({{position.x, position.y, position.z}, {normal.x, normal.y, normal.z}, color});
+            output->push_back({{position.x, position.y, position.z}, {normal.x, normal.y, normal.z}, color,
+                               {source.texcoord.x, source.texcoord.y}});
+        }
+        if (ranges) {
+            if (!ranges->empty() && ranges->back().material == material &&
+                ranges->back().selected == selected &&
+                ranges->back().start_vertex + ranges->back().vertex_count == start_vertex) {
+                ranges->back().vertex_count += 3;
+            } else {
+                ranges->push_back({start_vertex, 3, material, selected});
+            }
         }
     }
+}
+
+void append_view_bounding_box(const Asura_Bounding_Box& bounds,
+                              std::vector<LightGizmoLine>* lines) {
+    const float values[] = {bounds.MinX, bounds.MaxX, bounds.MinY,
+                            bounds.MaxY, bounds.MinZ, bounds.MaxZ};
+    for (float value : values)
+        if (!isfinite(value))
+            return;
+    Asura_Vector_3 corners[8]{};
+    for (int corner = 0; corner < 8; ++corner) {
+        corners[corner] = {corner & 1 ? bounds.MaxX : bounds.MinX,
+                           corner & 2 ? bounds.MaxY : bounds.MinY,
+                           corner & 4 ? bounds.MaxZ : bounds.MinZ};
+    }
+    for (int corner = 0; corner < 8; ++corner) {
+        for (int axis = 0; axis < 3; ++axis) {
+            const int other = corner ^ (1 << axis);
+            if (corner < other)
+                append_light_gizmo_line(lines, corners[corner], corners[other]);
+        }
+    }
+}
+
+void append_oriented_bounds_gizmo(const Entity& entity, std::vector<LightGizmoLine>* lines) {
+    const Asura_Bounding_Box& bounds = entity.source_bounds;
+    const float values[] = {bounds.MinX, bounds.MaxX, bounds.MinY, bounds.MaxY,
+                            bounds.MinZ, bounds.MaxZ, entity.position.x, entity.position.y,
+                            entity.position.z, entity.rotation.x, entity.rotation.y,
+                            entity.rotation.z};
+    for (float value : values)
+        if (!isfinite(value))
+            return;
+    if (bounds.MinX > bounds.MaxX || bounds.MinY > bounds.MaxY || bounds.MinZ > bounds.MaxZ)
+        return;
+
+    const Asura_Vector_3 source_center{(bounds.MinX + bounds.MaxX) * .5f,
+                                       (bounds.MinY + bounds.MaxY) * .5f,
+                                       (bounds.MinZ + bounds.MaxZ) * .5f};
+    const Asura_Quat orientation = euler_quaternion(entity.rotation);
+    Asura_Vector_3 corners[8]{};
+    for (int corner = 0; corner < 8; ++corner) {
+        const Asura_Vector_3 source_corner{corner & 1 ? bounds.MaxX : bounds.MinX,
+                                           corner & 2 ? bounds.MaxY : bounds.MinY,
+                                           corner & 4 ? bounds.MaxZ : bounds.MinZ};
+        const Asura_Vector_3 local = sub(source_corner, source_center);
+        corners[corner] = entity_view_position(
+            add(entity.position, rotate_by_quaternion(local, orientation)));
+    }
+    for (int corner = 0; corner < 8; ++corner) {
+        for (int axis = 0; axis < 3; ++axis) {
+            const int other = corner ^ (1 << axis);
+            if (corner < other)
+                append_light_gizmo_line(lines, corners[corner], corners[other]);
+        }
+    }
+}
+
+void gpu_draw_puppet_ranges(const std::vector<GpuPuppetRange>& ranges, bool selected) {
+    gpu.context->PSSetSamplers(0, 1, &gpu.environment_sampler);
+    for (const GpuPuppetRange& range : ranges) {
+        if (range.selected != selected || !range.vertex_count)
+            continue;
+        ID3D11ShaderResourceView* texture = gpu_model_texture_view(range.material);
+        gpu.context->PSSetShaderResources(0, 1, &texture);
+        gpu.context->Draw(range.vertex_count, range.start_vertex);
+    }
+    ID3D11ShaderResourceView* none = nullptr;
+    gpu.context->PSSetShaderResources(0, 1, &none);
 }
 
 void gpu_render() {
@@ -4651,6 +6302,7 @@ void gpu_render() {
                     static_cast<float>(width) / height, rain_animation_time);
     gpu.context->PSSetShader(gpu.pixel_shader, nullptr, 0);
     std::vector<GpuVertex> puppet_vertices;
+    std::vector<GpuPuppetRange> puppet_ranges;
     size_t puppet_vertex_count = 0;
     for (const Entity& entity : g.document.entities) {
         const SpawnPuppet* model = entity_render_model(entity);
@@ -4663,9 +6315,9 @@ void gpu_render() {
             continue;
         const Entity& entity = g.document.entities[i];
         if (entity.kind == EntityKind::SpawnPoint)
-            append_gpu_spawn_puppet(entity, false, &puppet_vertices);
-        else if (entity.kind == EntityKind::Pickup)
-            append_gpu_pickup_model(entity, false, &puppet_vertices);
+            append_gpu_spawn_puppet(entity, false, &puppet_vertices, &puppet_ranges);
+        else if (entity.kind == EntityKind::Pickup || entity.kind == EntityKind::StaticObject)
+            append_gpu_entity_model(entity, false, &puppet_vertices, &puppet_ranges);
     }
     const uint32_t unselected_puppet_count = static_cast<uint32_t>(puppet_vertices.size());
     for (int selected_index : g.selected_entities) {
@@ -4673,9 +6325,9 @@ void gpu_render() {
             continue;
         const Entity& selected_entity = g.document.entities[selected_index];
         if (selected_entity.kind == EntityKind::SpawnPoint)
-            append_gpu_spawn_puppet(selected_entity, true, &puppet_vertices);
-        else if (selected_entity.kind == EntityKind::Pickup)
-            append_gpu_pickup_model(selected_entity, true, &puppet_vertices);
+            append_gpu_spawn_puppet(selected_entity, true, &puppet_vertices, &puppet_ranges);
+        else if (selected_entity.kind == EntityKind::Pickup || selected_entity.kind == EntityKind::StaticObject)
+            append_gpu_entity_model(selected_entity, true, &puppet_vertices, &puppet_ranges);
     }
     const uint32_t selected_puppet_count =
         static_cast<uint32_t>(puppet_vertices.size()) - unselected_puppet_count;
@@ -4696,7 +6348,8 @@ void gpu_render() {
             gizmo_line_capacity = kLightRangeSegments * 3 * g.selected_entities.size();
     }
     overlay.reserve((lines * 2 + 1) * 4 +
-                    g.document.entities.size() * (6 + kCameraSpawnArrowLines * 2) +
+                    g.document.entities.size() *
+                        (6 + kCameraSpawnArrowLines * 2 + kLightBoundingBoxLines * 2) +
                     gizmo_line_capacity * 2);
     for (int i = -lines; i <= lines; ++i) {
         const auto color = i == 0 ? major : minor;
@@ -4726,12 +6379,27 @@ void gpu_render() {
             color = {.2f, .7f, 1, 1};
         else if (entity.kind == EntityKind::Pickup)
             color = {1, .45f, .18f, 1};
+        else if (entity.kind == EntityKind::StaticObject)
+            color = {.2f, .8f, .65f, 1};
         else if (entity.kind == EntityKind::AssassinationTarget)
             color = {1, .15f, .25f, 1};
         else if (entity.kind == EntityKind::PositionMarker)
             color = {.75f, .35f, 1, 1};
+        else if (entity.kind == EntityKind::BuildingVolume)
+            color = {.15f, .88f, 1, 1};
+        else if (entity.kind == EntityKind::InvisibleBarrier)
+            color = {1.0f, .34f, .08f, 1.0f};
         if (selected)
             color = {1, 1, 1, 1};
+        if (entity.kind == EntityKind::BuildingVolume || entity.kind == EntityKind::InvisibleBarrier) {
+            entity_gizmo.clear();
+            append_oriented_bounds_gizmo(entity, &entity_gizmo);
+            for (const LightGizmoLine& line : entity_gizmo) {
+                overlay.push_back(gpu_line_vertex(line.a, color));
+                overlay.push_back(gpu_line_vertex(line.b, color));
+            }
+            continue;
+        }
         if (entity.kind == EntityKind::SpawnPoint &&
             (entity.value_u32_a & SnipeSpawnTeam_Camera)) {
             entity_gizmo.clear();
@@ -4782,7 +6450,7 @@ void gpu_render() {
         gpu.context->OMSetDepthStencilState(gpu.depth_enabled, 0);
         gpu.context->IASetVertexBuffers(0, 1, &gpu.puppet_vertices, &stride, &offset);
         gpu.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        gpu.context->Draw(unselected_puppet_count, 0);
+        gpu_draw_puppet_ranges(puppet_ranges, false);
     }
     if (overlay_ready && selected_entity_start > entity_start) {
         gpu.context->OMSetDepthStencilState(gpu.depth_enabled, 0);
@@ -4797,7 +6465,7 @@ void gpu_render() {
         gpu.context->OMSetDepthStencilState(gpu.depth_enabled, 0);
         gpu.context->IASetVertexBuffers(0, 1, &gpu.puppet_vertices, &stride, &offset);
         gpu.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        gpu.context->Draw(selected_puppet_count, unselected_puppet_count);
+        gpu_draw_puppet_ranges(puppet_ranges, true);
     }
     if (overlay_ready && overlay.size() > selected_entity_start) {
         gpu.context->OMSetDepthStencilState(gpu.depth_disabled, 0);
@@ -5745,6 +7413,71 @@ void adopt_pickup_template(Entity* entity, const PickupTemplate& source) {
     entity->pickup_has_template = true;
 }
 
+bool choose_paths(HWND owner, const char* title, const char* filter, const char* extension,
+                  const std::vector<std::string>& current, std::vector<std::string>* paths) {
+    std::vector<char> buffer(64 * 1024, 0);
+    std::string initial_directory;
+    if (!current.empty()) {
+        const size_t slash = current.front().find_last_of("\\/");
+        if (slash != std::string::npos)
+            initial_directory = current.front().substr(0, slash);
+    }
+    OPENFILENAMEA ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = owner;
+    ofn.lpstrTitle = title;
+    ofn.lpstrFilter = filter;
+    ofn.lpstrFile = buffer.data();
+    ofn.nMaxFile = static_cast<DWORD>(buffer.size());
+    ofn.lpstrDefExt = extension;
+    ofn.lpstrInitialDir = initial_directory.empty() ? nullptr : initial_directory.c_str();
+    ofn.Flags = OFN_EXPLORER | OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_ALLOWMULTISELECT;
+    if (!GetOpenFileNameA(&ofn))
+        return false;
+    std::vector<std::string> selected;
+    const std::string first = buffer.data();
+    const char* next = buffer.data() + first.size() + 1;
+    if (!*next) {
+        selected.push_back(first);
+    } else {
+        while (*next) {
+            std::string path = first;
+            if (!path.empty() && path.back() != '\\' && path.back() != '/')
+                path.push_back('\\');
+            path += next;
+            selected.push_back(std::move(path));
+            next += strlen(next) + 1;
+        }
+    }
+    *paths = std::move(selected);
+    return true;
+}
+
+const StaticObjectTemplate* find_static_object_template(const Document& document, uint32_t file_id,
+                                                        bool require_file) {
+    const StaticObjectTemplate* fallback = nullptr;
+    for (const StaticObjectTemplate& candidate : document.static_object_templates) {
+        if (!fallback)
+            fallback = &candidate;
+        if (candidate.file_id == file_id)
+            return &candidate;
+    }
+    return require_file ? nullptr : fallback;
+}
+
+void adopt_static_object_template(Entity* entity, const StaticObjectTemplate& source) {
+    Snipe_ServerEntity_StaticObject_ChunkDataV0 body{};
+    memcpy(&body, source.body.data(), sizeof(body));
+    entity->value_a = body.m_xPhysicalObject.m_fHealth;
+    entity->value_u32_b = source.file_id;
+    entity->pickup_skin_id = body.m_xPhysicalObject.m_uSkinID;
+    entity->pickup_anim_id = body.m_xPhysicalObject.m_uAnimID;
+    entity->pickup_anim_file_id = body.m_xPhysicalObject.m_uAnimFileID;
+    entity->entity_padding = source.entity_padding;
+    entity->static_object_body = source.body;
+    entity->static_object_has_template = true;
+}
+
 const char* entity_type_label(EntityKind kind) {
     switch (kind) {
     case EntityKind::SpawnPoint: return "Spawn";
@@ -5753,6 +7486,9 @@ const char* entity_type_label(EntityKind kind) {
     case EntityKind::Pickup: return "Pickup";
     case EntityKind::AssassinationTarget: return "Target";
     case EntityKind::PositionMarker: return "Marker";
+    case EntityKind::StaticObject: return "Object";
+    case EntityKind::BuildingVolume: return "Building volume";
+    case EntityKind::InvisibleBarrier: return "Invisible barrier";
     }
     return "Entity";
 }
@@ -5888,16 +7624,47 @@ void refresh_pickup_choices(uint32_t selected_item) {
     }
 }
 
+void refresh_static_object_choices(uint32_t selected_file) {
+    SendMessageA(g.pickup_item, CB_RESETCONTENT, 0, 0);
+    std::vector<const StaticObjectTemplate*> choices;
+    choices.reserve(g.document.static_object_templates.size());
+    for (const StaticObjectTemplate& object : g.document.static_object_templates)
+        choices.push_back(&object);
+    std::stable_sort(choices.begin(), choices.end(), [](const StaticObjectTemplate* a,
+                                                        const StaticObjectTemplate* b) {
+        const int names = _stricmp(a->resource_name.c_str(), b->resource_name.c_str());
+        return names != 0 ? names < 0 : a->file_id < b->file_id;
+    });
+    for (const StaticObjectTemplate* object : choices) {
+        char label[640]{};
+        snprintf(label, sizeof(label), "%s (%08X)",
+                 object->resource_name.empty() ? "Unnamed Object" : object->resource_name.c_str(),
+                 object->file_id);
+        const LRESULT row = SendMessageA(g.pickup_item, CB_ADDSTRING, 0,
+                                         reinterpret_cast<LPARAM>(label));
+        if (row == CB_ERR || row == CB_ERRSPACE)
+            continue;
+        SendMessageA(g.pickup_item, CB_SETITEMDATA, static_cast<WPARAM>(row), object->file_id);
+        if (object->file_id == selected_file)
+            SendMessageA(g.pickup_item, CB_SETCURSEL, static_cast<WPARAM>(row), 0);
+    }
+}
+
 void refresh_inspector() {
     g.refreshing_inspector = true;
     g.inspector_dirty = 0;
     const bool enabled = g.selected >= 0 && g.selected < static_cast<int>(g.document.entities.size());
     const bool source_entity = enabled && g.document.entities[g.selected].source_entity_record;
     const bool pickup = enabled && g.document.entities[g.selected].kind == EntityKind::Pickup;
+    const bool static_object = enabled && g.document.entities[g.selected].kind == EntityKind::StaticObject;
+    const bool oriented_bounds = enabled &&
+                                 (g.document.entities[g.selected].kind == EntityKind::BuildingVolume ||
+                                  g.document.entities[g.selected].kind == EntityKind::InvisibleBarrier);
     bool selection_deletable = enabled;
     for (int index : g.selected_entities) {
         const Entity& entity = g.document.entities[index];
-        selection_deletable &= !entity.source_entity_record || entity.kind == EntityKind::Pickup;
+        selection_deletable &= !entity.source_entity_record || entity.kind == EntityKind::Pickup ||
+                               entity.kind == EntityKind::StaticObject;
     }
     if (g.rain_toggle) {
         SendMessageA(g.rain_toggle, BM_SETCHECK,
@@ -5908,11 +7675,13 @@ void refresh_inspector() {
     if (g.ambience_properties)
         EnableWindow(g.ambience_properties,
                      !g.document.source_pc_path.empty() || !g.document.obj_path.empty());
-    HWND fields[] = {g.name, g.pos[0], g.pos[1], g.pos[2], g.rot[0], g.rot[1], g.rot[2], g.value[0], g.value[1]};
+    HWND fields[] = {g.name, g.pos[0], g.pos[1], g.pos[2], g.rot[0], g.rot[1], g.rot[2],
+                     g.value[0], g.value[1], g.value[2]};
     for (HWND h : fields)
         EnableWindow(h, enabled);
-    EnableWindow(g.value[0], enabled && (!source_entity || pickup));
-    EnableWindow(g.value[1], enabled && !source_entity && !pickup);
+    EnableWindow(g.value[0], enabled && (!source_entity || pickup || static_object || oriented_bounds));
+    EnableWindow(g.value[1], enabled && ((!source_entity && !pickup && !static_object) || oriented_bounds));
+    EnableWindow(g.value[2], oriented_bounds);
     EnableWindow(GetDlgItem(g.window, ID_APPLY_INSPECTOR), enabled);
     EnableWindow(GetDlgItem(g.window, ID_DELETE_ENTITY), selection_deletable);
     if (g.selected_entities.size() > 1) {
@@ -5937,6 +7706,10 @@ void refresh_inspector() {
         ShowWindow(GetDlgItem(g.window, 914 + i), SW_SHOW);
         ShowWindow(g.rot[i], SW_SHOW);
     }
+    for (int i = 0; i < 3; ++i) {
+        ShowWindow(g.value_label[i], SW_HIDE);
+        ShowWindow(g.value[i], SW_HIDE);
+    }
     for (int i = 0; i < 2; ++i) {
         ShowWindow(g.value_label[i], SW_SHOW);
         ShowWindow(g.value[i], SW_SHOW);
@@ -5946,6 +7719,7 @@ void refresh_inspector() {
             SetWindowTextA(h, "");
         set_control_text(g.value_label[0], "Property A");
         set_control_text(g.value_label[1], "Property B");
+        set_control_text(g.value_label[2], "Property C");
         set_control_text(GetDlgItem(g.window, 914), "Pitch");
         set_control_text(GetDlgItem(g.window, 915), "Yaw");
         set_control_text(GetDlgItem(g.window, 916), "Roll");
@@ -6019,6 +7793,15 @@ void refresh_inspector() {
         EnableWindow(g.pickup_item,
                      SendMessageA(g.pickup_item, CB_GETCOUNT, 0, 0) > 0);
         ShowWindow(g.pickup_item, SW_SHOW);
+    } else if (e.kind == EntityKind::StaticObject) {
+        set_control_text(g.value_label[0], "Object type");
+        set_control_text(g.value_label[1], "Object file ID");
+        set_float(g.value[0], e.value_a);
+        set_u32_hex(g.value[1], e.value_u32_b);
+        ShowWindow(g.value[0], SW_HIDE);
+        refresh_static_object_choices(e.value_u32_b);
+        EnableWindow(g.pickup_item, SendMessageA(g.pickup_item, CB_GETCOUNT, 0, 0) > 0);
+        ShowWindow(g.pickup_item, SW_SHOW);
     } else if (e.kind == EntityKind::AssassinationTarget) {
         set_control_text(g.value_label[0], "Health");
         set_control_text(g.value_label[1], "Class ID");
@@ -6029,6 +7812,16 @@ void refresh_inspector() {
         set_control_text(g.value_label[1], "Bounds depth");
         set_float(g.value[0], e.value_a);
         set_float(g.value[1], e.value_b);
+    } else if (e.kind == EntityKind::BuildingVolume || e.kind == EntityKind::InvisibleBarrier) {
+        const Asura_Vector_3 size = oriented_box_dimensions(e);
+        set_control_text(g.value_label[0], "Bounds width");
+        set_control_text(g.value_label[1], "Bounds height");
+        set_control_text(g.value_label[2], "Bounds depth");
+        set_float(g.value[0], size.x);
+        set_float(g.value[1], size.y);
+        set_float(g.value[2], size.z);
+        ShowWindow(g.value_label[2], SW_SHOW);
+        ShowWindow(g.value[2], SW_SHOW);
     }
     g.refreshing_inspector = false;
 }
@@ -6084,7 +7877,9 @@ void focus_camera_on_entity(int index) {
         const float model_radius = .5f * sqrtf(width * width + height * height + depth * depth);
         if (isfinite(model_radius) && model_radius > .01f)
             radius = model_radius;
-    } else if (entity.kind == EntityKind::PositionMarker) {
+    } else if (entity.kind == EntityKind::PositionMarker ||
+               entity.kind == EntityKind::BuildingVolume ||
+               entity.kind == EntityKind::InvisibleBarrier) {
         const float width = entity.source_bounds.MaxX - entity.source_bounds.MinX;
         const float height = entity.source_bounds.MaxY - entity.source_bounds.MinY;
         const float depth = entity.source_bounds.MaxZ - entity.source_bounds.MinZ;
@@ -6217,6 +8012,43 @@ void apply_inspector() {
                     set_status(message);
                 }
             }
+        } else if (e.kind == EntityKind::StaticObject) {
+            const LRESULT selected_object = SendMessageA(g.pickup_item, CB_GETCURSEL, 0, 0);
+            const uint32_t requested_file = !changed(kInspectorDirtyPickup) || selected_object == CB_ERR
+                                                ? e.value_u32_b
+                                                : static_cast<uint32_t>(SendMessageA(
+                                                      g.pickup_item, CB_GETITEMDATA,
+                                                      static_cast<WPARAM>(selected_object), 0));
+            if (requested_file != e.value_u32_b) {
+                const StaticObjectTemplate* object =
+                    find_static_object_template(g.document, requested_file, true);
+                if (object) {
+                    const StaticObjectTemplate* old =
+                        find_static_object_template(g.document, e.value_u32_b, true);
+                    const bool automatic_name = old && e.name.rfind(old->resource_name, 0) == 0;
+                    const std::string suffix = automatic_name ? e.name.substr(old->resource_name.size())
+                                                              : std::string{};
+                    adopt_static_object_template(&e, *object);
+                    if (automatic_name)
+                        e.name = object->resource_name + suffix;
+                }
+            }
+        } else if (e.kind == EntityKind::BuildingVolume || e.kind == EntityKind::InvisibleBarrier) {
+            Asura_Vector_3 size = oriented_box_dimensions(e);
+            if (changed(kInspectorDirtyValueA))
+                size.x = get_float(g.value[0], size.x);
+            if (changed(kInspectorDirtyValueB))
+                size.y = get_float(g.value[1], size.y);
+            if (changed(kInspectorDirtyValueC))
+                size.z = get_float(g.value[2], size.z);
+            if (isfinite(size.x) && isfinite(size.y) && isfinite(size.z) &&
+                size.x > 0.0f && size.y > 0.0f && size.z > 0.0f) {
+                e.source_bounds = {e.position.x - size.x * .5f, e.position.x + size.x * .5f,
+                                   e.position.y - size.y * .5f, e.position.y + size.y * .5f,
+                                   e.position.z - size.z * .5f, e.position.z + size.z * .5f};
+                e.value_a = size.x;
+                e.value_b = size.z;
+            }
         }
     }
     commit_history_transaction();
@@ -6255,6 +8087,7 @@ bool open_obj_path(const std::string& path) {
     if (!g.document.source_pc_path.empty()) {
         g.document = Document{};
         g.pickup_models.clear();
+        g.static_object_models.clear();
         set_single_selection_state(-1);
         g.pending_kind = -1;
         gpu_load_skybox({}, nullptr);
@@ -6294,6 +8127,21 @@ void add_entity_at(EntityKind kind, const Asura_Vector_3& p) {
         e.entity_padding = pickup_template->entity_padding;
         e.source_entity_record = false;
         e.source_entity_classification = SnipeEntityClass_Pickup;
+    } else if (kind == EntityKind::StaticObject) {
+        const StaticObjectTemplate* object = find_static_object_template(g.document, 0, false);
+        if (!object) {
+            g.pending_kind = -1;
+            set_status("No Object catalog is loaded. Choose one or more Object donor .PC levels first.");
+            return;
+        }
+        adopt_static_object_template(&e, *object);
+        e.source_entity_record = false;
+        e.source_entity_classification = SnipeEntityClass_StaticObject;
+    } else if (kind == EntityKind::BuildingVolume) {
+        e.source_entity_record = false;
+        e.source_entity_classification = SnipeEntityClass_BuildingVolume;
+    } else if (kind == EntityKind::InvisibleBarrier) {
+        e.barrier_source_record = false;
     }
     if (!g.history.begin(g.document, g.selected))
         return;
@@ -6326,6 +8174,29 @@ void add_entity_at(EntityKind kind, const Asura_Vector_3& p) {
         snprintf(name, sizeof(name), "%s %zu",
                  snipe_item_name(e.value_u32_a) ? snipe_item_name(e.value_u32_a) : "Pickup",
                  g.document.entities.size() + 1);
+    } else if (kind == EntityKind::StaticObject) {
+        const StaticObjectTemplate* object = find_static_object_template(g.document, e.value_u32_b, true);
+        snprintf(name, sizeof(name), "%s %zu",
+                  object && !object->resource_name.empty() ? object->resource_name.c_str() : "Object",
+                  g.document.entities.size() + 1);
+    } else if (kind == EntityKind::BuildingVolume) {
+        snprintf(name, sizeof(name), "Building volume %zu", g.document.entities.size() + 1);
+        constexpr Asura_Vector_3 size{10.0f, 5.0f, 10.0f};
+        e.source_bounds = {p.x - size.x * .5f, p.x + size.x * .5f,
+                           p.y - size.y * .5f, p.y + size.y * .5f,
+                           p.z - size.z * .5f, p.z + size.z * .5f};
+        e.value_a = size.x;
+        e.value_b = size.z;
+    } else if (kind == EntityKind::InvisibleBarrier) {
+        snprintf(name, sizeof(name), "Invisible barrier %zu", g.document.entities.size() + 1);
+        constexpr Asura_Vector_3 size{10.0f, 5.0f, .15f};
+        e.source_bounds = {p.x - size.x * .5f, p.x + size.x * .5f,
+                           p.y - size.y * .5f, p.y + size.y * .5f,
+                           p.z - size.z * .5f, p.z + size.z * .5f};
+        e.value_a = size.x;
+        e.value_b = size.z;
+        e.barrier_collision_flags = kPcInvisibleBarrierCollisionMask;
+        e.barrier_collision_material = 0x0015u;
     }
     e.name = name;
     stop_sound_preview();
@@ -6349,43 +8220,63 @@ void begin_place(EntityKind kind) {
                     "Cannot create pickup", MB_ICONINFORMATION);
         return;
     }
+    if (kind == EntityKind::StaticObject && !find_static_object_template(g.document, 0, false)) {
+        MessageBoxA(g.window, "Choose one or more Object donor .PC levels first.",
+                    "Cannot create Object", MB_ICONINFORMATION);
+        return;
+    }
     g.pending_kind = static_cast<int>(kind);
     set_status("Click visible environment geometry to place the entity. Right-drag orbits; wheel zooms.");
 }
 
-bool spawn_puppet_screen_bounds(const Entity& entity, RECT* bounds, float* nearest_depth = nullptr) {
+bool ray_hits_model_triangle(const EnvironmentRay& ray, const Asura_Vector_3& a,
+                             const Asura_Vector_3& b, const Asura_Vector_3& c,
+                             float maximum_distance, float* distance) {
+    const Asura_Vector_3 ab = sub(b, a);
+    const Asura_Vector_3 ac = sub(c, a);
+    const Asura_Vector_3 p = cross(ray.direction, ac);
+    const float determinant = dot(ab, p);
+    if (fabsf(determinant) <= 1.0e-9f)
+        return false;
+    const float inverse_determinant = 1.0f / determinant;
+    const Asura_Vector_3 from_a = sub(ray.origin, a);
+    const float u = dot(from_a, p) * inverse_determinant;
+    if (u < -1.0e-6f || u > 1.000001f)
+        return false;
+    const Asura_Vector_3 q = cross(from_a, ab);
+    const float v = dot(ray.direction, q) * inverse_determinant;
+    if (v < -1.0e-6f || u + v > 1.000001f)
+        return false;
+    const float hit_distance = dot(ac, q) * inverse_determinant;
+    if (hit_distance <= 1.0e-5f || hit_distance >= maximum_distance)
+        return false;
+    *distance = hit_distance;
+    return true;
+}
+
+bool entity_model_ray_distance(const Entity& entity, const EnvironmentRay& ray,
+                               float* distance) {
     const SpawnPuppet* puppet = entity_render_model(entity);
-    if (!puppet)
+    if (!puppet || !distance)
         return false;
-    bool projected = false;
-    float nearest = 1.0e30f;
-    RECT result{};
-    for (int corner = 0; corner < 8; ++corner) {
-        const Asura_Vector_3 local{
-            corner & 1 ? puppet->max.x : puppet->min.x,
-            corner & 2 ? puppet->max.y : puppet->min.y,
-            corner & 4 ? puppet->max.z : puppet->min.z,
-        };
-        POINT point{};
-        float depth = 0;
-        if (!project_point(spawn_puppet_view_position(local, entity), &point, &depth))
+    float closest = FLT_MAX;
+    bool found = false;
+    for (const auto& face : puppet->faces) {
+        if (face[0] >= puppet->vertices.size() || face[1] >= puppet->vertices.size() ||
+            face[2] >= puppet->vertices.size())
             continue;
-        if (!projected) {
-            result = {point.x, point.y, point.x, point.y};
-            projected = true;
-        } else {
-            result.left = std::min(result.left, point.x);
-            result.top = std::min(result.top, point.y);
-            result.right = std::max(result.right, point.x);
-            result.bottom = std::max(result.bottom, point.y);
+        const Asura_Vector_3 a = spawn_puppet_view_position(puppet->vertices[face[0]].position, entity);
+        const Asura_Vector_3 b = spawn_puppet_view_position(puppet->vertices[face[1]].position, entity);
+        const Asura_Vector_3 c = spawn_puppet_view_position(puppet->vertices[face[2]].position, entity);
+        float candidate = 0.0f;
+        if (ray_hits_model_triangle(ray, a, b, c, closest, &candidate)) {
+            closest = candidate;
+            found = true;
         }
-        nearest = fminf(nearest, depth);
     }
-    if (!projected)
+    if (!found)
         return false;
-    *bounds = result;
-    if (nearest_depth)
-        *nearest_depth = nearest;
+    *distance = closest;
     return true;
 }
 
@@ -6393,27 +8284,68 @@ int hit_entity(int x, int y) {
     int best = -1;
     int best_distance = 15 * 15;
     float best_depth = 1.0e30f;
+    EnvironmentRay selection_ray{};
+    const bool have_selection_ray = screen_ray(x, y, &selection_ray);
+    EnvironmentRayHit environment_hit{};
+    const bool have_environment_hit = have_selection_ray &&
+                                      g.environment_raycast.intersect(g.mesh, selection_ray,
+                                                                      &environment_hit);
     for (int i = 0; i < static_cast<int>(g.document.entities.size()); ++i) {
         const Entity& entity = g.document.entities[i];
-        if (!entity_is_selected(i) &&
+        if (entity_render_model(entity)) {
+            float model_distance = 0.0f;
+            if (!have_selection_ray ||
+                !entity_model_ray_distance(entity, selection_ray, &model_distance))
+                continue;
+            const float surface_epsilon = fmaxf(.01f, model_distance * 1.0e-4f);
+            if (!entity_is_selected(i) && have_environment_hit &&
+                environment_hit.distance + surface_epsilon < model_distance)
+                continue;
+            if (best_distance > 0 || model_distance < best_depth) {
+                best_distance = 0;
+                best_depth = model_distance;
+                best = i;
+            }
+            continue;
+        }
+        if (entity.kind != EntityKind::BuildingVolume && entity.kind != EntityKind::InvisibleBarrier &&
+            !entity_is_selected(i) &&
             environment_occludes_view_position(entity_view_position(entity.position)))
             continue;
-        if (entity_render_model(entity)) {
-            RECT bounds{};
-            float depth = 0;
-            if (!spawn_puppet_screen_bounds(entity, &bounds, &depth))
-                continue;
-            bounds.left -= 5;
-            bounds.top -= 5;
-            bounds.right += 5;
-            bounds.bottom += 5;
-            const int dx = x < bounds.left ? bounds.left - x : x > bounds.right ? x - bounds.right : 0;
-            const int dy = y < bounds.top ? bounds.top - y : y > bounds.bottom ? y - bounds.bottom : 0;
-            const int distance = dx * dx + dy * dy;
-            if (distance < best_distance || (distance == best_distance && depth < best_depth)) {
-                best_distance = distance;
-                best_depth = depth;
-                best = i;
+        if (entity.kind == EntityKind::BuildingVolume || entity.kind == EntityKind::InvisibleBarrier) {
+            std::vector<LightGizmoLine> lines;
+            lines.reserve(kLightBoundingBoxLines);
+            append_oriented_bounds_gizmo(entity, &lines);
+            const int edge_radius = entity.kind == EntityKind::InvisibleBarrier
+                                        ? (entity_is_selected(i) ? 9 : 6)
+                                        : 10;
+            const int edge_distance_limit = edge_radius * edge_radius;
+            for (const LightGizmoLine& line : lines) {
+                POINT a{}, b{};
+                float a_depth = 0, b_depth = 0;
+                if (!project_point(line.a, &a, &a_depth) || !project_point(line.b, &b, &b_depth))
+                    continue;
+                const float vx = static_cast<float>(b.x - a.x);
+                const float vy = static_cast<float>(b.y - a.y);
+                const float length_squared = vx * vx + vy * vy;
+                float t = length_squared > .001f
+                              ? ((x - a.x) * vx + (y - a.y) * vy) / length_squared
+                              : 0.0f;
+                t = std::clamp(t, 0.0f, 1.0f);
+                const float dx = x - (a.x + vx * t);
+                const float dy = y - (a.y + vy * t);
+                const int distance = static_cast<int>(dx * dx + dy * dy);
+                if (distance >= edge_distance_limit)
+                    continue;
+                const Asura_Vector_3 edge_point = add(line.a, mul(sub(line.b, line.a), t));
+                if (!entity_is_selected(i) && environment_occludes_view_position(edge_point))
+                    continue;
+                const float depth = fminf(a_depth, b_depth);
+                if (distance < best_distance || (distance == best_distance && depth < best_depth)) {
+                    best_distance = distance;
+                    best_depth = depth;
+                    best = i;
+                }
             }
             continue;
         }
@@ -6437,8 +8369,11 @@ COLORREF entity_color(EntityKind kind) {
     case EntityKind::Light: return RGB(255, 220, 70);
     case EntityKind::Sound: return RGB(80, 190, 255);
     case EntityKind::Pickup: return RGB(255, 116, 46);
+    case EntityKind::StaticObject: return RGB(80, 205, 175);
     case EntityKind::AssassinationTarget: return RGB(255, 38, 64);
     case EntityKind::PositionMarker: return RGB(190, 88, 255);
+    case EntityKind::BuildingVolume: return RGB(38, 224, 255);
+    case EntityKind::InvisibleBarrier: return RGB(255, 86, 20);
     default: return RGB(255, 120, 80);
     }
 }
@@ -6650,10 +8585,12 @@ bool draw_spawn_puppet(HDC dc, const Entity& entity, bool selected) {
         return false;
     COLORREF color = entity.kind == EntityKind::Pickup
                          ? RGB(210, 92, 28)
+                         : entity.kind == EntityKind::StaticObject ? RGB(45, 155, 128)
                          : entity.value_u32_a == 5 ? RGB(135, 165, 67) : RGB(112, 128, 138);
     if (selected) {
         color = entity.kind == EntityKind::Pickup
                     ? RGB(255, 188, 70)
+                    : entity.kind == EntityKind::StaticObject ? RGB(110, 255, 220)
                     : entity.value_u32_a == 5 ? RGB(220, 240, 105) : RGB(190, 218, 232);
     }
     HPEN pen = CreatePen(PS_SOLID, selected ? 2 : 1, color);
@@ -6685,7 +8622,8 @@ void draw_entities(HDC dc) {
     for (int i = 0; i < static_cast<int>(g.document.entities.size()); ++i) {
         const Entity& e = g.document.entities[i];
         const bool selected = entity_is_selected(i);
-        if (!selected && environment_occludes_view_position(entity_view_position(e.position)))
+        if (e.kind != EntityKind::BuildingVolume && e.kind != EntityKind::InvisibleBarrier && !selected &&
+            environment_occludes_view_position(entity_view_position(e.position)))
             continue;
         POINT p{};
         if (!project_point(entity_view_position(e.position), &p))
@@ -6695,6 +8633,16 @@ void draw_entities(HDC dc) {
             draw_light_gizmo(dc, e, true);
         else if (e.kind == EntityKind::Sound && selected)
             draw_sound_gizmo(dc, e);
+        if (e.kind == EntityKind::BuildingVolume || e.kind == EntityKind::InvisibleBarrier) {
+            std::vector<LightGizmoLine> lines;
+            lines.reserve(kLightBoundingBoxLines);
+            append_oriented_bounds_gizmo(e, &lines);
+            draw_gizmo_lines(dc, lines, selected ? 2 : 1,
+                             selected ? RGB(255, 255, 255) : color);
+            if (selected)
+                TextOutA(dc, p.x + 10, p.y - 8, e.name.c_str(), static_cast<int>(e.name.size()));
+            continue;
+        }
         if (e.kind == EntityKind::SpawnPoint && (e.value_u32_a & SnipeSpawnTeam_Camera)) {
             std::vector<LightGizmoLine> lines;
             lines.reserve(kCameraSpawnArrowLines);
@@ -6703,7 +8651,8 @@ void draw_entities(HDC dc) {
             draw_gizmo_lines(dc, lines, selected ? 2 : 1,
                              selected ? RGB(255, 255, 255) : color);
         }
-        if ((e.kind == EntityKind::SpawnPoint || e.kind == EntityKind::Pickup) &&
+        if ((e.kind == EntityKind::SpawnPoint || e.kind == EntityKind::Pickup ||
+             e.kind == EntityKind::StaticObject) &&
             draw_spawn_puppet(dc, e, selected)) {
             if (selected)
                 TextOutA(dc, p.x + 10, p.y - 8, e.name.c_str(), static_cast<int>(e.name.size()));
@@ -6779,25 +8728,29 @@ void layout_controls() {
     }
     const int right = r.right - 262;
     const int top_y = 7;
-    const struct { int id, x, w; } top[] = {{ID_OPEN_OBJ, 8, 84},          {ID_OPEN_PC, 96, 84},
-                                            {ID_OPEN_PROJECT, 184, 84},    {ID_SAVE_PROJECT, 272, 84},
-                                            {ID_EXPORT_PC, 360, 90},       {ID_MATERIAL_MAP, 454, 140},
-                                            {ID_EXPORT_MATERIAL_MAP, 598, 126}, {ID_TEXTURE_DIR, 728, 100},
-                                            {ID_WEAPONS_DONOR, 832, 112},  {ID_SKYBOX_TEXTURES, 948, 108},
-                                            {ID_TOGGLE_RAIN, 1060, 54}
+    const struct { int id, x, w; } top[] = {{ID_OPEN_OBJ, 8, 68},          {ID_OPEN_PC, 80, 68},
+                                            {ID_OPEN_PROJECT, 152, 92},    {ID_SAVE_PROJECT, 248, 88},
+                                            {ID_EXPORT_PC, 340, 82},       {ID_MATERIAL_MAP, 426, 112},
+                                            {ID_EXPORT_MATERIAL_MAP, 542, 112}, {ID_TEXTURE_DIR, 658, 88},
+                                            {ID_WEAPONS_DONOR, 750, 104},  {ID_OBJECT_DONOR, 858, 96},
+                                            {ID_SKYBOX_TEXTURES, 958, 104}, {ID_TOGGLE_RAIN, 1066, 48}
     };
     for (auto c : top)
         MoveWindow(GetDlgItem(g.window, c.id), c.x, top_y, c.w, 28, TRUE);
     MoveWindow(g.ambience_properties, right, top_y, 252, 28, TRUE);
-    MoveWindow(g.list, 8, 48, 220, std::max(80, static_cast<int>(r.bottom) - 301), TRUE);
-    int y = std::max(140, static_cast<int>(r.bottom) - 245);
+    MoveWindow(g.list, 8, 48, 220, std::max(80, static_cast<int>(r.bottom) - 332), TRUE);
+    int y = std::max(140, static_cast<int>(r.bottom) - 276);
     const int bw = 106;
     MoveWindow(GetDlgItem(g.window, ID_ADD_SPAWN), 8, y, bw, 27, TRUE);
     MoveWindow(GetDlgItem(g.window, ID_ADD_LIGHT), 120, y, bw, 27, TRUE);
     y += 31;
-    MoveWindow(GetDlgItem(g.window, ID_ADD_PICKUP), 8, y, 218, 27, TRUE);
+    MoveWindow(GetDlgItem(g.window, ID_ADD_PICKUP), 8, y, bw, 27, TRUE);
+    MoveWindow(GetDlgItem(g.window, ID_ADD_STATIC_OBJECT), 120, y, bw, 27, TRUE);
     y += 31;
-    MoveWindow(GetDlgItem(g.window, ID_ADD_SOUND), 8, y, 218, 27, TRUE);
+    MoveWindow(GetDlgItem(g.window, ID_ADD_SOUND), 8, y, bw, 27, TRUE);
+    MoveWindow(GetDlgItem(g.window, ID_ADD_BUILDING_VOLUME), 120, y, bw, 27, TRUE);
+    y += 31;
+    MoveWindow(GetDlgItem(g.window, ID_ADD_INVISIBLE_BARRIER), 8, y, 218, 27, TRUE);
     y += 31;
     MoveWindow(GetDlgItem(g.window, ID_DELETE_ENTITY), 8, y, 218, 27, TRUE);
     y += 38;
@@ -6823,6 +8776,8 @@ void layout_controls() {
     MoveWindow(g.value_label[1], label_x, iy + 3, 112, 22, TRUE);
     MoveWindow(g.value[1], property_edit_x, iy, property_ew, 24, TRUE);
     iy += 34;
+    MoveWindow(g.value_label[2], label_x, iy + 3, 112, 22, TRUE);
+    MoveWindow(g.value[2], property_edit_x, iy, property_ew, 24, TRUE);
     MoveWindow(g.sound_browse, edit_x, iy, 80, 26, TRUE);
     MoveWindow(g.sound_preview, edit_x + 84, iy, 80, 26, TRUE);
     MoveWindow(g.sound_loop, label_x, iy, 82, 26, TRUE);
@@ -6865,6 +8820,7 @@ void create_controls() {
     make_control("BUTTON", "Export material map", BS_PUSHBUTTON, ID_EXPORT_MATERIAL_MAP);
     make_control("BUTTON", "Texture folder", BS_PUSHBUTTON, ID_TEXTURE_DIR);
     make_control("BUTTON", "Weapons donor", BS_PUSHBUTTON, ID_WEAPONS_DONOR);
+    make_control("BUTTON", "Object donor", BS_PUSHBUTTON, ID_OBJECT_DONOR);
     make_control("BUTTON", "Skybox properties", BS_PUSHBUTTON, ID_SKYBOX_TEXTURES);
     g.rain_toggle = make_control("BUTTON", "Rain", BS_AUTOCHECKBOX, ID_TOGGLE_RAIN);
     g.ambience_properties = make_control("BUTTON", "Ambience sound", BS_PUSHBUTTON, ID_AMBIENCE_PROPERTIES);
@@ -6873,7 +8829,10 @@ void create_controls() {
     make_control("BUTTON", "+ Spawn", BS_PUSHBUTTON, ID_ADD_SPAWN);
     make_control("BUTTON", "+ Light", BS_PUSHBUTTON, ID_ADD_LIGHT);
     make_control("BUTTON", "+ Pickup", BS_PUSHBUTTON, ID_ADD_PICKUP);
+    make_control("BUTTON", "+ Object", BS_PUSHBUTTON, ID_ADD_STATIC_OBJECT);
     make_control("BUTTON", "+ Sound", BS_PUSHBUTTON, ID_ADD_SOUND);
+    make_control("BUTTON", "+ Indoor volume", BS_PUSHBUTTON, ID_ADD_BUILDING_VOLUME);
+    make_control("BUTTON", "+ Invisible barrier", BS_PUSHBUTTON, ID_ADD_INVISIBLE_BARRIER);
     make_control("BUTTON", "Delete selected", BS_PUSHBUTTON, ID_DELETE_ENTITY);
     make_control("STATIC",
                  "Right-drag: orbit; middle-drag: pan; wheel: zoom\r\n"
@@ -6896,8 +8855,10 @@ void create_controls() {
     g.rot[2] = make_control("EDIT", "", ES_AUTOHSCROLL | WS_BORDER, ID_ROT_Z);
     g.value_label[0] = make_control("STATIC", "Property A", SS_LEFT, 917);
     g.value_label[1] = make_control("STATIC", "Property B", SS_LEFT, 918);
+    g.value_label[2] = make_control("STATIC", "Property C", SS_LEFT, 921);
     g.value[0] = make_control("EDIT", "", ES_AUTOHSCROLL | WS_BORDER, ID_VALUE_A);
     g.value[1] = make_control("EDIT", "", ES_AUTOHSCROLL | WS_BORDER, ID_VALUE_B);
+    g.value[2] = make_control("EDIT", "", ES_AUTOHSCROLL | WS_BORDER, ID_VALUE_C);
     g.pickup_item = make_control("COMBOBOX", "", CBS_DROPDOWNLIST | CBS_AUTOHSCROLL | WS_VSCROLL,
                                  ID_PICKUP_ITEM);
     g.sound_browse = make_control("BUTTON", "Choose WAV...", BS_PUSHBUTTON, ID_BROWSE_SOUND);
@@ -6969,28 +8930,69 @@ void merge_pickup_templates(Document* document, const std::vector<PickupTemplate
     }
 }
 
+void merge_static_object_templates(Document* document,
+                                   const std::vector<StaticObjectTemplate>& incoming);
+
+void enrich_project_static_object_templates(Document* document, const Document& imported) {
+    if (document->static_object_templates.empty())
+        document->static_object_templates = imported.static_object_templates;
+    else
+        merge_static_object_templates(document, imported.static_object_templates);
+    size_t imported_objects = 0, matched_objects = 0;
+    for (const Entity& source : imported.entities) {
+        if (source.kind != EntityKind::StaticObject || !source.source_entity_record)
+            continue;
+        ++imported_objects;
+        for (Entity& saved : document->entities) {
+            if (saved.kind != EntityKind::StaticObject || saved.guid != source.guid)
+                continue;
+            ++matched_objects;
+            if (!saved.static_object_has_template) {
+                saved.entity_padding = source.entity_padding;
+                saved.source_entity_classification = source.source_entity_classification;
+                saved.static_object_body = source.static_object_body;
+                saved.static_object_has_template = true;
+            }
+            break;
+        }
+    }
+    if (!document->source_static_object_inventory_complete && imported_objects == matched_objects)
+        document->source_static_object_inventory_complete = true;
+}
+
 bool load_document_preview(Document* document, Mesh* mesh, std::string* why,
-                           std::vector<PickupModel>* pickup_models = nullptr) {
+                           std::vector<PickupModel>* pickup_models = nullptr,
+                           std::vector<StaticObjectModel>* object_models = nullptr) {
     if (!document->obj_path.empty()) {
         if (!load_preview_mesh(document->obj_path, document->material_map, mesh, why))
             return false;
-        if (document->weapons_donor.empty()) {
-            if (pickup_models)
-                pickup_models->clear();
-            return true;
-        }
-        std::vector<PickupTemplate> donor_templates;
-        std::vector<PickupModel> donor_models;
-        if (!load_pickup_donor(document->weapons_donor, &donor_templates, &donor_models, why))
-            return false;
-        merge_pickup_templates(document, donor_templates);
         if (pickup_models)
-            *pickup_models = std::move(donor_models);
+            pickup_models->clear();
+        if (object_models)
+            object_models->clear();
+        if (!document->weapons_donor.empty()) {
+            std::vector<PickupTemplate> donor_templates;
+            std::vector<PickupModel> donor_models;
+            if (!load_pickup_donor(document->weapons_donor, &donor_templates, &donor_models, why))
+                return false;
+            merge_pickup_templates(document, donor_templates);
+            if (pickup_models)
+                *pickup_models = std::move(donor_models);
+        }
+        if (!document->object_donors.empty()) {
+            std::vector<StaticObjectTemplate> donor_templates;
+            std::vector<StaticObjectModel> donor_models;
+            if (!load_static_object_donors(document->object_donors, &donor_templates, &donor_models, why))
+                return false;
+            merge_static_object_templates(document, donor_templates);
+            if (object_models)
+                *object_models = std::move(donor_models);
+        }
         return true;
     }
     if (!document->source_pc_path.empty()) {
         Document imported;
-        if (!load_pc_level(document->source_pc_path, &imported, mesh, why, pickup_models))
+        if (!load_pc_level(document->source_pc_path, &imported, mesh, why, pickup_models, object_models))
             return false;
         if (!document->skybox.source_record && imported.skybox.source_record)
             document->skybox = imported.skybox;
@@ -7004,10 +9006,29 @@ bool load_document_preview(Document* document, Mesh* mesh, std::string* why,
             document->ambient_volume = imported.ambient_volume;
         }
         enrich_project_pickup_templates(document, imported);
+        enrich_project_static_object_templates(document, imported);
+        if (!document->object_donors.empty()) {
+            std::vector<StaticObjectTemplate> donor_templates;
+            std::vector<StaticObjectModel> donor_models;
+            if (!load_static_object_donors(document->object_donors, &donor_templates, &donor_models, why))
+                return false;
+            merge_static_object_templates(document, donor_templates);
+            if (object_models) {
+                for (StaticObjectModel& model : donor_models) {
+                    bool present = false;
+                    for (const StaticObjectModel& existing : *object_models)
+                        present |= existing.file_id == model.file_id;
+                    if (!present)
+                        object_models->push_back(std::move(model));
+                }
+            }
+        }
         return true;
     }
     if (pickup_models)
         pickup_models->clear();
+    if (object_models)
+        object_models->clear();
     *mesh = {};
     return true;
 }
@@ -7021,7 +9042,8 @@ bool open_pc_path(const std::string& path) {
     Mesh mesh;
     std::string why;
     std::vector<PickupModel> pickup_models;
-    const bool ok = load_pc_level(path, &document, &mesh, &why, &pickup_models);
+    std::vector<StaticObjectModel> object_models;
+    const bool ok = load_pc_level(path, &document, &mesh, &why, &pickup_models, &object_models);
     SetCursor(LoadCursor(nullptr, IDC_ARROW));
     if (!ok) {
         set_status("Could not open the .PC level.");
@@ -7031,6 +9053,7 @@ bool open_pc_path(const std::string& path) {
     g.document = std::move(document);
     g.mesh = std::move(mesh);
     g.pickup_models = std::move(pickup_models);
+    g.static_object_models = std::move(object_models);
     set_single_selection_state(g.document.entities.empty() ? -1 : 0);
     g.pending_kind = -1;
     std::string skybox_why;
@@ -7149,7 +9172,8 @@ bool refresh_history_derived_resources(const Document& previous, std::string* wh
     const bool preview_changed = previous.obj_path != g.document.obj_path ||
                                  previous.source_pc_path != g.document.source_pc_path ||
                                  previous.material_map != g.document.material_map ||
-                                 previous.weapons_donor != g.document.weapons_donor;
+                                 previous.weapons_donor != g.document.weapons_donor ||
+                                 previous.object_donors != g.document.object_donors;
     const bool textures_changed = previous.texture_dir != g.document.texture_dir ||
                                   previous.material_map != g.document.material_map ||
                                   previous.rain_enabled != g.document.rain_enabled;
@@ -7164,8 +9188,10 @@ bool refresh_history_derived_resources(const Document& previous, std::string* wh
         Document preview_document = g.document;
         Mesh mesh;
         std::vector<PickupModel> pickup_models;
+        std::vector<StaticObjectModel> object_models;
         std::string preview_why;
-        bool preview_loaded = load_document_preview(&preview_document, &mesh, &preview_why, &pickup_models);
+        bool preview_loaded = load_document_preview(&preview_document, &mesh, &preview_why,
+                                                    &pickup_models, &object_models);
         if (preview_loaded && !g.document.source_pc_path.empty() &&
             !g.document.weapons_donor.empty()) {
             std::vector<PickupTemplate> donor_templates;
@@ -7186,9 +9212,11 @@ bool refresh_history_derived_resources(const Document& previous, std::string* wh
         if (preview_loaded) {
             g.mesh = std::move(mesh);
             g.pickup_models = std::move(pickup_models);
+            g.static_object_models = std::move(object_models);
         } else {
             g.mesh = {};
             g.pickup_models.clear();
+            g.static_object_models.clear();
             ok = false;
             if (why)
                 *why = preview_why;
@@ -7257,28 +9285,39 @@ void command_redo() {
 }
 
 void command_copy_entity() {
+    normalize_selection_state();
     std::string why;
-    if (!g.history.copy(g.document, g.selected, &why)) {
+    if (!g.history.copy(g.document, g.selected_entities, &why)) {
         set_status(why.c_str());
         return;
     }
-    set_status("Entity copied. Paste creates an authored clone with a fresh target-valid GUID.");
+    char status[160]{};
+    snprintf(status, sizeof(status), "%zu %s copied. Paste creates authored clones with fresh target-valid GUIDs.",
+             g.selected_entities.size(), g.selected_entities.size() == 1 ? "entity" : "entities");
+    set_status(status);
 }
 
 void command_paste_entity() {
     stop_sound_preview();
     std::string why;
-    if (!g.history.paste(&g.document, &g.selected, &why)) {
+    std::vector<int> pasted;
+    if (!g.history.paste(&g.document, &g.selected, &pasted, &why)) {
         set_status(why.c_str());
         return;
     }
-    set_single_selection_state(g.selected);
+    g.selected_entities = std::move(pasted);
+    g.selected = g.selected_entities.empty() ? -1 : g.selected_entities.back();
     g.pending_kind = -1;
     refresh_list();
     refresh_inspector();
     update_title();
     request_redraw();
-    set_status("Entity pasted as a new authored record.");
+    char status[128]{};
+    snprintf(status, sizeof(status), "%zu %s pasted as %s authored %s.",
+             g.selected_entities.size(), g.selected_entities.size() == 1 ? "entity" : "entities",
+             g.selected_entities.size() == 1 ? "a new" : "new",
+             g.selected_entities.size() == 1 ? "record" : "records");
+    set_status(status);
 }
 
 void command_open_project() {
@@ -7296,13 +9335,16 @@ void command_open_project() {
     stop_sound_preview();
     Mesh mesh;
     std::vector<PickupModel> pickup_models;
-    if (!load_document_preview(&doc, &mesh, &why, &pickup_models)) {
+    std::vector<StaticObjectModel> object_models;
+    if (!load_document_preview(&doc, &mesh, &why, &pickup_models, &object_models)) {
         g.mesh = std::move(mesh);
         g.pickup_models.clear();
+        g.static_object_models.clear();
         MessageBoxA(g.window, why.c_str(), "Project source level is unavailable", MB_ICONWARNING);
     } else {
         g.mesh = std::move(mesh);
         g.pickup_models = std::move(pickup_models);
+        g.static_object_models = std::move(object_models);
     }
     g.document = std::move(doc);
     const bool skybox_loaded = reload_skybox_preview(true);
@@ -7939,6 +9981,104 @@ void command_weapons_donor() {
     request_redraw();
 }
 
+void merge_static_object_templates(Document* document,
+                                   const std::vector<StaticObjectTemplate>& incoming) {
+    for (const StaticObjectTemplate& object : incoming) {
+        bool present = false;
+        for (const StaticObjectTemplate& existing : document->static_object_templates)
+            present |= existing.file_id == object.file_id;
+        if (!present)
+            document->static_object_templates.push_back(object);
+    }
+}
+
+void command_object_donor() {
+    std::vector<std::string> paths;
+    if (!choose_paths(g.window, "Choose one or more target-game Object donor .PC levels",
+                      "Asura PC files\0*.PC\0All files\0*.*\0", "PC",
+                      g.document.object_donors, &paths))
+        return;
+    set_status("Reading class-0x7 Object definitions and models from selected donors...");
+    UpdateWindow(g.window);
+    SetCursor(LoadCursor(nullptr, IDC_WAIT));
+    std::vector<StaticObjectTemplate> templates;
+    std::vector<StaticObjectModel> models;
+    std::string why;
+    const bool ok = load_static_object_donors(paths, &templates, &models, &why);
+    SetCursor(LoadCursor(nullptr, IDC_ARROW));
+    if (!ok) {
+        set_status("The selected Object donors do not contain a usable Object catalog.");
+        MessageBoxA(g.window, why.c_str(), "Could not load Object donors", MB_ICONERROR);
+        return;
+    }
+    for (const Entity& entity : g.document.entities) {
+        if (entity.kind != EntityKind::StaticObject)
+            continue;
+        bool requires_donor = !entity.source_entity_record;
+        if (entity.source_entity_record) {
+            for (const StaticObjectTemplate& current : g.document.static_object_templates)
+                if (current.file_id == entity.value_u32_b &&
+                    current.donor_path != g.document.source_pc_path) {
+                    requires_donor = true;
+                    break;
+                }
+        }
+        if (!requires_donor)
+            continue;
+        bool supported = false;
+        for (const StaticObjectTemplate& object : templates)
+            supported |= object.file_id == entity.value_u32_b;
+        if (!supported) {
+            char message[220]{};
+            snprintf(message, sizeof(message),
+                     "The selected donors have no Object definition for existing file ID %08X.",
+                     entity.value_u32_b);
+            set_status("Object donors are missing an Object used by this level.");
+            MessageBoxA(g.window, message, "Could not switch Object donors", MB_ICONERROR);
+            return;
+        }
+    }
+    if (!g.history.begin(g.document, g.selected))
+        return;
+    g.document.object_donors = paths;
+    if (g.document.source_pc_path.empty()) {
+        g.document.static_object_templates = templates;
+        for (Entity& entity : g.document.entities) {
+            if (entity.kind != EntityKind::StaticObject || entity.source_entity_record)
+                continue;
+            for (const StaticObjectTemplate& object : templates)
+                if (object.file_id == entity.value_u32_b) {
+                    adopt_static_object_template(&entity, object);
+                    break;
+                }
+        }
+        g.static_object_models = std::move(models);
+    } else {
+        std::vector<StaticObjectTemplate> source_templates;
+        for (const StaticObjectTemplate& object : g.document.static_object_templates)
+            if (object.donor_path == g.document.source_pc_path)
+                source_templates.push_back(object);
+        g.document.static_object_templates = std::move(source_templates);
+        merge_static_object_templates(&g.document, templates);
+        for (StaticObjectModel& model : models) {
+            bool present = false;
+            for (const StaticObjectModel& existing : g.static_object_models)
+                present |= existing.file_id == model.file_id;
+            if (!present)
+                g.static_object_models.push_back(std::move(model));
+        }
+    }
+    commit_history_transaction();
+    char status[260]{};
+    snprintf(status, sizeof(status),
+             "%zu Object donor levels loaded: %zu definitions, %zu rendered models.",
+             paths.size(), templates.size(), g.static_object_models.size());
+    set_status(status);
+    refresh_list();
+    refresh_inspector();
+    request_redraw();
+}
+
 enum SkyboxPropertiesId : int {
     ID_SKYBOX_RED = 3300,
     ID_SKYBOX_GREEN,
@@ -8189,8 +10329,9 @@ void delete_selected() {
         return;
     for (int index : g.selected_entities) {
         if (g.document.entities[index].source_entity_record &&
-            g.document.entities[index].kind != EntityKind::Pickup) {
-            set_status("Imported target/marker records remain source-preserved and cannot be deleted yet.");
+            g.document.entities[index].kind != EntityKind::Pickup &&
+            g.document.entities[index].kind != EntityKind::StaticObject) {
+            set_status("Imported target/marker/volume records remain source-preserved and cannot be deleted yet.");
             return;
         }
     }
@@ -8318,6 +10459,8 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             command_texture_dir();
         else if (id == ID_WEAPONS_DONOR)
             command_weapons_donor();
+        else if (id == ID_OBJECT_DONOR)
+            command_object_donor();
         else if (id == ID_SKYBOX_TEXTURES)
             command_skybox_textures();
         else if (id == ID_TOGGLE_RAIN)
@@ -8332,6 +10475,12 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             begin_place(EntityKind::Sound);
         else if (id == ID_ADD_PICKUP)
             begin_place(EntityKind::Pickup);
+        else if (id == ID_ADD_STATIC_OBJECT)
+            begin_place(EntityKind::StaticObject);
+        else if (id == ID_ADD_BUILDING_VOLUME)
+            begin_place(EntityKind::BuildingVolume);
+        else if (id == ID_ADD_INVISIBLE_BARRIER)
+            begin_place(EntityKind::InvisibleBarrier);
         else if (id == ID_UNDO)
             command_undo();
         else if (id == ID_REDO)
@@ -8507,7 +10656,8 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
                 set_single_selection_state(g.document.entities.empty() ? -1 : 0);
                 g.pending_kind = -1;
                 const bool skybox_loaded = reload_skybox_preview(true);
-                load_document_preview(&g.document, &g.mesh, &why, &g.pickup_models);
+                load_document_preview(&g.document, &g.mesh, &why, &g.pickup_models,
+                                      &g.static_object_models);
                 frame_mesh();
                 reset_history(!g.document.dirty);
                 refresh_list();
@@ -8830,8 +10980,233 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
         }
         return 31;
     }
+    if (__argc == 3 && strcmp(__argv[1], "--pc-static-object-model-smoke") == 0) {
+        Document document;
+        Mesh mesh;
+        std::vector<StaticObjectModel> models;
+        std::string why;
+        if (!load_pc_level(__argv[2], &document, &mesh, &why, nullptr, &models) || models.empty())
+            return 64;
+        g.document = std::move(document);
+        g.static_object_models = std::move(models);
+        g.pickup_models.clear();
+        size_t resolved_objects = 0;
+        for (const Entity& entity : g.document.entities) {
+            if (entity.kind != EntityKind::StaticObject)
+                continue;
+            const SpawnPuppet* direct = static_object_model_for_file(entity.value_u32_b);
+            if (!direct || direct->faces.empty())
+                continue;
+            ++resolved_objects;
+            std::vector<GpuVertex> vertices;
+            append_gpu_entity_model(entity, false, &vertices);
+            if (vertices.size() != direct->faces.size() * 3)
+                return 65;
+            const Asura_Vector_3 expected =
+                spawn_puppet_view_position(direct->vertices[direct->faces.front()[0]].position, entity);
+            const DirectX::XMFLOAT3 actual = vertices.front().position;
+            if (fabsf(actual.x - expected.x) > 1.0e-5f ||
+                fabsf(actual.y - expected.y) > 1.0e-5f ||
+                fabsf(actual.z - expected.z) > 1.0e-5f)
+                return 66;
+        }
+        return resolved_objects ? 0 : 67;
+    }
+    if (__argc == 3 && strcmp(__argv[1], "--pc-object-hierarchy-model-smoke") == 0) {
+        Document document;
+        Mesh mesh;
+        std::vector<PickupModel> hierarchy_models;
+        std::vector<StaticObjectModel> direct_models;
+        std::string why;
+        if (!load_pc_level(__argv[2], &document, &mesh, &why, &hierarchy_models, &direct_models))
+            return 68;
+        const PickupModel* leaves = nullptr;
+        for (const PickupModel& model : hierarchy_models)
+            if (_stricmp(model.mesh.resource_name.c_str(), "8aleaves") == 0)
+                leaves = &model;
+        if (!leaves || leaves->mesh.faces.empty() || leaves->mesh.face_materials.size() != leaves->mesh.faces.size())
+            return 69;
+        if (leaves->mesh.min.y >= -8.0f || leaves->mesh.max.y - leaves->mesh.min.y <= 8.0f)
+            return 70;
+        bool textured_material = false;
+        for (const SpawnPuppetMaterial& material : leaves->mesh.materials)
+            textured_material |= material.texture_bytes.size() >= 4 &&
+                                 memcmp(material.texture_bytes.data(), "DDS ", 4) == 0 &&
+                                 material.texture_fingerprint != 0;
+        if (!textured_material)
+            return 71;
+        float min_u = FLT_MAX, min_v = FLT_MAX, max_u = -FLT_MAX, max_v = -FLT_MAX;
+        for (const SpawnPuppetVertex& vertex : leaves->mesh.vertices) {
+            min_u = fminf(min_u, vertex.texcoord.x);
+            min_v = fminf(min_v, vertex.texcoord.y);
+            max_u = fmaxf(max_u, vertex.texcoord.x);
+            max_v = fmaxf(max_v, vertex.texcoord.y);
+        }
+        if (max_u - min_u <= .1f || max_v - min_v <= .1f)
+            return 72;
+        const uint32_t leaves_skin_id = leaves->skin_id;
+        g.document = std::move(document);
+        g.pickup_models = std::move(hierarchy_models);
+        g.static_object_models = std::move(direct_models);
+        const Entity* leaves_entity = nullptr;
+        for (const Entity& entity : g.document.entities)
+            if (entity.kind == EntityKind::StaticObject && entity.pickup_skin_id == leaves_skin_id)
+                leaves_entity = &entity;
+        if (!leaves_entity)
+            return 73;
+        std::vector<GpuVertex> vertices;
+        std::vector<GpuPuppetRange> ranges;
+        append_gpu_entity_model(*leaves_entity, false, &vertices, &ranges);
+        bool textured_range = false;
+        for (const GpuPuppetRange& range : ranges)
+            textured_range |= range.material && !range.material->texture_bytes.empty();
+        return vertices.size() == leaves->mesh.faces.size() * 3 && textured_range ? 0 : 74;
+    }
+    if (__argc == 4 && strcmp(__argv[1], "--object-donor-catalog-smoke") == 0) {
+        std::vector<StaticObjectTemplate> first, second, combined;
+        std::string why;
+        if (!load_static_object_donors({__argv[2]}, &first, nullptr, &why) ||
+            !load_static_object_donors({__argv[3]}, &second, nullptr, &why) ||
+            !load_static_object_donors({__argv[2], __argv[3]}, &combined, nullptr, &why))
+            return 61;
+        bool found_second_fallback = false;
+        for (const StaticObjectTemplate& candidate : second) {
+            bool in_first = false;
+            for (const StaticObjectTemplate& object : first)
+                in_first |= object.file_id == candidate.file_id;
+            if (!in_first) {
+                bool in_combined_from_second = false;
+                for (const StaticObjectTemplate& object : combined)
+                    in_combined_from_second |= object.file_id == candidate.file_id &&
+                                               object.donor_path == __argv[3];
+                found_second_fallback |= in_combined_from_second;
+            }
+        }
+        for (const StaticObjectTemplate& object : first) {
+            bool first_wins = false;
+            for (const StaticObjectTemplate& candidate : combined)
+                first_wins |= candidate.file_id == object.file_id && candidate.donor_path == __argv[2];
+            if (!first_wins)
+                return 62;
+        }
+        return found_second_fallback && combined.size() >= first.size() ? 0 : 63;
+    }
+    if (__argc == 4 && strcmp(__argv[1], "--pc-static-object-lifecycle-smoke") == 0) {
+        Document document, restored;
+        Mesh mesh, restored_mesh;
+        std::vector<StaticObjectModel> models, restored_models;
+        std::string why;
+        if (!load_pc_level(__argv[2], &document, &mesh, &why, nullptr, &models))
+            return 50;
+        size_t object_count = 0, delete_index = SIZE_MAX;
+        const StaticObjectTemplate* creation_template = nullptr;
+        for (size_t index = 0; index < document.entities.size(); ++index) {
+            const Entity& entity = document.entities[index];
+            if (entity.kind != EntityKind::StaticObject)
+                continue;
+            ++object_count;
+            if (!creation_template) {
+                const StaticObjectTemplate* candidate =
+                    find_static_object_template(document, entity.value_u32_b, true);
+                bool rendered = false;
+                for (const StaticObjectModel& model : models)
+                    rendered |= model.file_id == entity.value_u32_b && !model.mesh.faces.empty();
+                if (candidate && rendered) {
+                    delete_index = index;
+                    creation_template = candidate;
+                }
+            }
+        }
+        if (!object_count || delete_index == SIZE_MAX || !creation_template)
+            return 51;
+        const uint32_t deleted_guid = document.entities[delete_index].guid;
+        const Asura_Vector_3 old_position = document.entities[delete_index].position;
+        document.entities.erase(document.entities.begin() + delete_index);
+        Entity created;
+        created.kind = EntityKind::StaticObject;
+        created.source_entity_classification = SnipeEntityClass_StaticObject;
+        adopt_static_object_template(&created, *creation_template);
+        created.guid = allocate_editor_guid(&document);
+        created.position = {old_position.x + 2.0f, old_position.y, old_position.z - 2.0f};
+        created.name = "Lifecycle smoke Object";
+        const uint32_t created_guid = created.guid;
+        document.entities.push_back(created);
+        if (!created_guid || !pack_document(document, __argv[3], &why) ||
+            !load_pc_level(__argv[3], &restored, &restored_mesh, &why, nullptr, &restored_models))
+            return 52;
+        size_t restored_count = 0;
+        bool deleted_absent = true, created_present = false;
+        for (const Entity& entity : restored.entities) {
+            if (entity.kind != EntityKind::StaticObject)
+                continue;
+            ++restored_count;
+            deleted_absent &= entity.guid != deleted_guid;
+            created_present |= entity.guid == created_guid && entity.value_u32_b == creation_template->file_id &&
+                               nearly_equal(entity.position, created.position);
+        }
+        return restored_count == object_count && deleted_absent && created_present ? 0 : 53;
+    }
+    if (__argc == 5 && strcmp(__argv[1], "--pc-object-donor-smoke") == 0) {
+        Document document, restored;
+        Mesh mesh, restored_mesh;
+        std::vector<StaticObjectTemplate> templates;
+        std::vector<StaticObjectModel> models, restored_models;
+        std::string why;
+        if (!load_pc_level(__argv[2], &document, &mesh, &why) ||
+            !load_static_object_donors({__argv[3]}, &templates, &models, &why))
+            return 54;
+        const StaticObjectTemplate* creation_template = nullptr;
+        for (const StaticObjectTemplate& candidate : templates) {
+            bool rendered = false;
+            for (const StaticObjectModel& model : models)
+                rendered |= model.file_id == candidate.file_id && !model.mesh.faces.empty();
+            if (rendered) {
+                creation_template = &candidate;
+                break;
+            }
+        }
+        if (!creation_template)
+            return 55;
+        document.object_donors = {__argv[3]};
+        document.static_object_templates = templates;
+        Entity created;
+        created.kind = EntityKind::StaticObject;
+        created.source_entity_classification = SnipeEntityClass_StaticObject;
+        adopt_static_object_template(&created, *creation_template);
+        created.guid = allocate_editor_guid(&document);
+        created.position = mesh.center;
+        created.name = "Donated smoke Object";
+        const uint32_t created_guid = created.guid;
+        document.entities.push_back(created);
+        const std::string project_path = std::string(__argv[4]) + ".alev";
+        Document project_roundtrip;
+        if (!save_project(document, project_path.c_str(), &why) ||
+            !load_project(&project_roundtrip, project_path.c_str(), &why))
+            return 59;
+        DeleteFileA(project_path.c_str());
+        if (project_roundtrip.object_donors != document.object_donors ||
+            project_roundtrip.static_object_templates.size() != document.static_object_templates.size() ||
+            project_roundtrip.entities.empty() ||
+            project_roundtrip.entities.back().kind != EntityKind::StaticObject ||
+            project_roundtrip.entities.back().static_object_body != created.static_object_body)
+            return 60;
+        if (!created_guid || !pack_document(document, __argv[4], &why) ||
+            !load_pc_level(__argv[4], &restored, &restored_mesh, &why, nullptr, &restored_models))
+            return 56;
+        for (const Entity& entity : restored.entities) {
+            if (entity.kind != EntityKind::StaticObject || entity.guid != created_guid)
+                continue;
+            bool rendered = false;
+            for (const StaticObjectModel& model : restored_models)
+                rendered |= model.file_id == entity.value_u32_b && !model.mesh.faces.empty();
+            return entity.value_u32_b == creation_template->file_id && rendered ? 0 : 57;
+        }
+        return 58;
+    }
     const bool gpu_smoke = (__argc == 3 || __argc == 4) && strcmp(__argv[1], "--gpu-smoke") == 0;
     const bool pc_gpu_smoke = __argc == 3 && strcmp(__argv[1], "--pc-gpu-smoke") == 0;
+    const bool pc_object_hierarchy_render_smoke =
+        __argc == 3 && strcmp(__argv[1], "--pc-object-hierarchy-render-smoke") == 0;
     const bool pc_editor_ui_smoke = __argc == 3 && strcmp(__argv[1], "--pc-editor-ui-smoke") == 0;
     const bool selection_smoke = __argc == 2 && strcmp(__argv[1], "--selection-smoke") == 0;
     const bool pc_weather_render_smoke =
@@ -8927,6 +11302,203 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
                               sizeof(document.ambient_volume)) == 0
                    ? 0
                    : 39;
+    }
+    if (__argc == 3 && strcmp(__argv[1], "--pc-invisible-barrier-count-smoke") == 0) {
+        Document document;
+        Mesh mesh;
+        std::string why;
+        if (!load_pc_level(__argv[2], &document, &mesh, &why))
+            return 94;
+        for (const Entity& entity : document.entities)
+            if (entity.kind == EntityKind::InvisibleBarrier)
+                return 0;
+        return 95;
+    }
+    if (__argc == 3 && strcmp(__argv[1], "--pc-invisible-barrier-smoke") == 0) {
+        Document document;
+        Mesh mesh;
+        std::string why;
+        if (!load_pc_level(__argv[2], &document, &mesh, &why))
+            return 79;
+        size_t barrier_count = 0;
+        bool found_mp04_example = false;
+        for (const Entity& entity : document.entities) {
+            if (entity.kind != EntityKind::InvisibleBarrier)
+                continue;
+            ++barrier_count;
+            if (!entity.barrier_source_record)
+                return 80;
+            const Asura_Bounding_Box& bounds = entity.source_bounds;
+            const float values[] = {bounds.MinX, bounds.MaxX, bounds.MinY,
+                                    bounds.MaxY, bounds.MinZ, bounds.MaxZ};
+            for (float value : values)
+                if (!isfinite(value))
+                    return 81;
+            if (bounds.MinX > bounds.MaxX || bounds.MinY > bounds.MaxY ||
+                bounds.MinZ > bounds.MaxZ)
+                return 82;
+            std::vector<LightGizmoLine> lines;
+            append_oriented_bounds_gizmo(entity, &lines);
+            if (lines.size() != kLightBoundingBoxLines)
+                return 83;
+            found_mp04_example |= bounds.MinX <= -78.0f && bounds.MaxX >= -78.0f &&
+                                  bounds.MinY <= 0.0f && bounds.MaxY >= 0.0f &&
+                                  bounds.MinZ <= 163.01f && bounds.MaxZ >= 162.99f;
+        }
+        return barrier_count && document.source_barrier_inventory_complete && found_mp04_example ? 0 : 84;
+    }
+    if (__argc == 4 && strcmp(__argv[1], "--pc-invisible-barrier-edit-smoke") == 0) {
+        Document document, restored;
+        Mesh mesh, restored_mesh;
+        std::string why;
+        if (!load_pc_level(__argv[2], &document, &mesh, &why))
+            return 90;
+        Entity* example = nullptr;
+        int delete_index = -1;
+        for (int index = 0; index < static_cast<int>(document.entities.size()); ++index) {
+            Entity& entity = document.entities[index];
+            if (entity.kind != EntityKind::InvisibleBarrier)
+                continue;
+            if (!example && entity.position.x > -86.1f && entity.position.x < -71.8f &&
+                entity.position.z > 162.9f && entity.position.z < 163.1f)
+                example = &entity;
+            else if (delete_index < 0)
+                delete_index = index;
+        }
+        if (!example || delete_index < 0)
+            return 91;
+        const Asura_Vector_3 original_position = example->position;
+        const Asura_Vector_3 original_size = oriented_box_dimensions(*example);
+        example->position.x += 2.0f;
+        example->rotation.y += 5.0f;
+        const Asura_Vector_3 edited_size{original_size.x + 1.5f, original_size.y + .75f,
+                                         original_size.z};
+        example->source_bounds = {example->position.x - edited_size.x * .5f,
+                                  example->position.x + edited_size.x * .5f,
+                                  example->position.y - edited_size.y * .5f,
+                                  example->position.y + edited_size.y * .5f,
+                                  example->position.z - edited_size.z * .5f,
+                                  example->position.z + edited_size.z * .5f};
+        const Asura_Vector_3 edited_position = example->position;
+        document.entities.erase(document.entities.begin() + delete_index);
+        Entity created;
+        created.kind = EntityKind::InvisibleBarrier;
+        created.name = "Created invisible barrier";
+        created.guid = allocate_editor_guid(&document);
+        created.position = {-40.0f, -1.0f, 140.0f};
+        created.rotation = {0.0f, 20.0f, 0.0f};
+        created.source_bounds = {-44.0f, -36.0f, -4.0f, 2.0f, 139.9f, 140.1f};
+        created.barrier_collision_flags = kPcInvisibleBarrierCollisionMask;
+        created.barrier_collision_material = 0x0015u;
+        document.entities.push_back(created);
+        if (!pack_document(document, __argv[3], &why) ||
+            !load_pc_level(__argv[3], &restored, &restored_mesh, &why))
+            return 92;
+        bool found_edited = false, found_created = false, found_old = false;
+        for (const Entity& entity : restored.entities) {
+            if (entity.kind != EntityKind::InvisibleBarrier)
+                continue;
+            const float edited_distance = fabsf(entity.position.x - edited_position.x) +
+                                          fabsf(entity.position.z - edited_position.z);
+            const float created_distance = fabsf(entity.position.x - created.position.x) +
+                                           fabsf(entity.position.z - created.position.z);
+            const float old_distance = fabsf(entity.position.x - original_position.x) +
+                                       fabsf(entity.position.z - original_position.z);
+            found_edited |= edited_distance < 1.0f;
+            found_created |= created_distance < 1.0f;
+            found_old |= old_distance < .25f;
+        }
+        return found_edited && found_created && !found_old ? 0 : 93;
+    }
+    if (__argc == 4 && strcmp(__argv[1], "--pc-building-volume-smoke") == 0) {
+        Document document, restored;
+        Mesh mesh, restored_mesh;
+        std::string why;
+        if (!load_pc_level(__argv[2], &document, &mesh, &why))
+            return 85;
+        Entity* changed = nullptr;
+        size_t source_count = 0;
+        for (Entity& entity : document.entities) {
+            if (entity.kind != EntityKind::BuildingVolume)
+                continue;
+            ++source_count;
+            if (!entity.source_entity_record ||
+                entity.source_entity_classification != SnipeEntityClass_BuildingVolume)
+                return 86;
+            std::vector<LightGizmoLine> lines;
+            append_oriented_bounds_gizmo(entity, &lines);
+            if (lines.size() != kLightBoundingBoxLines)
+                return 87;
+            if (!changed)
+                changed = &entity;
+        }
+        if (!changed || !source_count)
+            return 88;
+        const uint32_t guid = changed->guid;
+        const Asura_Vector_3 delta{1.25f, -.5f, 2.75f};
+        Asura_Vector_3 edited_size = oriented_box_dimensions(*changed);
+        edited_size.x += 2.0f;
+        edited_size.y += 1.0f;
+        edited_size.z += 3.0f;
+        changed->source_bounds = {
+            changed->position.x - edited_size.x * .5f, changed->position.x + edited_size.x * .5f,
+            changed->position.y - edited_size.y * .5f, changed->position.y + edited_size.y * .5f,
+            changed->position.z - edited_size.z * .5f, changed->position.z + edited_size.z * .5f};
+        changed->position = add(changed->position, delta);
+        changed->rotation.y += 7.5f;
+        const Asura_Vector_3 expected_position = changed->position;
+        const Asura_Vector_3 expected_rotation = changed->rotation;
+        const Asura_Bounding_Box expected_bounds = centered_oriented_box_bounds(*changed);
+
+        Entity created;
+        created.kind = EntityKind::BuildingVolume;
+        created.name = "Authored building volume smoke";
+        created.guid = allocate_editor_guid(&document);
+        created.position = {12.0f, -3.0f, 18.0f};
+        created.rotation = {0.0f, 22.5f, 0.0f};
+        created.source_entity_classification = SnipeEntityClass_BuildingVolume;
+        created.source_bounds = {8.0f, 16.0f, -5.5f, -.5f, 12.0f, 24.0f};
+        created.value_a = 8.0f;
+        created.value_b = 12.0f;
+        const uint32_t created_guid = created.guid;
+        const Asura_Bounding_Box created_bounds = centered_oriented_box_bounds(created);
+        if (!created_guid)
+            return 91;
+        document.entities.push_back(created);
+        if (!pack_document(document, __argv[3], &why) ||
+            !load_pc_level(__argv[3], &restored, &restored_mesh, &why))
+            return 89;
+        size_t restored_count = 0;
+        const Entity* actual = nullptr;
+        const Entity* actual_created = nullptr;
+        for (const Entity& entity : restored.entities) {
+            if (entity.kind != EntityKind::BuildingVolume)
+                continue;
+            ++restored_count;
+            if (entity.guid == guid)
+                actual = &entity;
+            if (entity.guid == created_guid)
+                actual_created = &entity;
+        }
+        if (!actual || !actual_created || restored_count != source_count + 1 ||
+            !nearly_equal(actual->position, expected_position) ||
+            !nearly_equal_rotation(actual->rotation, expected_rotation) ||
+            !nearly_equal(actual->source_bounds.MinX, expected_bounds.MinX) ||
+            !nearly_equal(actual->source_bounds.MaxX, expected_bounds.MaxX) ||
+            !nearly_equal(actual->source_bounds.MinY, expected_bounds.MinY) ||
+            !nearly_equal(actual->source_bounds.MaxY, expected_bounds.MaxY) ||
+            !nearly_equal(actual->source_bounds.MinZ, expected_bounds.MinZ) ||
+            !nearly_equal(actual->source_bounds.MaxZ, expected_bounds.MaxZ) ||
+            !nearly_equal(actual_created->position, created.position) ||
+            !nearly_equal_rotation(actual_created->rotation, created.rotation) ||
+            !nearly_equal(actual_created->source_bounds.MinX, created_bounds.MinX) ||
+            !nearly_equal(actual_created->source_bounds.MaxX, created_bounds.MaxX) ||
+            !nearly_equal(actual_created->source_bounds.MinY, created_bounds.MinY) ||
+            !nearly_equal(actual_created->source_bounds.MaxY, created_bounds.MaxY) ||
+            !nearly_equal(actual_created->source_bounds.MinZ, created_bounds.MinZ) ||
+            !nearly_equal(actual_created->source_bounds.MaxZ, created_bounds.MaxZ))
+            return 90;
+        return 0;
     }
     if (__argc == 4 && strcmp(__argv[1], "--pc-entity-transform-smoke") == 0) {
         Document doc, restored;
@@ -9046,6 +11618,15 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
         light.value_b = 100;
         light.light = legacy_editor_light(light);
         doc.entities.push_back(light);
+        Entity barrier;
+        barrier.kind = EntityKind::InvisibleBarrier;
+        barrier.name = "Smoke invisible barrier";
+        barrier.guid = allocate_editor_guid(&doc);
+        barrier.position = {0, 1.5f, 1.0f};
+        barrier.source_bounds = {-2.0f, 2.0f, -1.5f, 4.5f, .9f, 1.1f};
+        barrier.barrier_collision_flags = kPcInvisibleBarrierCollisionMask;
+        barrier.barrier_collision_material = 0x0015u;
+        doc.entities.push_back(barrier);
         std::string why;
         return pack_document(doc, __argv[3], &why) ? 0 : 2;
     }
@@ -9102,6 +11683,25 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
                                   CW_USEDEFAULT, CW_USEDEFAULT, 1380, 840, nullptr, nullptr, instance, nullptr);
     if (!window)
         return 1;
+    if (pc_object_hierarchy_render_smoke) {
+        if (!open_pc_path(__argv[2])) {
+            DestroyWindow(window);
+            return 75;
+        }
+        gpu_render();
+        bool leaves_resolved = false;
+        for (const PickupModel& model : g.pickup_models)
+            leaves_resolved |= _stricmp(model.mesh.resource_name.c_str(), "8aleaves") == 0 &&
+                               model.mesh.min.y < -8.0f && !model.mesh.faces.empty();
+        bool leaves_texture_created = false;
+        for (const GpuModelTexture& texture : gpu.model_textures)
+            leaves_texture_created |= texture.view &&
+                                      texture.name.find("8aleaves.tga") != std::string::npos;
+        const bool valid = gpu.ready && gpu.puppet_vertices && gpu.puppet_capacity &&
+                           leaves_resolved && leaves_texture_created;
+        DestroyWindow(window);
+        return valid ? 0 : 76;
+    }
     if (selection_smoke) {
         g.document = {};
         Entity first;
@@ -9146,12 +11746,84 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
                                    g.document.entities[1].position.y == 5.0f &&
                                    g.document.entities[0].name == "First spawn" &&
                                    g.document.entities[1].name == "Second spawn";
+        command_copy_entity();
+        command_paste_entity();
+        const bool group_pasted = g.document.entities.size() == 5 &&
+                                  g.selected_entities.size() == 2 &&
+                                  entity_is_selected(3) && entity_is_selected(4) && g.selected == 4 &&
+                                  g.document.entities[3].name == "First spawn" &&
+                                  g.document.entities[4].name == "Second spawn" &&
+                                  g.document.entities[3].position.x == 42.0f &&
+                                  g.document.entities[4].position.x == 42.0f &&
+                                  g.document.entities[3].guid != g.document.entities[4].guid &&
+                                  g.document.entities[3].guid >= kToolCreatedGuidFirst &&
+                                  g.document.entities[4].guid >= kToolCreatedGuidFirst;
+        command_undo();
+        const bool paste_undo_restored = g.document.entities.size() == 3;
         int restored_selection = g.selected;
         const bool undo_restored = g.history.undo(&g.document, &restored_selection) &&
                                    g.document.entities[0].position.x == 1.0f &&
                                    g.document.entities[1].position.x == 4.0f;
+        StaticObjectModel selection_model;
+        selection_model.file_id = 0x12345678u;
+        selection_model.mesh.vertices = {
+            {{0.0f, -6.0f, 0.0f}, {}, {}},
+            {{-3.0f, 0.0f, 0.0f}, {}, {}},
+            {{3.0f, 0.0f, 0.0f}, {}, {}},
+        };
+        selection_model.mesh.faces = {{0, 1, 2}};
+        selection_model.mesh.min = {-20.0f, -20.0f, -1.0f};
+        selection_model.mesh.max = {20.0f, 20.0f, 1.0f};
+        g.static_object_models = {selection_model};
+        Entity selection_object;
+        selection_object.kind = EntityKind::StaticObject;
+        selection_object.value_u32_b = selection_model.file_id;
+        g.document.entities = {selection_object};
+        set_single_selection_state(-1);
+        g.mesh = {};
+        g.environment_raycast.clear();
+        g.camera.target = {0.0f, 3.0f, 0.0f};
+        g.camera.yaw = 0.0f;
+        g.camera.pitch = 0.0f;
+        g.camera.distance = 20.0f;
+        POINT visible_point{}, empty_bounds_point{};
+        const bool projected_selection_points =
+            project_point(spawn_puppet_view_position({0.0f, -2.0f, 0.0f}, selection_object),
+                          &visible_point) &&
+            project_point(spawn_puppet_view_position({2.5f, -5.5f, 0.0f}, selection_object),
+                          &empty_bounds_point);
+        const bool geometry_hit_matches = projected_selection_points &&
+                                          hit_entity(visible_point.x, visible_point.y) == 0 &&
+                                          hit_entity(empty_bounds_point.x, empty_bounds_point.y) == -1;
+        g.static_object_models.clear();
+        Entity selection_barrier;
+        selection_barrier.kind = EntityKind::InvisibleBarrier;
+        selection_barrier.source_bounds = {-5.0f, 5.0f, -5.0f, 5.0f, -.1f, .1f};
+        g.document.entities = {selection_barrier};
+        set_single_selection_state(-1);
+        g.camera.target = {};
+        POINT barrier_center{}, barrier_edge{};
+        const bool projected_barrier_points =
+            project_point(entity_view_position(selection_barrier.position), &barrier_center) &&
+            project_point(entity_view_position({0.0f, -5.0f, .1f}), &barrier_edge);
+        const bool center_not_pickable = projected_barrier_points &&
+                                         hit_entity(barrier_center.x, barrier_center.y) == -1;
+        const bool visible_edge_pickable = projected_barrier_points &&
+                                           hit_entity(barrier_edge.x, barrier_edge.y) == 0;
+        g.mesh.positions = {{-20.0f, -20.0f, 10.0f}, {20.0f, -20.0f, 10.0f},
+                            {20.0f, 20.0f, 10.0f}, {-20.0f, 20.0f, 10.0f}};
+        g.mesh.faces = {{0, 1, 2}, {0, 2, 3}};
+        g.environment_raycast.build(g.mesh);
+        const bool hidden_edge_not_pickable = projected_barrier_points &&
+                                              hit_entity(barrier_edge.x, barrier_edge.y) == -1;
+        const bool barrier_pick_matches = center_not_pickable && visible_edge_pickable &&
+                                          hidden_edge_not_pickable;
         DestroyWindow(window);
-        return same_type_selected && mixed_type_rejected && batch_applied && undo_restored ? 0 : 41;
+        return same_type_selected && mixed_type_rejected && batch_applied && group_pasted &&
+                       paste_undo_restored && undo_restored && geometry_hit_matches &&
+                       barrier_pick_matches
+                   ? 0
+                   : 41;
     }
     if (project_weather_render_smoke) {
         Document document;
@@ -9535,7 +12207,8 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
                 set_single_selection_state(g.document.entities.empty() ? -1 : 0);
                 g.pending_kind = -1;
                 const bool skybox_loaded = reload_skybox_preview(true);
-                load_document_preview(&g.document, &g.mesh, &why, &g.pickup_models);
+                load_document_preview(&g.document, &g.mesh, &why, &g.pickup_models,
+                                      &g.static_object_models);
                 frame_mesh();
                 reset_history(!g.document.dirty);
                 refresh_list();
