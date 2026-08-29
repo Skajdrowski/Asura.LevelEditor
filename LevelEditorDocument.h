@@ -20,7 +20,6 @@ enum class EntityKind : uint32_t {
     PositionMarker,
     StaticObject,
     BuildingVolume,
-    InvisibleBarrier,
 };
 
 struct Entity {
@@ -62,15 +61,6 @@ struct Entity {
     std::array<uint8_t, kPickupBodySize> pickup_body{};
     bool static_object_has_template = false;
     std::array<uint8_t, kStaticObjectBodySize> static_object_body{};
-    // Invisible barriers are authored as flagged EMOD collision polygons, not
-    // ENTI records.  Source identity lets export remove or replace exactly the
-    // connected polygon component that produced this editor object.
-    bool barrier_source_record = false;
-    uint32_t barrier_source_chunk = 0xffffffffu;
-    uint32_t barrier_source_module = 0xffffffffu;
-    uint32_t barrier_source_component = 0xffffffffu;
-    uint16_t barrier_collision_flags = 0x0340u;
-    uint16_t barrier_collision_material = 0x0015u;
 };
 
 struct StaticObjectTemplate {
@@ -142,7 +132,6 @@ struct Document {
     // makes absence from entities an intentional deletion during export.
     bool source_pickup_inventory_complete = false;
     bool source_static_object_inventory_complete = false;
-    bool source_barrier_inventory_complete = false;
     bool dirty = false;
 };
 

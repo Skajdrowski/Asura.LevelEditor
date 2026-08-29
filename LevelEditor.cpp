@@ -257,257 +257,6 @@ bool decode_pc_environment(const RscfInfo& resource, Mesh* mesh, Arena* arena, E
     return true;
 }
 
-constexpr uint16_t kPcInvisibleBarrierCollisionMask = 0x0340u;
-
-struct PcCollisionView {
-    const uint8_t* data = nullptr;
-    uint32_t size = 0;
-    uint32_t vertex_count = 0;
-    uint32_t polygon_count = 0;
-    bool per_polygon_flags = false;
-    bool per_polygon_materials = false;
-    uint16_t overall_flags = 0;
-    uint16_t overall_material = 0xffffu;
-    uint64_t vertices_at = 0;
-    uint64_t polygons_at = 0;
-    uint64_t flags_at = 0;
-    uint64_t materials_at = 0;
-    uint64_t required = 0;
-};
-
-struct PcBarrierComponent {
-    std::vector<uint32_t> polygons;
-    Asura_Bounding_Box bounds{};
-    uint16_t flags = kPcInvisibleBarrierCollisionMask;
-    uint16_t material = 0x0015u;
-};
-
-bool pc_collision_view(const uint8_t* collision, uint32_t collision_size,
-                       PcCollisionView* view, Error* err, uint32_t module_index) {
-    if (collision_size < 52 || read_u32(collision) != 3)
-        return false;
-    PcCollisionView next{};
-    next.data = collision;
-    next.size = collision_size;
-    next.vertex_count = read_u32(collision + 4);
-    next.polygon_count = read_u32(collision + 8);
-    next.per_polygon_flags = read_u32(collision + 12) != 0;
-    next.per_polygon_materials = read_u32(collision + 16) != 0;
-    next.overall_flags = read_u16(collision + 20);
-    next.overall_material = read_u16(collision + 22);
-    next.vertices_at = 52;
-    next.polygons_at = next.vertices_at + static_cast<uint64_t>(next.vertex_count) * 12;
-    next.flags_at = next.polygons_at + static_cast<uint64_t>(next.polygon_count) * 8;
-    next.materials_at = next.flags_at +
-                        (next.per_polygon_flags ? static_cast<uint64_t>(next.polygon_count) * 2 : 0);
-    next.required = next.materials_at +
-                    (next.per_polygon_materials ? static_cast<uint64_t>(next.polygon_count) * 2 : 0);
-    if (next.required > collision_size) {
-        fail(err, "the .PC EMOD collision arrays for module %u are truncated", module_index);
-        return false;
-    }
-    *view = next;
-    return true;
-}
-
-uint16_t pc_collision_polygon_flags(const PcCollisionView& view, uint32_t polygon) {
-    return view.per_polygon_flags
-               ? read_u16(view.data + view.flags_at + static_cast<uint64_t>(polygon) * 2)
-               : view.overall_flags;
-}
-
-uint16_t pc_collision_polygon_material(const PcCollisionView& view, uint32_t polygon) {
-    return view.per_polygon_materials
-               ? read_u16(view.data + view.materials_at + static_cast<uint64_t>(polygon) * 2)
-               : view.overall_material;
-}
-
-bool pc_barrier_components(const PcCollisionView& view, const Asura_Vector_3& translation,
-                           std::vector<PcBarrierComponent>* components, Error* err,
-                           uint32_t module_index) {
-    std::vector<int32_t> parent(view.vertex_count, -1);
-    auto root = [&](uint32_t vertex) {
-        uint32_t current = vertex;
-        while (parent[current] != static_cast<int32_t>(current)) {
-            parent[current] = parent[static_cast<uint32_t>(parent[current])];
-            current = static_cast<uint32_t>(parent[current]);
-        }
-        return current;
-    };
-    auto unite = [&](uint32_t first, uint32_t second) {
-        if (parent[first] < 0)
-            parent[first] = static_cast<int32_t>(first);
-        if (parent[second] < 0)
-            parent[second] = static_cast<int32_t>(second);
-        const uint32_t first_root = root(first), second_root = root(second);
-        if (first_root != second_root)
-            parent[second_root] = static_cast<int32_t>(first_root);
-    };
-
-    std::vector<uint32_t> barrier_polygons;
-    for (uint32_t polygon_index = 0; polygon_index < view.polygon_count; ++polygon_index) {
-        const uint16_t flags = pc_collision_polygon_flags(view, polygon_index);
-        if ((flags & kPcInvisibleBarrierCollisionMask) != kPcInvisibleBarrierCollisionMask)
-            continue;
-        std::array<uint16_t, 4> vertices{};
-        memcpy(vertices.data(), view.data + view.polygons_at + static_cast<uint64_t>(polygon_index) * 8,
-               sizeof(vertices));
-        if (vertices[0] >= view.vertex_count || vertices[1] >= view.vertex_count ||
-            vertices[2] >= view.vertex_count ||
-            (vertices[3] != 0xffffu && vertices[3] >= view.vertex_count))
-            return fail(err, "the .PC invisible barrier in module %u has an invalid vertex", module_index);
-        unite(vertices[0], vertices[1]);
-        unite(vertices[1], vertices[2]);
-        if (vertices[3] != 0xffffu)
-            unite(vertices[2], vertices[3]);
-        barrier_polygons.push_back(polygon_index);
-    }
-
-    std::vector<int32_t> component_slot(view.vertex_count, -1);
-    for (uint32_t polygon_index : barrier_polygons) {
-        std::array<uint16_t, 4> polygon{};
-        memcpy(polygon.data(), view.data + view.polygons_at + static_cast<uint64_t>(polygon_index) * 8,
-               sizeof(polygon));
-        const uint32_t component = root(polygon[0]);
-        int32_t& slot = component_slot[component];
-        if (slot < 0) {
-            slot = static_cast<int32_t>(components->size());
-            PcBarrierComponent next{};
-            next.flags = pc_collision_polygon_flags(view, polygon_index);
-            next.material = pc_collision_polygon_material(view, polygon_index);
-            components->push_back(std::move(next));
-        }
-        PcBarrierComponent& output = (*components)[slot];
-        output.polygons.push_back(polygon_index);
-        for (uint16_t vertex : polygon) {
-            if (vertex == 0xffffu)
-                continue;
-            const uint8_t* source = view.data + view.vertices_at + static_cast<uint64_t>(vertex) * 12;
-            const Asura_Vector_3 position{read_f32(source) + translation.x,
-                                          read_f32(source + 4) + translation.y,
-                                          read_f32(source + 8) + translation.z};
-            if (!isfinite(position.x) || !isfinite(position.y) || !isfinite(position.z))
-                return fail(err, "the .PC invisible barrier in module %u is non-finite", module_index);
-            if (output.polygons.size() == 1 && vertex == polygon[0]) {
-                output.bounds = {position.x, position.x, position.y, position.y,
-                                 position.z, position.z};
-            } else {
-                output.bounds.MinX = fminf(output.bounds.MinX, position.x);
-                output.bounds.MaxX = fmaxf(output.bounds.MaxX, position.x);
-                output.bounds.MinY = fminf(output.bounds.MinY, position.y);
-                output.bounds.MaxY = fmaxf(output.bounds.MaxY, position.y);
-                output.bounds.MinZ = fminf(output.bounds.MinZ, position.z);
-                output.bounds.MaxZ = fmaxf(output.bounds.MaxZ, position.z);
-            }
-        }
-    }
-    return true;
-}
-
-void make_pc_barrier_entity(const PcBarrierComponent& component, uint32_t chunk_index,
-                            uint32_t module_index, uint32_t component_index,
-                            uint32_t number, Entity* entity) {
-    *entity = {};
-    entity->kind = EntityKind::InvisibleBarrier;
-    entity->name = "Invisible barrier " + std::to_string(number);
-    entity->position = {(component.bounds.MinX + component.bounds.MaxX) * .5f,
-                        (component.bounds.MinY + component.bounds.MaxY) * .5f,
-                        (component.bounds.MinZ + component.bounds.MaxZ) * .5f};
-    Asura_Vector_3 size{component.bounds.MaxX - component.bounds.MinX,
-                        component.bounds.MaxY - component.bounds.MinY,
-                        component.bounds.MaxZ - component.bounds.MinZ};
-    const float largest = fmaxf(size.x, fmaxf(size.y, size.z));
-    const float preview_thickness = fmaxf(.1f, largest * .01f);
-    if (size.x < preview_thickness)
-        size.x = preview_thickness;
-    if (size.y < preview_thickness)
-        size.y = preview_thickness;
-    if (size.z < preview_thickness)
-        size.z = preview_thickness;
-    entity->source_bounds = {entity->position.x - size.x * .5f, entity->position.x + size.x * .5f,
-                             entity->position.y - size.y * .5f, entity->position.y + size.y * .5f,
-                             entity->position.z - size.z * .5f, entity->position.z + size.z * .5f};
-    entity->value_a = size.x;
-    entity->value_b = size.z;
-    entity->barrier_source_record = true;
-    entity->barrier_source_chunk = chunk_index;
-    entity->barrier_source_module = module_index;
-    entity->barrier_source_component = component_index;
-    entity->barrier_collision_flags = component.flags;
-    entity->barrier_collision_material = component.material;
-}
-
-bool decode_pc_invisible_barriers(const ChunkList& chunks, Document* document, Error* err) {
-    uint32_t barrier_number = 0;
-    for (uint32_t chunk_index = 0; chunk_index < chunks.count; ++chunk_index) {
-        const ChunkRef& chunk = chunks.chunks[chunk_index];
-        if (chunk.cid != ASURA_CHUNK_ENVIRONMENT_MODULELIST || chunk.version != 6)
-            continue;
-        if (chunk.size < sizeof(Asura_Chunk_Header) + sizeof(uint32_t))
-            return fail(err, "the .PC EMOD chunk is truncated");
-
-        const uint32_t module_count = read_u32(chunk.data + sizeof(Asura_Chunk_Header));
-        uint64_t at = sizeof(Asura_Chunk_Header) + sizeof(uint32_t);
-        const Str environment_name = padded_string_at(chunk.data, chunk.size, static_cast<uint32_t>(at));
-        if (!environment_name.data)
-            return fail(err, "the .PC EMOD environment name is truncated");
-        at += align_up(static_cast<uint64_t>(environment_name.size) + 1, 4);
-
-        for (uint32_t module_index = 0; module_index < module_count; ++module_index) {
-            if (at > UINT32_MAX)
-                return fail(err, "the .PC EMOD module table is invalid");
-            const Str module_name = padded_string_at(chunk.data, chunk.size, static_cast<uint32_t>(at));
-            if (!module_name.data)
-                return fail(err, "the .PC EMOD module name is truncated");
-            at += align_up(static_cast<uint64_t>(module_name.size) + 1, 4);
-            if (at + sizeof(Asura_Chunk_Environment_ModuleList_EntryV6) > chunk.size)
-                return fail(err, "the .PC EMOD module %u is truncated", module_index);
-
-            Asura_Chunk_Environment_ModuleList_EntryV6 module{};
-            memcpy(&module, chunk.data + at, sizeof(module));
-            at += sizeof(module);
-            if (module.m_uCollisionDataSize > chunk.size - at)
-                return fail(err, "the .PC EMOD collision module %u is truncated", module_index);
-
-            const uint8_t* collision = chunk.data + at;
-            const uint32_t collision_size = module.m_uCollisionDataSize;
-            at += collision_size;
-            PcCollisionView view{};
-            if (!pc_collision_view(collision, collision_size, &view, err, module_index)) {
-                if (err->set)
-                    return false;
-                continue;
-            }
-            std::vector<PcBarrierComponent> components;
-            if (!pc_barrier_components(view, module.m_xTranslation, &components, err, module_index))
-                return false;
-            for (uint32_t component_index = 0; component_index < components.size(); ++component_index) {
-                Entity entity;
-                make_pc_barrier_entity(components[component_index], chunk_index, module_index,
-                                       component_index, ++barrier_number, &entity);
-                uint32_t candidate = document->next_guid;
-                for (;;) {
-                    bool used = false;
-                    for (const Entity& existing : document->entities)
-                        used |= existing.guid == candidate;
-                    if (!used)
-                        break;
-                    candidate = candidate == asura::level::kToolCreatedGuidLast
-                                    ? asura::level::kToolCreatedGuidFirst
-                                    : candidate + 1;
-                }
-                entity.guid = candidate;
-                document->next_guid = candidate == asura::level::kToolCreatedGuidLast
-                                          ? asura::level::kToolCreatedGuidFirst
-                                          : candidate + 1;
-                document->entities.push_back(std::move(entity));
-            }
-        }
-    }
-    document->source_barrier_inventory_complete = true;
-    return true;
-}
-
 const RscfInfo* find_pc_environment(const ChunkList& chunks, RscfInfo* storage) {
     bool have_fallback = false;
     RscfInfo fallback{};
@@ -1840,8 +1589,7 @@ bool load_pc_level(const std::string& path, Document* document, Mesh* mesh, std:
         ok = fail(&err, "the .PC contains no PC environment RSCF");
     if (ok)
         ok = decode_pc_environment(environment, &next_mesh, &arena, &err) &&
-             import_pc_entities(chunks, &next_document, &err) &&
-             decode_pc_invisible_barriers(chunks, &next_document, &err);
+             import_pc_entities(chunks, &next_document, &err);
     if (ok)
         add_resource_backed_pickup_templates(chunks, &next_document);
     if (ok) {
@@ -2544,331 +2292,6 @@ bool append_editor_building_volumes(Buffer* out, const Document& doc, Error* err
     return true;
 }
 
-struct PcEmodModuleView {
-    const uint8_t* name = nullptr;
-    uint32_t name_bytes = 0;
-    Asura_Chunk_Environment_ModuleList_EntryV6 module{};
-    const uint8_t* collision = nullptr;
-};
-
-bool pc_emod_modules(const ChunkRef& chunk, const uint8_t** environment_name,
-                     uint32_t* environment_name_bytes, std::vector<PcEmodModuleView>* modules,
-                     Error* err) {
-    if (chunk.cid != ASURA_CHUNK_ENVIRONMENT_MODULELIST || chunk.version != 6 ||
-        chunk.size < sizeof(Asura_Chunk_Header) + sizeof(uint32_t))
-        return fail(err, "the source EMOD chunk is unsupported or truncated");
-    const uint32_t module_count = read_u32(chunk.data + sizeof(Asura_Chunk_Header));
-    uint64_t at = sizeof(Asura_Chunk_Header) + sizeof(uint32_t);
-    const Str env_name = padded_string_at(chunk.data, chunk.size, static_cast<uint32_t>(at));
-    if (!env_name.data)
-        return fail(err, "the source EMOD environment name is truncated");
-    *environment_name = chunk.data + at;
-    *environment_name_bytes = static_cast<uint32_t>(align_up(static_cast<uint64_t>(env_name.size) + 1, 4));
-    at += *environment_name_bytes;
-    modules->clear();
-    modules->reserve(module_count);
-    for (uint32_t module_index = 0; module_index < module_count; ++module_index) {
-        if (at > UINT32_MAX)
-            return fail(err, "the source EMOD module table is invalid");
-        const Str module_name = padded_string_at(chunk.data, chunk.size, static_cast<uint32_t>(at));
-        if (!module_name.data)
-            return fail(err, "the source EMOD module name %u is truncated", module_index);
-        PcEmodModuleView next{};
-        next.name = chunk.data + at;
-        next.name_bytes = static_cast<uint32_t>(align_up(static_cast<uint64_t>(module_name.size) + 1, 4));
-        at += next.name_bytes;
-        if (at + sizeof(next.module) > chunk.size)
-            return fail(err, "the source EMOD module record %u is truncated", module_index);
-        memcpy(&next.module, chunk.data + at, sizeof(next.module));
-        at += sizeof(next.module);
-        if (next.module.m_uCollisionDataSize > chunk.size - at)
-            return fail(err, "the source EMOD collision module %u is truncated", module_index);
-        next.collision = chunk.data + at;
-        at += next.module.m_uCollisionDataSize;
-        modules->push_back(next);
-    }
-    if (at != chunk.size)
-        return fail(err, "the source EMOD chunk has an unsupported trailing payload");
-    return true;
-}
-
-const Entity* find_source_barrier(const Document& doc, uint32_t chunk_index,
-                                  uint32_t module_index, uint32_t component_index) {
-    for (const Entity& entity : doc.entities) {
-        if (entity.kind == EntityKind::InvisibleBarrier && entity.barrier_source_record &&
-            entity.barrier_source_chunk == chunk_index &&
-            entity.barrier_source_module == module_index &&
-            entity.barrier_source_component == component_index)
-            return &entity;
-    }
-    return nullptr;
-}
-
-bool equal_barrier_geometry(const Entity& entity, const PcBarrierComponent& source,
-                            uint32_t chunk_index, uint32_t module_index,
-                            uint32_t component_index) {
-    Entity original;
-    make_pc_barrier_entity(source, chunk_index, module_index, component_index, 0, &original);
-    return nearly_equal(entity.position, original.position) &&
-           nearly_equal_rotation(entity.rotation, original.rotation) &&
-           nearly_equal(oriented_box_dimensions(entity), oriented_box_dimensions(original));
-}
-
-Asura_Vector_3 barrier_subtract(const Asura_Vector_3& first, const Asura_Vector_3& second) {
-    return {first.x - second.x, first.y - second.y, first.z - second.z};
-}
-
-Asura_Vector_3 barrier_rotate(const Asura_Vector_3& value, const Asura_Quat& q) {
-    const Asura_Vector_3 twice_cross{2.0f * (q.y * value.z - q.z * value.y),
-                                     2.0f * (q.z * value.x - q.x * value.z),
-                                     2.0f * (q.x * value.y - q.y * value.x)};
-    return {value.x + q.w * twice_cross.x + q.y * twice_cross.z - q.z * twice_cross.y,
-            value.y + q.w * twice_cross.y + q.z * twice_cross.x - q.x * twice_cross.z,
-            value.z + q.w * twice_cross.z + q.x * twice_cross.y - q.y * twice_cross.x};
-}
-
-void append_barrier_rectangle(const Entity& entity, const Asura_Vector_3& translation,
-                              std::vector<Asura_Vector_3>* vertices,
-                              std::vector<std::array<uint16_t, 4>>* polygons,
-                              std::vector<uint16_t>* flags, std::vector<uint16_t>* materials) {
-    const Asura_Vector_3 size = oriented_box_dimensions(entity);
-    const float half[3] = {size.x * .5f, size.y * .5f, size.z * .5f};
-    uint32_t normal_axis = 0;
-    if (size.y < size.x)
-        normal_axis = 1;
-    if ((normal_axis == 0 ? size.x : size.y) > size.z)
-        normal_axis = 2;
-    const uint32_t first_axis = normal_axis == 0 ? 1 : 0;
-    const uint32_t second_axis = normal_axis == 2 ? 1 : 2;
-    Asura_Vector_3 local[4]{};
-    float* coordinates[4][3] = {{&local[0].x, &local[0].y, &local[0].z},
-                                {&local[1].x, &local[1].y, &local[1].z},
-                                {&local[2].x, &local[2].y, &local[2].z},
-                                {&local[3].x, &local[3].y, &local[3].z}};
-    const float signs[4][2] = {{-1, -1}, {1, -1}, {1, 1}, {-1, 1}};
-    for (uint32_t corner = 0; corner < 4; ++corner) {
-        *coordinates[corner][first_axis] = signs[corner][0] * half[first_axis];
-        *coordinates[corner][second_axis] = signs[corner][1] * half[second_axis];
-    }
-    const Asura_Quat orientation = euler_quaternion(entity.rotation);
-    const uint16_t first_vertex = static_cast<uint16_t>(vertices->size());
-    for (const Asura_Vector_3& corner : local) {
-        const Asura_Vector_3 rotated = barrier_rotate(corner, orientation);
-        const Asura_Vector_3 world{entity.position.x + rotated.x, entity.position.y + rotated.y,
-                                   entity.position.z + rotated.z};
-        vertices->push_back(barrier_subtract(world, translation));
-    }
-    polygons->push_back({first_vertex, static_cast<uint16_t>(first_vertex + 1),
-                         static_cast<uint16_t>(first_vertex + 2), 0xffffu});
-    polygons->push_back({first_vertex, static_cast<uint16_t>(first_vertex + 2),
-                         static_cast<uint16_t>(first_vertex + 3), 0xffffu});
-    flags->push_back(entity.barrier_collision_flags);
-    flags->push_back(entity.barrier_collision_flags);
-    materials->push_back(entity.barrier_collision_material);
-    materials->push_back(entity.barrier_collision_material);
-}
-
-bool append_edited_collision_v3(Buffer* out, const PcCollisionView& view,
-                                const Asura_Vector_3& translation,
-                                const std::vector<PcBarrierComponent>& components,
-                                const std::vector<const Entity*>& additions,
-                                const std::vector<bool>& omitted_polygons, Error* err) {
-    std::vector<Asura_Vector_3> vertices;
-    vertices.reserve(static_cast<size_t>(view.vertex_count) + additions.size() * 4);
-    for (uint32_t vertex = 0; vertex < view.vertex_count; ++vertex) {
-        const uint8_t* source = view.data + view.vertices_at + static_cast<uint64_t>(vertex) * 12;
-        vertices.push_back({read_f32(source), read_f32(source + 4), read_f32(source + 8)});
-    }
-    std::vector<std::array<uint16_t, 4>> polygons;
-    std::vector<uint16_t> polygon_flags, polygon_materials;
-    polygons.reserve(static_cast<size_t>(view.polygon_count) + additions.size() * 2);
-    polygon_flags.reserve(polygons.capacity());
-    polygon_materials.reserve(polygons.capacity());
-    for (uint32_t polygon = 0; polygon < view.polygon_count; ++polygon) {
-        if (polygon < omitted_polygons.size() && omitted_polygons[polygon])
-            continue;
-        std::array<uint16_t, 4> indices{};
-        memcpy(indices.data(), view.data + view.polygons_at + static_cast<uint64_t>(polygon) * 8,
-               sizeof(indices));
-        polygons.push_back(indices);
-        polygon_flags.push_back(pc_collision_polygon_flags(view, polygon));
-        polygon_materials.push_back(pc_collision_polygon_material(view, polygon));
-    }
-    for (const Entity* entity : additions) {
-        if (!valid_oriented_box_dimensions(*entity))
-            return fail(err, "invisible barrier '%s' has invalid bounds", entity->name.c_str());
-        if (vertices.size() > 65531)
-            return fail(err, "an EMOD module exceeds 65535 collision vertices after adding barriers");
-        append_barrier_rectangle(*entity, translation, &vertices, &polygons,
-                                 &polygon_flags, &polygon_materials);
-    }
-    if (polygons.empty())
-        return fail(err, "editing invisible barriers would leave an EMOD module without collision polygons");
-    if (polygons.size() > kMaxAabbTreeObjects)
-        return fail(err, "an EMOD module exceeds 65535 collision polygons after editing barriers");
-
-    Asura_Vector_3 minimum = vertices.front(), maximum = vertices.front();
-    for (const Asura_Vector_3& vertex : vertices) {
-        minimum.x = fminf(minimum.x, vertex.x);
-        minimum.y = fminf(minimum.y, vertex.y);
-        minimum.z = fminf(minimum.z, vertex.z);
-        maximum.x = fmaxf(maximum.x, vertex.x);
-        maximum.y = fmaxf(maximum.y, vertex.y);
-        maximum.z = fmaxf(maximum.z, vertex.z);
-    }
-    const float bounds[6] = {minimum.x, maximum.x, minimum.y, maximum.y, minimum.z, maximum.z};
-    const float dx = maximum.x - minimum.x, dy = maximum.y - minimum.y, dz = maximum.z - minimum.z;
-    const float radius = .5f * sqrtf(dx * dx + dy * dy + dz * dz);
-    append_u32(out, 3, err);
-    append_u32(out, static_cast<uint32_t>(vertices.size()), err);
-    append_u32(out, static_cast<uint32_t>(polygons.size()), err);
-    append_u32(out, 1, err);
-    append_u32(out, 1, err);
-    append_u16(out, view.overall_flags, err);
-    append_u16(out, view.overall_material, err);
-    buffer_append(out, bounds, sizeof(bounds), err);
-    append_f32(out, radius, err);
-    buffer_append(out, vertices.data(), vertices.size() * sizeof(vertices[0]), err);
-    buffer_append(out, polygons.data(), polygons.size() * sizeof(polygons[0]), err);
-    buffer_append(out, polygon_flags.data(), polygon_flags.size() * sizeof(polygon_flags[0]), err);
-    buffer_append(out, polygon_materials.data(), polygon_materials.size() * sizeof(polygon_materials[0]), err);
-    (void)components;
-    return !err->set;
-}
-
-bool append_editor_emod_copy(Buffer* out, const ChunkRef& chunk, const Document& doc,
-                             bool include_authored, Error* err) {
-    const uint8_t* environment_name = nullptr;
-    uint32_t environment_name_bytes = 0;
-    std::vector<PcEmodModuleView> modules;
-    if (!pc_emod_modules(chunk, &environment_name, &environment_name_bytes, &modules, err))
-        return false;
-
-    std::vector<std::vector<const Entity*>> authored(modules.size());
-    if (include_authored) {
-        for (const Entity& entity : doc.entities) {
-            if (entity.kind != EntityKind::InvisibleBarrier || entity.barrier_source_record)
-                continue;
-            if (!valid_oriented_box_dimensions(entity))
-                return fail(err, "invisible barrier '%s' has invalid bounds", entity.name.c_str());
-            uint32_t nearest = 0xffffffffu;
-            float nearest_distance = FLT_MAX;
-            for (uint32_t module_index = 0; module_index < modules.size(); ++module_index) {
-                PcCollisionView collision{};
-                Error ignored{};
-                if (!pc_collision_view(modules[module_index].collision,
-                                       modules[module_index].module.m_uCollisionDataSize,
-                                       &collision, &ignored, module_index))
-                    continue;
-                const Asura_Vector_3 delta = barrier_subtract(
-                    entity.position, modules[module_index].module.m_xTranslation);
-                const float distance = delta.x * delta.x + delta.y * delta.y + delta.z * delta.z;
-                if (distance < nearest_distance) {
-                    nearest = module_index;
-                    nearest_distance = distance;
-                }
-            }
-            if (nearest == 0xffffffffu)
-                return fail(err, "the source EMOD has no version-3 collision module for a new invisible barrier");
-            authored[nearest].push_back(&entity);
-        }
-    }
-
-    struct ModuleEdit {
-        PcCollisionView collision{};
-        std::vector<PcBarrierComponent> components;
-        std::vector<bool> omitted;
-        std::vector<const Entity*> additions;
-        bool changed = false;
-    };
-    std::vector<ModuleEdit> edits(modules.size());
-    bool any_changed = false;
-    for (uint32_t module_index = 0; module_index < modules.size(); ++module_index) {
-        ModuleEdit& edit = edits[module_index];
-        if (!pc_collision_view(modules[module_index].collision,
-                               modules[module_index].module.m_uCollisionDataSize,
-                               &edit.collision, err, module_index)) {
-            if (err->set)
-                return false;
-            if (!authored[module_index].empty())
-                return fail(err, "cannot add an invisible barrier to non-version-3 collision module %u",
-                            module_index);
-            continue;
-        }
-        if (!pc_barrier_components(edit.collision, modules[module_index].module.m_xTranslation,
-                                   &edit.components, err, module_index))
-            return false;
-        edit.omitted.assign(edit.collision.polygon_count, false);
-        for (uint32_t component_index = 0; component_index < edit.components.size(); ++component_index) {
-            const PcBarrierComponent& component = edit.components[component_index];
-            const Entity* entity = find_source_barrier(doc, chunk.index, module_index, component_index);
-            const bool remove = !entity && doc.source_barrier_inventory_complete;
-            const bool replace = entity && !equal_barrier_geometry(*entity, component, chunk.index,
-                                                                    module_index, component_index);
-            if (!remove && !replace)
-                continue;
-            for (uint32_t polygon : component.polygons)
-                edit.omitted[polygon] = true;
-            if (replace)
-                edit.additions.push_back(entity);
-            edit.changed = true;
-        }
-        edit.additions.insert(edit.additions.end(), authored[module_index].begin(), authored[module_index].end());
-        edit.changed |= !authored[module_index].empty();
-        if (edit.changed && edit.collision.required != edit.collision.size)
-            return fail(err, "collision module %u has unsupported trailing data", module_index);
-        any_changed |= edit.changed;
-    }
-    if (!any_changed)
-        return append_chunk_copy(out, chunk, err);
-
-    ChunkMark output_chunk = begin_chunk(out, ASURA_CHUNK_ENVIRONMENT_MODULELIST,
-                                         chunk.version, chunk.flags, err);
-    append_u32(out, static_cast<uint32_t>(modules.size()), err);
-    buffer_append(out, environment_name, environment_name_bytes, err);
-    for (uint32_t module_index = 0; module_index < modules.size(); ++module_index) {
-        const PcEmodModuleView& source = modules[module_index];
-        const ModuleEdit& edit = edits[module_index];
-        buffer_append(out, source.name, source.name_bytes, err);
-        Asura_Chunk_Environment_ModuleList_EntryV6 module = source.module;
-        const uint64_t module_at = out->size;
-        buffer_append(out, &module, sizeof(module), err);
-        const uint64_t collision_at = out->size;
-        if (edit.changed) {
-            if (!append_edited_collision_v3(out, edit.collision, module.m_xTranslation,
-                                            edit.components, edit.additions, edit.omitted, err))
-                return false;
-        } else {
-            buffer_append(out, source.collision, module.m_uCollisionDataSize, err);
-        }
-        if (out->size - collision_at > UINT32_MAX)
-            return fail(err, "edited EMOD collision module %u exceeds 4 GiB", module_index);
-        patch_u32(out, module_at + offsetof(Asura_Chunk_Environment_ModuleList_EntryV6,
-                                           m_uCollisionDataSize),
-                  static_cast<uint32_t>(out->size - collision_at), err);
-    }
-    return end_chunk(out, output_chunk, err);
-}
-
-bool append_editor_generated_emod(Buffer* out, const Document& doc, const EnvView& view,
-                                  uint32_t module_count, const Config& cfg,
-                                  const MaterialMap& materials, Arena* scratch,
-                                  ModuleMetric* metrics, Error* err) {
-    Buffer generated{};
-    if (!buffer_init(&generated, cfg.output_reserve, err))
-        return false;
-    const bool built = append_emod(&generated, view, module_count, cfg, materials,
-                                    scratch, metrics, err);
-    bool ok = built;
-    if (ok) {
-        ChunkRef chunk{generated.base, static_cast<uint32_t>(generated.size),
-                       ASURA_CHUNK_ENVIRONMENT_MODULELIST, 6, 0, 0};
-        ok = append_editor_emod_copy(out, chunk, doc, true, err);
-    }
-    buffer_release(&generated);
-    return ok;
-}
-
 bool replaced_pc_sound_resource(const Document& doc, const RscfInfo& resource) {
     if (resource.type != ASURA_RESOURCEFILE_TYPE_SOUND)
         return false;
@@ -3137,7 +2560,6 @@ bool pack_pc_document(const Document& doc, const char* output_path, std::string*
 
     bool source_has_lights = false, source_has_phonons = false, source_has_editable_entities = false;
     bool source_has_ambience = false;
-    uint32_t first_emod_chunk = 0xffffffffu;
     if (ok) {
         for (uint32_t i = 0; i < source.count; ++i) {
             source_has_lights |= source.chunks[i].cid == ASURA_CHUNK_LIGHTS;
@@ -3145,10 +2567,6 @@ bool pack_pc_document(const Document& doc, const char* output_path, std::string*
             source_has_editable_entities |= editable_pc_entity_chunk(source.chunks[i]);
             source_has_ambience |=
                 source.chunks[i].cid == ASURA_CHUNK_STREAMINGBACKGROUNDSOUND;
-            if (first_emod_chunk == 0xffffffffu &&
-                source.chunks[i].cid == ASURA_CHUNK_ENVIRONMENT_MODULELIST &&
-                source.chunks[i].version == 6)
-                first_emod_chunk = i;
         }
     }
     bool wrote_lights = false, wrote_phonons = false, wrote_entities = false, wrote_sound_resources = false;
@@ -3245,10 +2663,6 @@ bool pack_pc_document(const Document& doc, const char* output_path, std::string*
             write_phonons();
             continue;
         }
-        if (chunk.cid == ASURA_CHUNK_ENVIRONMENT_MODULELIST && chunk.version == 6) {
-            ok = append_editor_emod_copy(&output, chunk, doc, i == first_emod_chunk, &err);
-            continue;
-        }
         if (chunk.cid == ASURA_CHUNK_ENTITY) {
             write_object_support();
             if (!source_has_lights)
@@ -3266,12 +2680,6 @@ bool pack_pc_document(const Document& doc, const char* output_path, std::string*
         ok = ok && append_chunk_copy(&output, chunk, &err);
     }
     if (ok) {
-        for (const Entity& entity : doc.entities) {
-            if (entity.kind == EntityKind::InvisibleBarrier && first_emod_chunk == 0xffffffffu) {
-                ok = fail(&err, "the source .PC has no EMOD collision data for invisible barriers");
-                break;
-            }
-        }
         write_lights();
         write_phonons();
         write_entities();
@@ -3377,8 +2785,8 @@ bool pack_document(Document& doc, const char* output_path, std::string* why) {
              (doc.ambient_stream_path.empty() || append_editor_ambience(&output, doc, &err)) &&
              append_editor_lights(&output, doc, &err) &&
              append_phon(&output, sounds, &err) &&
-             append_editor_generated_emod(&output, doc, view, view.module_count, cfg, material_map,
-                                           &scratch, metrics, &err) &&
+             append_emod(&output, view, view.module_count, cfg, material_map,
+                         &scratch, metrics, &err) &&
              append_mlin(&output, metrics, view.module_count, &err) &&
              append_mrvb(&output, view.module_count, &err) && append_nav1(&output, view.module_count, &err) &&
               append_sound_entities(&output, sounds, &err) && append_editor_spawnpoints(&output, doc, &err) &&
@@ -3425,7 +2833,6 @@ enum ControlId : int {
     ID_ADD_PICKUP,
     ID_ADD_STATIC_OBJECT,
     ID_ADD_BUILDING_VOLUME,
-    ID_ADD_INVISIBLE_BARRIER,
     ID_DELETE_ENTITY,
     ID_UNDO,
     ID_REDO,
@@ -6389,11 +5796,9 @@ void gpu_render() {
             color = {.75f, .35f, 1, 1};
         else if (entity.kind == EntityKind::BuildingVolume)
             color = {.15f, .88f, 1, 1};
-        else if (entity.kind == EntityKind::InvisibleBarrier)
-            color = {1.0f, .34f, .08f, 1.0f};
         if (selected)
             color = {1, 1, 1, 1};
-        if (entity.kind == EntityKind::BuildingVolume || entity.kind == EntityKind::InvisibleBarrier) {
+        if (entity.kind == EntityKind::BuildingVolume) {
             entity_gizmo.clear();
             append_oriented_bounds_gizmo(entity, &entity_gizmo);
             for (const LightGizmoLine& line : entity_gizmo) {
@@ -7490,7 +6895,6 @@ const char* entity_type_label(EntityKind kind) {
     case EntityKind::PositionMarker: return "Marker";
     case EntityKind::StaticObject: return "Object";
     case EntityKind::BuildingVolume: return "Building volume";
-    case EntityKind::InvisibleBarrier: return "Invisible barrier";
     }
     return "Entity";
 }
@@ -7660,8 +7064,7 @@ void refresh_inspector() {
     const bool pickup = enabled && g.document.entities[g.selected].kind == EntityKind::Pickup;
     const bool static_object = enabled && g.document.entities[g.selected].kind == EntityKind::StaticObject;
     const bool oriented_bounds = enabled &&
-                                 (g.document.entities[g.selected].kind == EntityKind::BuildingVolume ||
-                                  g.document.entities[g.selected].kind == EntityKind::InvisibleBarrier);
+                                 g.document.entities[g.selected].kind == EntityKind::BuildingVolume;
     bool selection_deletable = enabled;
     for (int index : g.selected_entities) {
         const Entity& entity = g.document.entities[index];
@@ -7814,7 +7217,7 @@ void refresh_inspector() {
         set_control_text(g.value_label[1], "Bounds depth");
         set_float(g.value[0], e.value_a);
         set_float(g.value[1], e.value_b);
-    } else if (e.kind == EntityKind::BuildingVolume || e.kind == EntityKind::InvisibleBarrier) {
+    } else if (e.kind == EntityKind::BuildingVolume) {
         const Asura_Vector_3 size = oriented_box_dimensions(e);
         set_control_text(g.value_label[0], "Bounds width");
         set_control_text(g.value_label[1], "Bounds height");
@@ -7880,8 +7283,7 @@ void focus_camera_on_entity(int index) {
         if (isfinite(model_radius) && model_radius > .01f)
             radius = model_radius;
     } else if (entity.kind == EntityKind::PositionMarker ||
-               entity.kind == EntityKind::BuildingVolume ||
-               entity.kind == EntityKind::InvisibleBarrier) {
+               entity.kind == EntityKind::BuildingVolume) {
         const float width = entity.source_bounds.MaxX - entity.source_bounds.MinX;
         const float height = entity.source_bounds.MaxY - entity.source_bounds.MinY;
         const float depth = entity.source_bounds.MaxZ - entity.source_bounds.MinZ;
@@ -8035,7 +7437,7 @@ void apply_inspector() {
                         e.name = object->resource_name + suffix;
                 }
             }
-        } else if (e.kind == EntityKind::BuildingVolume || e.kind == EntityKind::InvisibleBarrier) {
+        } else if (e.kind == EntityKind::BuildingVolume) {
             Asura_Vector_3 size = oriented_box_dimensions(e);
             if (changed(kInspectorDirtyValueA))
                 size.x = get_float(g.value[0], size.x);
@@ -8142,8 +7544,6 @@ void add_entity_at(EntityKind kind, const Asura_Vector_3& p) {
     } else if (kind == EntityKind::BuildingVolume) {
         e.source_entity_record = false;
         e.source_entity_classification = SnipeEntityClass_BuildingVolume;
-    } else if (kind == EntityKind::InvisibleBarrier) {
-        e.barrier_source_record = false;
     }
     if (!g.history.begin(g.document, g.selected))
         return;
@@ -8189,16 +7589,6 @@ void add_entity_at(EntityKind kind, const Asura_Vector_3& p) {
                            p.z - size.z * .5f, p.z + size.z * .5f};
         e.value_a = size.x;
         e.value_b = size.z;
-    } else if (kind == EntityKind::InvisibleBarrier) {
-        snprintf(name, sizeof(name), "Invisible barrier %zu", g.document.entities.size() + 1);
-        constexpr Asura_Vector_3 size{10.0f, 5.0f, .15f};
-        e.source_bounds = {p.x - size.x * .5f, p.x + size.x * .5f,
-                           p.y - size.y * .5f, p.y + size.y * .5f,
-                           p.z - size.z * .5f, p.z + size.z * .5f};
-        e.value_a = size.x;
-        e.value_b = size.z;
-        e.barrier_collision_flags = kPcInvisibleBarrierCollisionMask;
-        e.barrier_collision_material = 0x0015u;
     }
     e.name = name;
     stop_sound_preview();
@@ -8310,17 +7700,14 @@ int hit_entity(int x, int y) {
             }
             continue;
         }
-        if (entity.kind != EntityKind::BuildingVolume && entity.kind != EntityKind::InvisibleBarrier &&
-            !entity_is_selected(i) &&
+        if (entity.kind != EntityKind::BuildingVolume && !entity_is_selected(i) &&
             environment_occludes_view_position(entity_view_position(entity.position)))
             continue;
-        if (entity.kind == EntityKind::BuildingVolume || entity.kind == EntityKind::InvisibleBarrier) {
+        if (entity.kind == EntityKind::BuildingVolume) {
             std::vector<LightGizmoLine> lines;
             lines.reserve(kLightBoundingBoxLines);
             append_oriented_bounds_gizmo(entity, &lines);
-            const int edge_radius = entity.kind == EntityKind::InvisibleBarrier
-                                        ? (entity_is_selected(i) ? 9 : 6)
-                                        : 10;
+            const int edge_radius = 10;
             const int edge_distance_limit = edge_radius * edge_radius;
             for (const LightGizmoLine& line : lines) {
                 POINT a{}, b{};
@@ -8375,7 +7762,6 @@ COLORREF entity_color(EntityKind kind) {
     case EntityKind::AssassinationTarget: return RGB(255, 38, 64);
     case EntityKind::PositionMarker: return RGB(190, 88, 255);
     case EntityKind::BuildingVolume: return RGB(38, 224, 255);
-    case EntityKind::InvisibleBarrier: return RGB(255, 86, 20);
     default: return RGB(255, 120, 80);
     }
 }
@@ -8624,7 +8010,7 @@ void draw_entities(HDC dc) {
     for (int i = 0; i < static_cast<int>(g.document.entities.size()); ++i) {
         const Entity& e = g.document.entities[i];
         const bool selected = entity_is_selected(i);
-        if (e.kind != EntityKind::BuildingVolume && e.kind != EntityKind::InvisibleBarrier && !selected &&
+        if (e.kind != EntityKind::BuildingVolume && !selected &&
             environment_occludes_view_position(entity_view_position(e.position)))
             continue;
         POINT p{};
@@ -8635,7 +8021,7 @@ void draw_entities(HDC dc) {
             draw_light_gizmo(dc, e, true);
         else if (e.kind == EntityKind::Sound && selected)
             draw_sound_gizmo(dc, e);
-        if (e.kind == EntityKind::BuildingVolume || e.kind == EntityKind::InvisibleBarrier) {
+        if (e.kind == EntityKind::BuildingVolume) {
             std::vector<LightGizmoLine> lines;
             lines.reserve(kLightBoundingBoxLines);
             append_oriented_bounds_gizmo(e, &lines);
@@ -8740,8 +8126,8 @@ void layout_controls() {
     for (auto c : top)
         MoveWindow(GetDlgItem(g.window, c.id), c.x, top_y, c.w, 28, TRUE);
     MoveWindow(g.ambience_properties, right, top_y, 252, 28, TRUE);
-    MoveWindow(g.list, 8, 48, 220, std::max(80, static_cast<int>(r.bottom) - 332), TRUE);
-    int y = std::max(140, static_cast<int>(r.bottom) - 276);
+    MoveWindow(g.list, 8, 48, 220, std::max(80, static_cast<int>(r.bottom) - 301), TRUE);
+    int y = std::max(140, static_cast<int>(r.bottom) - 245);
     const int bw = 106;
     MoveWindow(GetDlgItem(g.window, ID_ADD_SPAWN), 8, y, bw, 27, TRUE);
     MoveWindow(GetDlgItem(g.window, ID_ADD_LIGHT), 120, y, bw, 27, TRUE);
@@ -8751,8 +8137,6 @@ void layout_controls() {
     y += 31;
     MoveWindow(GetDlgItem(g.window, ID_ADD_SOUND), 8, y, bw, 27, TRUE);
     MoveWindow(GetDlgItem(g.window, ID_ADD_BUILDING_VOLUME), 120, y, bw, 27, TRUE);
-    y += 31;
-    MoveWindow(GetDlgItem(g.window, ID_ADD_INVISIBLE_BARRIER), 8, y, 218, 27, TRUE);
     y += 31;
     MoveWindow(GetDlgItem(g.window, ID_DELETE_ENTITY), 8, y, 218, 27, TRUE);
     y += 38;
@@ -8833,8 +8217,7 @@ void create_controls() {
     make_control("BUTTON", "+ Pickup", BS_PUSHBUTTON, ID_ADD_PICKUP);
     make_control("BUTTON", "+ Object", BS_PUSHBUTTON, ID_ADD_STATIC_OBJECT);
     make_control("BUTTON", "+ Sound", BS_PUSHBUTTON, ID_ADD_SOUND);
-    make_control("BUTTON", "+ Indoor volume", BS_PUSHBUTTON, ID_ADD_BUILDING_VOLUME);
-    make_control("BUTTON", "+ Invisible barrier", BS_PUSHBUTTON, ID_ADD_INVISIBLE_BARRIER);
+    make_control("BUTTON", "+ Indoor zone", BS_PUSHBUTTON, ID_ADD_BUILDING_VOLUME);
     make_control("BUTTON", "Delete selected", BS_PUSHBUTTON, ID_DELETE_ENTITY);
     make_control("STATIC",
                  "Right-drag: orbit; middle-drag: pan; wheel: zoom\r\n"
@@ -10478,8 +9861,6 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             begin_place(EntityKind::StaticObject);
         else if (id == ID_ADD_BUILDING_VOLUME)
             begin_place(EntityKind::BuildingVolume);
-        else if (id == ID_ADD_INVISIBLE_BARRIER)
-            begin_place(EntityKind::InvisibleBarrier);
         else if (id == ID_UNDO)
             command_undo();
         else if (id == ID_REDO)
@@ -11302,113 +10683,6 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
                    ? 0
                    : 39;
     }
-    if (__argc == 3 && strcmp(__argv[1], "--pc-invisible-barrier-count-smoke") == 0) {
-        Document document;
-        Mesh mesh;
-        std::string why;
-        if (!load_pc_level(__argv[2], &document, &mesh, &why))
-            return 94;
-        for (const Entity& entity : document.entities)
-            if (entity.kind == EntityKind::InvisibleBarrier)
-                return 0;
-        return 95;
-    }
-    if (__argc == 3 && strcmp(__argv[1], "--pc-invisible-barrier-smoke") == 0) {
-        Document document;
-        Mesh mesh;
-        std::string why;
-        if (!load_pc_level(__argv[2], &document, &mesh, &why))
-            return 79;
-        size_t barrier_count = 0;
-        bool found_mp04_example = false;
-        for (const Entity& entity : document.entities) {
-            if (entity.kind != EntityKind::InvisibleBarrier)
-                continue;
-            ++barrier_count;
-            if (!entity.barrier_source_record)
-                return 80;
-            const Asura_Bounding_Box& bounds = entity.source_bounds;
-            const float values[] = {bounds.MinX, bounds.MaxX, bounds.MinY,
-                                    bounds.MaxY, bounds.MinZ, bounds.MaxZ};
-            for (float value : values)
-                if (!isfinite(value))
-                    return 81;
-            if (bounds.MinX > bounds.MaxX || bounds.MinY > bounds.MaxY ||
-                bounds.MinZ > bounds.MaxZ)
-                return 82;
-            std::vector<LightGizmoLine> lines;
-            append_oriented_bounds_gizmo(entity, &lines);
-            if (lines.size() != kLightBoundingBoxLines)
-                return 83;
-            found_mp04_example |= bounds.MinX <= -78.0f && bounds.MaxX >= -78.0f &&
-                                  bounds.MinY <= 0.0f && bounds.MaxY >= 0.0f &&
-                                  bounds.MinZ <= 163.01f && bounds.MaxZ >= 162.99f;
-        }
-        return barrier_count && document.source_barrier_inventory_complete && found_mp04_example ? 0 : 84;
-    }
-    if (__argc == 4 && strcmp(__argv[1], "--pc-invisible-barrier-edit-smoke") == 0) {
-        Document document, restored;
-        Mesh mesh, restored_mesh;
-        std::string why;
-        if (!load_pc_level(__argv[2], &document, &mesh, &why))
-            return 90;
-        Entity* example = nullptr;
-        int delete_index = -1;
-        for (int index = 0; index < static_cast<int>(document.entities.size()); ++index) {
-            Entity& entity = document.entities[index];
-            if (entity.kind != EntityKind::InvisibleBarrier)
-                continue;
-            if (!example && entity.position.x > -86.1f && entity.position.x < -71.8f &&
-                entity.position.z > 162.9f && entity.position.z < 163.1f)
-                example = &entity;
-            else if (delete_index < 0)
-                delete_index = index;
-        }
-        if (!example || delete_index < 0)
-            return 91;
-        const Asura_Vector_3 original_position = example->position;
-        const Asura_Vector_3 original_size = oriented_box_dimensions(*example);
-        example->position.x += 2.0f;
-        example->rotation.y += 5.0f;
-        const Asura_Vector_3 edited_size{original_size.x + 1.5f, original_size.y + .75f,
-                                         original_size.z};
-        example->source_bounds = {example->position.x - edited_size.x * .5f,
-                                  example->position.x + edited_size.x * .5f,
-                                  example->position.y - edited_size.y * .5f,
-                                  example->position.y + edited_size.y * .5f,
-                                  example->position.z - edited_size.z * .5f,
-                                  example->position.z + edited_size.z * .5f};
-        const Asura_Vector_3 edited_position = example->position;
-        document.entities.erase(document.entities.begin() + delete_index);
-        Entity created;
-        created.kind = EntityKind::InvisibleBarrier;
-        created.name = "Created invisible barrier";
-        created.guid = allocate_editor_guid(&document);
-        created.position = {-40.0f, -1.0f, 140.0f};
-        created.rotation = {0.0f, 20.0f, 0.0f};
-        created.source_bounds = {-44.0f, -36.0f, -4.0f, 2.0f, 139.9f, 140.1f};
-        created.barrier_collision_flags = kPcInvisibleBarrierCollisionMask;
-        created.barrier_collision_material = 0x0015u;
-        document.entities.push_back(created);
-        if (!pack_document(document, __argv[3], &why) ||
-            !load_pc_level(__argv[3], &restored, &restored_mesh, &why))
-            return 92;
-        bool found_edited = false, found_created = false, found_old = false;
-        for (const Entity& entity : restored.entities) {
-            if (entity.kind != EntityKind::InvisibleBarrier)
-                continue;
-            const float edited_distance = fabsf(entity.position.x - edited_position.x) +
-                                          fabsf(entity.position.z - edited_position.z);
-            const float created_distance = fabsf(entity.position.x - created.position.x) +
-                                           fabsf(entity.position.z - created.position.z);
-            const float old_distance = fabsf(entity.position.x - original_position.x) +
-                                       fabsf(entity.position.z - original_position.z);
-            found_edited |= edited_distance < 1.0f;
-            found_created |= created_distance < 1.0f;
-            found_old |= old_distance < .25f;
-        }
-        return found_edited && found_created && !found_old ? 0 : 93;
-    }
     if (__argc == 4 && strcmp(__argv[1], "--pc-building-volume-smoke") == 0) {
         Document document, restored;
         Mesh mesh, restored_mesh;
@@ -11617,15 +10891,6 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
         light.value_b = 100;
         light.light = legacy_editor_light(light);
         doc.entities.push_back(light);
-        Entity barrier;
-        barrier.kind = EntityKind::InvisibleBarrier;
-        barrier.name = "Smoke invisible barrier";
-        barrier.guid = allocate_editor_guid(&doc);
-        barrier.position = {0, 1.5f, 1.0f};
-        barrier.source_bounds = {-2.0f, 2.0f, -1.5f, 4.5f, .9f, 1.1f};
-        barrier.barrier_collision_flags = kPcInvisibleBarrierCollisionMask;
-        barrier.barrier_collision_material = 0x0015u;
-        doc.entities.push_back(barrier);
         std::string why;
         return pack_document(doc, __argv[3], &why) ? 0 : 2;
     }
@@ -11795,32 +11060,9 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
                                           hit_entity(visible_point.x, visible_point.y) == 0 &&
                                           hit_entity(empty_bounds_point.x, empty_bounds_point.y) == -1;
         g.static_object_models.clear();
-        Entity selection_barrier;
-        selection_barrier.kind = EntityKind::InvisibleBarrier;
-        selection_barrier.source_bounds = {-5.0f, 5.0f, -5.0f, 5.0f, -.1f, .1f};
-        g.document.entities = {selection_barrier};
-        set_single_selection_state(-1);
-        g.camera.target = {};
-        POINT barrier_center{}, barrier_edge{};
-        const bool projected_barrier_points =
-            project_point(entity_view_position(selection_barrier.position), &barrier_center) &&
-            project_point(entity_view_position({0.0f, -5.0f, .1f}), &barrier_edge);
-        const bool center_not_pickable = projected_barrier_points &&
-                                         hit_entity(barrier_center.x, barrier_center.y) == -1;
-        const bool visible_edge_pickable = projected_barrier_points &&
-                                           hit_entity(barrier_edge.x, barrier_edge.y) == 0;
-        g.mesh.positions = {{-20.0f, -20.0f, 10.0f}, {20.0f, -20.0f, 10.0f},
-                            {20.0f, 20.0f, 10.0f}, {-20.0f, 20.0f, 10.0f}};
-        g.mesh.faces = {{0, 1, 2}, {0, 2, 3}};
-        g.environment_raycast.build(g.mesh);
-        const bool hidden_edge_not_pickable = projected_barrier_points &&
-                                              hit_entity(barrier_edge.x, barrier_edge.y) == -1;
-        const bool barrier_pick_matches = center_not_pickable && visible_edge_pickable &&
-                                          hidden_edge_not_pickable;
         DestroyWindow(window);
         return same_type_selected && mixed_type_rejected && batch_applied && group_pasted &&
-                       paste_undo_restored && undo_restored && geometry_hit_matches &&
-                       barrier_pick_matches
+                       paste_undo_restored && undo_restored && geometry_hit_matches
                    ? 0
                    : 41;
     }

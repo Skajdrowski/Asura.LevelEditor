@@ -76,13 +76,7 @@ bool equal(const Entity& a, const Entity& b) {
            a.pickup_skin_id == b.pickup_skin_id && a.pickup_anim_id == b.pickup_anim_id &&
            a.pickup_anim_file_id == b.pickup_anim_file_id && a.pickup_body == b.pickup_body &&
            a.static_object_has_template == b.static_object_has_template &&
-           a.static_object_body == b.static_object_body &&
-           a.barrier_source_record == b.barrier_source_record &&
-           a.barrier_source_chunk == b.barrier_source_chunk &&
-           a.barrier_source_module == b.barrier_source_module &&
-           a.barrier_source_component == b.barrier_source_component &&
-           a.barrier_collision_flags == b.barrier_collision_flags &&
-           a.barrier_collision_material == b.barrier_collision_material;
+           a.static_object_body == b.static_object_body;
 }
 
 bool equal(const PickupTemplate& a, const PickupTemplate& b) {
@@ -139,15 +133,13 @@ bool equal_document_content(const Document& a, const Document& b) {
            equal(a.ambient_volume, b.ambient_volume) &&
            a.ambient_source_record == b.ambient_source_record &&
            a.source_pickup_inventory_complete == b.source_pickup_inventory_complete &&
-           a.source_static_object_inventory_complete == b.source_static_object_inventory_complete &&
-           a.source_barrier_inventory_complete == b.source_barrier_inventory_complete;
+           a.source_static_object_inventory_complete == b.source_static_object_inventory_complete;
 }
 
 bool authorable(EntityKind kind) {
     return kind == EntityKind::SpawnPoint || kind == EntityKind::Light ||
            kind == EntityKind::Sound || kind == EntityKind::Pickup ||
-           kind == EntityKind::StaticObject || kind == EntityKind::BuildingVolume ||
-           kind == EntityKind::InvisibleBarrier;
+           kind == EntityKind::StaticObject || kind == EntityKind::BuildingVolume;
 }
 
 void set_error(std::string* error, const char* message) {
@@ -228,16 +220,6 @@ void canonicalize_clone(Entity* entity) {
         break;
     case EntityKind::BuildingVolume:
         entity->source_entity_classification = SnipeEntityClass_BuildingVolume;
-        entity->source_bounds = {
-            entity->position.x - bounds_size.x * .5f, entity->position.x + bounds_size.x * .5f,
-            entity->position.y - bounds_size.y * .5f, entity->position.y + bounds_size.y * .5f,
-            entity->position.z - bounds_size.z * .5f, entity->position.z + bounds_size.z * .5f};
-        break;
-    case EntityKind::InvisibleBarrier:
-        entity->barrier_source_record = false;
-        entity->barrier_source_chunk = 0xffffffffu;
-        entity->barrier_source_module = 0xffffffffu;
-        entity->barrier_source_component = 0xffffffffu;
         entity->source_bounds = {
             entity->position.x - bounds_size.x * .5f, entity->position.x + bounds_size.x * .5f,
             entity->position.y - bounds_size.y * .5f, entity->position.y + bounds_size.y * .5f,
