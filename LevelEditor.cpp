@@ -975,13 +975,13 @@ bool load_static_object_donors(const std::vector<std::string>& paths,
             break;
     }
     if (ok && next_templates.empty())
-        ok = fail(&err, "the selected Object donors contain no class-0x7 Object resources with shapes");
+        ok = fail(&err, "the selected Objects donors contain no class-0x7 Object resources with shapes");
     if (ok) {
         *templates = std::move(next_templates);
         if (models)
             *models = std::move(next_models);
     } else if (why) {
-        *why = err.set ? err.message : "Could not load Object definitions from the selected donors.";
+        *why = err.set ? err.message : "Could not load Objects definitions from the selected donors.";
     }
     arena_release(&arena);
     return ok;
@@ -3100,7 +3100,7 @@ bool append_static_object_support(Buffer* out, const Document& document,
     if (!err->set) {
         for (uint32_t id : required_roots) {
             if (!contains_u32(present_objects, id) || !contains_u32(present_shapes, id)) {
-                fail(err, "Object %08X is not available from the selected Object donors", id);
+                fail(err, "Object %08X is not available from the selected Objects donors", id);
                 break;
             }
         }
@@ -3314,7 +3314,7 @@ bool pack_document(Document& doc, const char* output_path, std::string* why) {
     }
     if (has_static_objects && doc.object_donors.empty()) {
         if (why)
-            *why = "Choose at least one Object donor .PC before exporting Objects from a custom level.";
+            *why = "Choose at least one Objects donor .PC before exporting Objects from a custom level.";
         return false;
     }
     Error err{};
@@ -6840,7 +6840,7 @@ bool gpu_verify_rain_streak_display() {
 void set_status(const char* text) { SetWindowTextA(g.status, text ? text : ""); }
 
 void update_title() {
-    std::string title = "Asura 2005 Level Editor";
+    std::string title = "Asura 2005 Level Editor (Unfinished)";
     const std::string& display_path = !g.document.project_path.empty() ? g.document.project_path
                                       : !g.document.source_pc_path.empty() ? g.document.source_pc_path
                                                                           : g.document.obj_path;
@@ -8133,7 +8133,7 @@ void add_entity_at(EntityKind kind, const Asura_Vector_3& p) {
         const StaticObjectTemplate* object = find_static_object_template(g.document, 0, false);
         if (!object) {
             g.pending_kind = -1;
-            set_status("No Object catalog is loaded. Choose one or more Object donor .PC levels first.");
+            set_status("No Object catalog is loaded. Choose one or more Objects donor .PC levels first.");
             return;
         }
         adopt_static_object_template(&e, *object);
@@ -8223,7 +8223,7 @@ void begin_place(EntityKind kind) {
         return;
     }
     if (kind == EntityKind::StaticObject && !find_static_object_template(g.document, 0, false)) {
-        MessageBoxA(g.window, "Choose one or more Object donor .PC levels first.",
+        MessageBoxA(g.window, "Choose one or more Objects donor .PC levels first.",
                     "Cannot create Object", MB_ICONINFORMATION);
         return;
     }
@@ -8822,7 +8822,7 @@ void create_controls() {
     make_control("BUTTON", "Export material map", BS_PUSHBUTTON, ID_EXPORT_MATERIAL_MAP);
     make_control("BUTTON", "Texture folder", BS_PUSHBUTTON, ID_TEXTURE_DIR);
     make_control("BUTTON", "Weapons donor", BS_PUSHBUTTON, ID_WEAPONS_DONOR);
-    make_control("BUTTON", "Object donor", BS_PUSHBUTTON, ID_OBJECT_DONOR);
+    make_control("BUTTON", "Objects donor", BS_PUSHBUTTON, ID_OBJECT_DONOR);
     make_control("BUTTON", "Skybox properties", BS_PUSHBUTTON, ID_SKYBOX_TEXTURES);
     g.rain_toggle = make_control("BUTTON", "Rain", BS_AUTOCHECKBOX, ID_TOGGLE_RAIN);
     g.ambience_properties = make_control("BUTTON", "Ambience sound", BS_PUSHBUTTON, ID_AMBIENCE_PROPERTIES);
@@ -9996,7 +9996,7 @@ void merge_static_object_templates(Document* document,
 
 void command_object_donor() {
     std::vector<std::string> paths;
-    if (!choose_paths(g.window, "Choose one or more target-game Object donor .PC levels",
+    if (!choose_paths(g.window, "Choose one or more target-game Objects donor .PC levels",
                       "Asura PC files\0*.PC\0All files\0*.*\0", "PC",
                       g.document.object_donors, &paths))
         return;
@@ -10009,8 +10009,8 @@ void command_object_donor() {
     const bool ok = load_static_object_donors(paths, &templates, &models, &why);
     SetCursor(LoadCursor(nullptr, IDC_ARROW));
     if (!ok) {
-        set_status("The selected Object donors do not contain a usable Object catalog.");
-        MessageBoxA(g.window, why.c_str(), "Could not load Object donors", MB_ICONERROR);
+        set_status("The selected Objects donors do not contain a usable Object catalog.");
+        MessageBoxA(g.window, why.c_str(), "Could not load Objects donors", MB_ICONERROR);
         return;
     }
     for (const Entity& entity : g.document.entities) {
@@ -10035,8 +10035,8 @@ void command_object_donor() {
             snprintf(message, sizeof(message),
                      "The selected donors have no Object definition for existing file ID %08X.",
                      entity.value_u32_b);
-            set_status("Object donors are missing an Object used by this level.");
-            MessageBoxA(g.window, message, "Could not switch Object donors", MB_ICONERROR);
+            set_status("Objects donors are missing an Object used by this level.");
+            MessageBoxA(g.window, message, "Could not switch Objects donors", MB_ICONERROR);
             return;
         }
     }
@@ -10073,7 +10073,7 @@ void command_object_donor() {
     commit_history_transaction();
     char status[260]{};
     snprintf(status, sizeof(status),
-             "%zu Object donor levels loaded: %zu definitions, %zu rendered models.",
+             "%zu Objects donor levels loaded: %zu definitions, %zu rendered models.",
              paths.size(), templates.size(), g.static_object_models.size());
     set_status(status);
     refresh_list();
@@ -11679,7 +11679,7 @@ int APIENTRY WinMain(HINSTANCE instance, HINSTANCE, LPSTR command_line, int show
     if (!RegisterClassExA(&wc))
         return 1;
     HWND window = CreateWindowExA(0, wc.lpszClassName, "Asura 2005 Level Editor", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
-                                  CW_USEDEFAULT, CW_USEDEFAULT, 1380, 840, nullptr, nullptr, instance, nullptr);
+                                  CW_USEDEFAULT, CW_USEDEFAULT, 1400, 720, nullptr, nullptr, instance, nullptr);
     if (!window)
         return 1;
     if (pc_object_hierarchy_render_smoke) {
