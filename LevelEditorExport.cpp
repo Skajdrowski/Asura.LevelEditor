@@ -1074,6 +1074,8 @@ bool pack_pc_document(const Document& doc, const char* output_path, std::string*
             ok = append_editor_ambience(&output, doc, &err);
         ok = ok && buffer_append(&output, nullptr, sizeof(Asura_Chunk_Header), &err) != ~0ull;
     }
+    if (ok)
+        ok = patch_fnfo_file_size(&output, &err);
 
     // The source may also be the explicitly selected destination. Release its
     // read mapping before opening the output with CREATE_ALWAYS.
@@ -1178,6 +1180,7 @@ bool pack_document(Document& doc, const char* output_path, std::string* why) {
                append_editor_skybox(&output, doc.skybox, &err) &&
              append_fog(&output, &err) && append_editor_weather(&output, doc, &err) &&
              buffer_append(&output, nullptr, sizeof(Asura_Chunk_Header), &err) != ~0ull &&
+             patch_fnfo_file_size(&output, &err) &&
              write_entire_file(output_path, output.base, output.size, &err);
     }
     if (!ok && why)

@@ -104,6 +104,43 @@ bool append_rscf(Buffer* out, Str name, uint32_t type, uint32_t subtype, const v
     return end_chunk(out, mark, err);
 }
 
+bool patch_fnfo_file_size(Buffer* out, Error* err) {
+    if (!out || !out->base || out->size < sizeof(kAsuraMagic) ||
+        memcmp(out->base, kAsuraMagic, sizeof(kAsuraMagic)) != 0)
+        return fail(err, "generated output is not an Asura file");
+    if (out->size > 0xffffffffull)
+        return fail(err, "generated Asura file exceeds the 32-bit FNFO size field");
+
+    // MCP2 0x43F1D0 stores this value as the denominator used by the loading
+    // progress callback at 0x43F0B0. Original target-game levels store their
+    // complete file length here. Patch every copied FNFO as well as the one
+    // emitted by append_fnfo so edited and newly authored levels stay exact.
+    const uint32_t file_size = static_cast<uint32_t>(out->size);
+    uint64_t off = sizeof(kAsuraMagic);
+    bool patched = false;
+    while (off + sizeof(Asura_Chunk_Header) <= out->size) {
+        const uint8_t* chunk = out->base + off;
+        const uint32_t cid = read_u32(chunk);
+        const uint32_t size = read_u32(chunk + offsetof(Asura_Chunk_Header, Size));
+        if (!cid || !size)
+            break;
+        if (size < sizeof(Asura_Chunk_Header) || size > out->size - off)
+            return fail(err, "generated output has an invalid chunk at 0x%llx",
+                        static_cast<unsigned long long>(off));
+        if (cid == ASURA_CHUNK_FILEINFO) {
+            if (size < sizeof(Asura_Chunk_Header) + sizeof(uint32_t))
+                return fail(err, "generated output has a truncated FNFO chunk");
+            if (!patch_u32(out, off + sizeof(Asura_Chunk_Header), file_size, err))
+                return false;
+            patched = true;
+        }
+        off += size;
+    }
+    if (!patched)
+        return fail(err, "generated output contains no FNFO chunk");
+    return true;
+}
+
 bool initialize_editor_config(const char* obj_path, Config* cfg, Error* err) {
     memset(cfg, 0, sizeof(*cfg));
     cfg->obj = obj_path;

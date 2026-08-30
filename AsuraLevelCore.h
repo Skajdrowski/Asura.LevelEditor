@@ -171,6 +171,7 @@ bool end_chunk(Buffer* out, ChunkMark mark, Error* err);
 bool append_chunk_copy(Buffer* out, const ChunkRef& chunk, Error* err);
 bool append_rscf(Buffer* out, Str name, uint32_t type, uint32_t subtype, const void* payload,
                  uint32_t payload_size, Error* err);
+bool patch_fnfo_file_size(Buffer* out, Error* err);
 
 bool initialize_editor_config(const char* obj_path, Config* out, Error* err);
 Asura_Vector_3 transform_vec(Asura_Vector_3 value, const Config& config);
