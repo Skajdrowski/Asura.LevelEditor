@@ -2017,10 +2017,9 @@ bool append_sky_resources(Buffer* out, const Config& cfg, Arena* scratch, Error*
         return false;
     struct SkyFaceFile {
         const char* stem;
-        const char* target_name;
     };
-    const SkyFaceFile faces[] = {{"fr", "fr.tga"}, {"lf", "lf.tga"}, {"bk", "bk.tga"},
-                                 {"rt", "rt.tga"}, {"up", "up.tga"}, {"ch_04_sky", "ch_04_sky.bmp"}};
+    const SkyFaceFile faces[] = {{"fr"}, {"lf"}, {"bk"},
+                                 {"rt"}, {"up"}, {"ch_04_sky"}};
     for (const SkyFaceFile& face : faces) {
         const DiskFile* source = nullptr;
         for (uint32_t i = 0; i < disk_files.count; ++i)
@@ -2031,7 +2030,7 @@ bool append_sky_resources(Buffer* out, const Config& cfg, Arena* scratch, Error*
         if (!source)
             continue;
         char name[256];
-        snprintf(name, sizeof(name), "\\graphics\\sky\\%s", face.target_name);
+        snprintf(name, sizeof(name), "\\graphics\\sky\\%s", face.stem);
         const bool flip = cfg.sky_flip_faces.size && csv_has_str(cfg.sky_flip_faces, str_from_c(face.stem));
         if (!append_file_rscf(out, str_from_c(name), ASURA_RESOURCEFILE_TYPE_TEXTURE, 0, source->path, scratch, flip,
                               err))
