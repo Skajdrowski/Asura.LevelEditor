@@ -3,15 +3,6 @@
 using namespace editor;
 
 int APIENTRY WinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE, _In_ LPSTR command_line, _In_ int show) {
-    if (__argc == 4 && strcmp(__argv[1], "--pack") == 0) {
-        Document document;
-        std::string why;
-        return load_project(&document, __argv[2], &why) &&
-                       pack_document(document, __argv[3], &why)
-                   ? 0
-                   : 2;
-    }
-
     load_spawn_puppets();
 
     WNDCLASSEXA viewport_class{};

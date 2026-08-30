@@ -100,7 +100,7 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="Construct.cpp" />
+    <ClCompile Include="AsuraLevelCore.cpp" />
     <ClCompile Include="LevelEditor.cpp" />
     <ClCompile Include="LevelEditorExport.cpp" />
     <ClCompile Include="LevelEditorGeometry.cpp" />

@@ -4,11 +4,13 @@ using namespace asura;
 
 namespace asura::level {
 
+// Shared binary/geometry implementation used directly by the level editor.
+
 // sub_4836C0 shares one 0x4000-byte buffer between AABB
 // traversal frames (28 bytes each) and returned object IDs (4 bytes each).
 // Keep a complete module query comfortably below that workspace limit.
 constexpr uint32_t kDefaultMaxCollisionPolys = 3000;
-constexpr uint16_t kCollisionPolyFlagBulletIgnore = 0x240;
+constexpr uint16_t kCollisionPolyFlagBulletIgnore = 0x240; // material map 'collision_flags'
 
 bool parse_chunks(const char* path, ChunkList* out, Arena* arena, Error* err) {
     memset(out, 0, sizeof(*out));
@@ -102,103 +104,10 @@ bool append_rscf(Buffer* out, Str name, uint32_t type, uint32_t subtype, const v
     return end_chunk(out, mark, err);
 }
 
-bool append_rscf_zero(Buffer* out, Str name, uint32_t type, uint32_t subtype, uint32_t payload_size, Error* err) {
-    ChunkMark mark = begin_chunk(out, ASURA_CHUNK_RESOURCEFILE, 0, 0, err);
-    append_u32(out, type, err);
-    append_u32(out, subtype, err);
-    append_u32(out, payload_size, err);
-    if (!append_padded_cstr(out, name, err))
-        return false;
-    if (buffer_append(out, nullptr, payload_size, err) == ~0ull)
-        return false;
-    return end_chunk(out, mark, err);
-}
-
-bool parse_option_u32(const char* text, uint32_t* out) {
-    uint64_t v = 0;
-    if (!parse_u64(str_from_c(text), &v) || v > 0xffffffffull)
-        return false;
-    *out = static_cast<uint32_t>(v);
-    return true;
-}
-
-bool parse_option_float(const char* text, float* out) {
-    double v = 0;
-    if (!parse_f64(str_from_c(text), &v) || !isfinite(v))
-        return false;
-    *out = static_cast<float>(v);
-    return true;
-}
-
-bool parse_vec3_arg(const char* text, Asura_Vector_3* out) {
-    const char* at = text;
-    float v[3]{};
-    for (uint32_t i = 0; i < 3; ++i) {
-        while (*at == ' ' || *at == '\t' || *at == ',' || *at == ';')
-            ++at;
-        const char* start = at;
-        while (*at && *at != ',' && *at != ';' && *at != ' ' && *at != '\t')
-            ++at;
-        double d = 0;
-        if (at == start || !parse_f64({start, static_cast<uint32_t>(at - start)}, &d))
-            return false;
-        v[i] = static_cast<float>(d);
-    }
-    while (*at == ' ' || *at == '\t' || *at == ',' || *at == ';')
-        ++at;
-    if (*at)
-        return false;
-    *out = {v[0], v[1], v[2]};
-    return true;
-}
-
-void print_usage() {
-    console_write("Asura 2005 .pc level constructor\n"
-                  "usage:\n"
-                  "  asura_pc_construct <map.obj> <out.pc> [options]\n\n"
-                  "Input:\n"
-                  "  Export one joined Blender mesh; object/group names are ignored.\n"
-                  "  The constructor splits the level into runtime modules automatically.\n\n"
-                  "Core options:\n"
-                  "  --env-name NAME\n"
-                  "  --axis-map xyz|xzy|yxz|yzx|zxy|zyx\n"
-                  "  --flip-x | --flip-y | --flip-z\n"
-                  "  --no-flip-x | --no-flip-y | --no-flip-z\n"
-                  "                                  default: flip Y/Z (target-game environment space)\n"
-                  "  --material-map FILE.json        direct or orig_to_handle mapping\n"
-                  "                                  optional collision_flags maps material IDs to u16 masks\n"
-                  "  --allow-unknown-materials\n"
-                  "  --force-material-index N\n"
-                  "  --diffuse-abgr 0xAARRGGBB\n"
-                  "  --auto-block-xz-cell F          default: 40\n"
-                  "  --max-prim-count N              default: 1000\n"
-                  "  --max-collision-polys N         default: 3000\n"
-                  "  --module-pad-min F --module-pad-scale F (default: exact bounds)\n\n"
-                  "Resource options:\n"
-                  "  --texture-dir DIR --texture-prefix PREFIX\n"
-                  "  --sky-texture-dir DIR --sky-flip-faces FACE,... (default: none)\n"
-                  "  --import-tex-from-pc FILE --import-mtrl-from-pc FILE (legacy no-op)\n"
-                  "  --rsfl-from-pc FILE --rsfl-names a,b\n"
-                  "  --smsg-from-pc FILE --lite-from-pc FILE --lite-json FILE\n"
-                  "  --enti-from-pc FILE [--enti-from-pc-keep-spawnpoints]\n"
-                  "  --enti-from-pc-types 0x8,0x804f\n"
-                  "  --rscf-from-pc FILE [--rscf-types 0,2,3] [--rscf-names a,b]\n"
-                  "  --rscf-name-regex TEXT          ASCII case-insensitive substring/glob\n"
-                  "  --rscf-skip N --rscf-limit N\n"
-                  "  --weapon-rscf-from-pc FILE\n"
-                  "  --spawnpoints-json FILE --sounds-json FILE\n"
-                  "  --ambient-stream-path NAME --ambient-volume F\n"
-                  "  --rscf-bootstrap-name NAME [--rscf-bootstrap-dummy N]\n"
-                  "  --rscf-bootstrap-payload-size N\n\n"
-                  "Memory controls:\n"
-                  "  --arena-mib N                    virtual reserve; default: x64 8192, Win32 256\n"
-                  "  --output-mib N                   virtual reserve; default: x64 4096, Win32 128\n");
-}
-
-bool parse_cli(int argc, char** argv, Config* cfg, Error* err) {
+bool initialize_editor_config(const char* obj_path, Config* cfg, Error* err) {
     memset(cfg, 0, sizeof(*cfg));
+    cfg->obj = obj_path;
     cfg->env_name = "Env";
-    cfg->axis_map = "xyz";
     // Target-game environment resources use the original Y/Z-flipped Blender
     // conversion. The level editor compensates Y only in its authoring view.
     cfg->flip_y = true;
@@ -207,195 +116,24 @@ bool parse_cli(int argc, char** argv, Config* cfg, Error* err) {
     cfg->max_prim_count = 1000;
     cfg->max_collision_polys = kDefaultMaxCollisionPolys;
     cfg->auto_block_xz_cell = 40.0f;
-    cfg->module_pad_min = 0.0f;
-    cfg->module_pad_scale = 0.0f;
     cfg->texture_prefix = "\\environments\\";
-    cfg->ambient_volume = 1.0f;
     cfg->arena_reserve = sizeof(void*) == 4 ? 256ull * MiB : 8ull * GiB;
     cfg->output_reserve = sizeof(void*) == 4 ? 128ull * MiB : 4ull * GiB;
 
-    if (argc < 3) {
-        print_usage();
-        return fail(err, "expected blender .OBJ path and .PC output path");
-    }
-    cfg->obj = argv[1];
-    cfg->out = argv[2];
-
-    for (int i = 3; i < argc; ++i) {
-        const char* a = argv[i];
-        auto value = [&](const char* name) -> const char* {
-            if (strcmp(a, name) != 0)
-                return nullptr;
-            if (i + 1 >= argc) {
-                fail(err, "%s needs a value", name);
-                return nullptr;
-            }
-            return argv[++i];
-        };
-        const char* v = nullptr;
-        if (strcmp(a, "--flip-x") == 0)
-            cfg->flip_x = true;
-        else if (strcmp(a, "--flip-y") == 0)
-            cfg->flip_y = true;
-        else if (strcmp(a, "--flip-z") == 0)
-            cfg->flip_z = true;
-        else if (strcmp(a, "--no-flip-x") == 0)
-            cfg->flip_x = false;
-        else if (strcmp(a, "--no-flip-y") == 0)
-            cfg->flip_y = false;
-        else if (strcmp(a, "--no-flip-z") == 0)
-            cfg->flip_z = false;
-        else if (strcmp(a, "--allow-unknown-materials") == 0)
-            cfg->allow_unknown_materials = true;
-        else if (strcmp(a, "--enti-from-pc-keep-spawnpoints") == 0)
-            cfg->enti_keep_spawnpoints = true;
-        else if ((v = value("--env-name")))
-            cfg->env_name = v;
-        else if ((v = value("--axis-map")))
-            cfg->axis_map = v;
-        else if ((v = value("--material-map")))
-            cfg->material_map = v;
-        else if ((v = value("--texture-dir")))
-            cfg->texture_dir = v;
-        else if ((v = value("--texture-prefix")))
-            cfg->texture_prefix = v;
-        else if ((v = value("--sky-texture-dir")))
-            cfg->sky_texture_dir = v;
-        else if ((v = value("--sky-flip-faces")))
-            cfg->sky_flip_faces = str_from_c(v);
-        else if ((v = value("--import-tex-from-pc")))
-            cfg->import_tex_from_pc = v;
-        else if ((v = value("--import-mtrl-from-pc")))
-            cfg->import_mtrl_from_pc = v;
-        else if ((v = value("--rsfl-from-pc")))
-            cfg->rsfl_from_pc = v;
-        else if ((v = value("--rsfl-names")))
-            cfg->rsfl_names = str_from_c(v);
-        else if ((v = value("--smsg-from-pc")))
-            cfg->smsg_from_pc = v;
-        else if ((v = value("--lite-from-pc")))
-            cfg->lite_from_pc = v;
-        else if ((v = value("--lite-json")))
-            cfg->lite_json = v;
-        else if ((v = value("--enti-from-pc")))
-            cfg->enti_from_pc = v;
-        else if ((v = value("--enti-from-pc-types")))
-            cfg->enti_types = str_from_c(v);
-        else if ((v = value("--rscf-from-pc")))
-            cfg->rscf_from_pc = v;
-        else if ((v = value("--rscf-types")))
-            cfg->rscf_types = str_from_c(v);
-        else if ((v = value("--rscf-name-regex")))
-            cfg->rscf_name_filter = str_from_c(v);
-        else if ((v = value("--rscf-names")))
-            cfg->rscf_names = str_from_c(v);
-        else if ((v = value("--rscf-bootstrap-name")))
-            cfg->rscf_bootstrap_name = v;
-        else if ((v = value("--weapon-rscf-from-pc")))
-            cfg->weapon_from_pc = v;
-        else if ((v = value("--spawnpoints-json")))
-            cfg->spawnpoints_json = v;
-        else if ((v = value("--sounds-json")))
-            cfg->sounds_json = v;
-        else if ((v = value("--ambient-stream-path")))
-            cfg->ambient_stream_path = v;
-        else if ((v = value("--shade-from")))
-            cfg->shade_from = v;
-        else if ((v = value("--shade-align-from-obj")))
-            cfg->shade_align_from_obj = v;
-        else if ((v = value("--diffuse-abgr"))) {
-            if (!parse_option_u32(v, &cfg->diffuse_abgr))
-                return fail(err, "bad --diffuse-abgr");
-        } else if ((v = value("--force-material-index"))) {
-            cfg->force_material = parse_option_u32(v, &cfg->force_material_index);
-            if (!cfg->force_material)
-                return fail(err, "bad --force-material-index");
-        } else if ((v = value("--max-prim-count"))) {
-            if (!parse_option_u32(v, &cfg->max_prim_count) || cfg->max_prim_count < 2)
-                return fail(err, "bad --max-prim-count (expected >= 2)");
-        } else if ((v = value("--max-collision-polys"))) {
-            if (!parse_option_u32(v, &cfg->max_collision_polys) || !cfg->max_collision_polys ||
-                cfg->max_collision_polys > kMaxAabbTreeObjects)
-                return fail(err, "bad --max-collision-polys (expected 1..65535)");
-        } else if ((v = value("--auto-block-xz-cell"))) {
-            if (!parse_option_float(v, &cfg->auto_block_xz_cell))
-                return fail(err, "bad --auto-block-xz-cell");
-        } else if ((v = value("--module-pad-min"))) {
-            if (!parse_option_float(v, &cfg->module_pad_min))
-                return fail(err, "bad --module-pad-min");
-        } else if ((v = value("--module-pad-scale"))) {
-            if (!parse_option_float(v, &cfg->module_pad_scale))
-                return fail(err, "bad --module-pad-scale");
-        } else if ((v = value("--rscf-skip"))) {
-            if (!parse_option_u32(v, &cfg->rscf_skip))
-                return fail(err, "bad --rscf-skip");
-        } else if ((v = value("--rscf-limit"))) {
-            cfg->rscf_limit_set = parse_option_u32(v, &cfg->rscf_limit);
-            if (!cfg->rscf_limit_set)
-                return fail(err, "bad --rscf-limit");
-        } else if ((v = value("--rscf-bootstrap-dummy"))) {
-            if (!parse_option_u32(v, &cfg->rscf_bootstrap_subtype))
-                return fail(err, "bad --rscf-bootstrap-dummy");
-        } else if ((v = value("--rscf-bootstrap-payload-size"))) {
-            if (!parse_option_u32(v, &cfg->rscf_bootstrap_payload_size))
-                return fail(err, "bad --rscf-bootstrap-payload-size");
-        } else if ((v = value("--ambient-volume"))) {
-            if (!parse_option_float(v, &cfg->ambient_volume))
-                return fail(err, "bad --ambient-volume");
-        } else if ((v = value("--shade-offset"))) {
-            if (!parse_vec3_arg(v, &cfg->shade_offset))
-                return fail(err, "bad --shade-offset");
-        } else if ((v = value("--arena-mib"))) {
-            uint32_t n = 0;
-            if (!parse_option_u32(v, &n) || n < 64)
-                return fail(err, "bad --arena-mib");
-            cfg->arena_reserve = static_cast<uint64_t>(n) * MiB;
-        } else if ((v = value("--output-mib"))) {
-            uint32_t n = 0;
-            if (!parse_option_u32(v, &n) || n < 64)
-                return fail(err, "bad --output-mib");
-            cfg->output_reserve = static_cast<uint64_t>(n) * MiB;
-        } else if (err->set)
-            return false;
-        else
-            return fail(err, "unknown option: %s", a);
-    }
-
-    if (strcmp(cfg->axis_map, "xyz") && strcmp(cfg->axis_map, "xzy") && strcmp(cfg->axis_map, "yxz") &&
-        strcmp(cfg->axis_map, "yzx") && strcmp(cfg->axis_map, "zxy") && strcmp(cfg->axis_map, "zyx"))
-        return fail(err, "invalid --axis-map");
-    if (!file_exists(cfg->obj))
-        return fail(err, "OBJ not found: %s", cfg->obj);
-    if (cfg->module_pad_min < 0.0f || cfg->module_pad_scale < 0.0f)
-        return fail(err, "module padding must be non-negative");
+    if (!obj_path || !file_exists(obj_path))
+        return fail(err, "OBJ not found: %s", obj_path ? obj_path : "");
     return true;
 }
-
 Asura_Vector_3 transform_vec(Asura_Vector_3 v, const Config& cfg) {
-    if (cfg.flip_x)
-        v.x = -v.x;
     if (cfg.flip_y)
         v.y = -v.y;
     if (cfg.flip_z)
         v.z = -v.z;
-    if (!strcmp(cfg.axis_map, "xyz"))
-        return v;
-    if (!strcmp(cfg.axis_map, "xzy"))
-        return {v.x, v.z, v.y};
-    if (!strcmp(cfg.axis_map, "yxz"))
-        return {v.y, v.x, v.z};
-    if (!strcmp(cfg.axis_map, "yzx"))
-        return {v.y, v.z, v.x};
-    if (!strcmp(cfg.axis_map, "zxy"))
-        return {v.z, v.x, v.y};
-    return {v.z, v.y, v.x};
+    return v;
 }
 
 bool transform_reverses_winding(const Config& cfg) {
-    bool reversed = cfg.flip_x ^ cfg.flip_y ^ cfg.flip_z;
-    const bool odd_permutation = !strcmp(cfg.axis_map, "xzy") || !strcmp(cfg.axis_map, "yxz") ||
-                                 !strcmp(cfg.axis_map, "zyx");
-    return reversed ^ odd_permutation;
+    return cfg.flip_y ^ cfg.flip_z;
 }
 
 uint8_t clamp_u8(double v) {
@@ -695,8 +433,8 @@ bool resolve_material(const MaterialMap& map, Str name, bool allow_unknown, uint
         *out = 0;
         return true;
     }
-    return fail(err, "unknown OBJ material '%.*s' (use --material-map or --allow-unknown-materials)", name.size,
-                name.data);
+    return fail(err, "unknown OBJ material '%.*s'; choose a material map or export without one",
+                name.size, name.data);
 }
 
 Str material_texture_name_exact(const MaterialMap& map, uint32_t material_index) {
@@ -778,11 +516,11 @@ bool work_less_group(const FaceWork& a, const FaceWork& b) {
 }
 
 inline bool vertex_key_eq(const VertexKey& a, const VertexKey& b) {
-    return a.v == b.v && a.vt == b.vt && a.vn == b.vn && a.shade_material == b.shade_material;
+    return a.v == b.v && a.vt == b.vt && a.vn == b.vn;
 }
 uint64_t vertex_hash(VertexKey k) {
-    uint64_t x = (static_cast<uint64_t>(k.v) << 32) ^ (static_cast<uint64_t>(k.vt) * 0x9e3779b185ebca87ull) ^ k.vn ^
-                 (static_cast<uint64_t>(k.shade_material) * 0xd6e8feb86659fd93ull);
+    uint64_t x = (static_cast<uint64_t>(k.v) << 32) ^
+                 (static_cast<uint64_t>(k.vt) * 0x9e3779b185ebca87ull) ^ k.vn;
     x ^= x >> 30;
     x *= 0xbf58476d1ce4e5b9ull;
     x ^= x >> 27;
@@ -823,7 +561,7 @@ bool face_keys(const ObjData& obj, const ObjFace& f, VertexKey keys[3], Error* e
         if (v < 0 || (raw[i].vt && vt < 0) || (raw[i].vn && vn < 0))
             return fail(err, "OBJ face index out of range");
         keys[i] = {static_cast<uint32_t>(v), vt < 0 ? 0xffffffffu : static_cast<uint32_t>(vt),
-                   vn < 0 ? 0xffffffffu : static_cast<uint32_t>(vn), 0};
+                   vn < 0 ? 0xffffffffu : static_cast<uint32_t>(vn)};
     }
     return true;
 }
@@ -840,9 +578,7 @@ uint32_t next_pow2(uint32_t v) {
     return v + 1;
 }
 
-bool shade_pick(const ShadeSource* shade, Asura_Vector_3 position, Asura_Vector_3 normal, uint32_t material, uint32_t* out_color);
-
-bool build_env(const Config& cfg, const ObjData& obj, const MaterialMap& materials, const ShadeSource* shade,
+bool build_env(const Config& cfg, const ObjData& obj, const MaterialMap& materials,
                Arena* arena, Arena* scratch, EnvBuild* out, Error* err) {
     memset(out, 0, sizeof(*out));
     FaceWork* work = arena_array<FaceWork>(arena, obj.face_count, err, false);
@@ -856,9 +592,7 @@ bool build_env(const Config& cfg, const ObjData& obj, const MaterialMap& materia
         const Asura_Vector_3 a = transform_vec(obj.positions[k[0].v], cfg), b = transform_vec(obj.positions[k[1].v], cfg),
                    c = transform_vec(obj.positions[k[2].v], cfg);
         uint32_t m = 0;
-        if (cfg.force_material)
-            m = cfg.force_material_index;
-        else if (!resolve_material(materials, f.material, cfg.allow_unknown_materials, &m, err))
+        if (!resolve_material(materials, f.material, cfg.allow_unknown_materials, &m, err))
             return false;
         if (m == 0xffffffffu)
             m = 0;
@@ -908,7 +642,6 @@ bool build_env(const Config& cfg, const ObjData& obj, const MaterialMap& materia
             }
             uint32_t vert_count = 0, tri_count = 0;
             auto lookup = [&](VertexKey key, uint32_t material, uint32_t* out_index, bool add) -> bool {
-                key.shade_material = shade ? material : 0;
                 const uint32_t mask = slot_cap - 1;
                 uint32_t at = static_cast<uint32_t>(vertex_hash(key)) & mask;
                 while (slots[at].used) {
@@ -931,9 +664,7 @@ bool build_env(const Config& cfg, const ObjData& obj, const MaterialMap& materia
                     uv = obj.texcoords[key.vt];
                     uv.y = 1.0f - uv.y;
                 }
-                uint32_t color = obj.has_color[key.v] ? obj.colors[key.v] : cfg.diffuse_abgr;
-                if (!obj.has_color[key.v])
-                    shade_pick(shade, p, n, material, &color);
+                const uint32_t color = obj.has_color[key.v] ? obj.colors[key.v] : cfg.diffuse_abgr;
                 verts[vert_count] = {{p.x, p.y, p.z}, {n.x, n.y, n.z}, color, {uv.x, uv.y}};
                 slots[at].used = 1;
                 slots[at].key = key;
@@ -1100,299 +831,6 @@ bool env_view(const Buffer& payload, EnvView* v, Arena* arena, Error* err) {
     return true;
 }
 
-uint64_t shade_cell_hash(int32_t x, int32_t y, int32_t z) {
-    uint64_t h = static_cast<uint32_t>(x) * 0x9e3779b1u;
-    h ^= static_cast<uint64_t>(static_cast<uint32_t>(y)) * 0x85ebca77u;
-    h ^= static_cast<uint64_t>(static_cast<uint32_t>(z)) * 0xc2b2ae3du;
-    h ^= h >> 29;
-    h *= 0x165667b19e3779f9ull;
-    return h ^ (h >> 32);
-}
-
-bool transformed_obj_bounds(const ObjData& obj, const Config& cfg, Asura_Vector_3* mn, Asura_Vector_3* mx) {
-    if (!obj.position_count)
-        return false;
-    *mn = transform_vec(obj.positions[0], cfg);
-    *mx = *mn;
-    for (uint32_t i = 1; i < obj.position_count; ++i) {
-        Asura_Vector_3 p = transform_vec(obj.positions[i], cfg);
-        mn->x = fmin(mn->x, p.x);
-        mn->y = fmin(mn->y, p.y);
-        mn->z = fmin(mn->z, p.z);
-        mx->x = fmax(mx->x, p.x);
-        mx->y = fmax(mx->y, p.y);
-        mx->z = fmax(mx->z, p.z);
-    }
-    return true;
-}
-
-bool shade_alignment_offset(const Config& cfg, const ObjData& target, Arena* scratch, Asura_Vector_3* out, Error* err) {
-    *out = cfg.shade_offset;
-    if (!cfg.shade_align_from_obj)
-        return true;
-    ArenaMark mark = arena_mark(scratch);
-    MappedFile f{};
-    if (!map_file(cfg.shade_align_from_obj, &f, err))
-        return false;
-    ObjData ref{};
-    if (!parse_obj(&f, &ref, scratch, err)) {
-        unmap_file(&f);
-        arena_reset(scratch, mark);
-        return false;
-    }
-    Asura_Vector_3 tmn, tmx, rmn, rmx;
-    if (!transformed_obj_bounds(target, cfg, &tmn, &tmx) || !transformed_obj_bounds(ref, cfg, &rmn, &rmx)) {
-        unmap_file(&f);
-        arena_reset(scratch, mark);
-        return fail(err, "cannot derive shading alignment from empty OBJ");
-    }
-    out->x += (tmn.x + tmx.x - rmn.x - rmx.x) * .5f;
-    out->y += (tmn.y + tmx.y - rmn.y - rmx.y) * .5f;
-    out->z += (tmn.z + tmx.z - rmn.z - rmx.z) * .5f;
-    unmap_file(&f);
-    arena_reset(scratch, mark);
-    return true;
-}
-
-bool load_shade_source(const Config& cfg, const ObjData& target, ShadeSource* out, Arena* arena, Arena* scratch,
-                       Error* err) {
-    memset(out, 0, sizeof(*out));
-    if (!cfg.shade_from)
-        return true;
-    if (dir_exists(cfg.shade_from))
-        return fail(err, "C++ --shade-from expects a donor .pc or raw Env payload, not a directory");
-    ArenaMark mark = arena_mark(scratch);
-    MappedFile file{};
-    if (!map_file(cfg.shade_from, &file, err))
-        return false;
-    const uint8_t* payload = file.data;
-    uint64_t payload_size = file.size;
-    if (file.size >= 8 && memcmp(file.data, kAsuraMagic, 8) == 0) {
-        payload = nullptr;
-        uint64_t off = 8;
-        while (off + sizeof(Asura_Chunk_Header) <= file.size) {
-            ChunkRef ch{file.data + off,
-                        read_u32(file.data + off + 4),
-                        read_u32(file.data + off),
-                        read_u32(file.data + off + 8),
-                        read_u32(file.data + off + 12),
-                        0};
-            if (!ch.cid || !ch.size)
-                break;
-            if (ch.size < sizeof(Asura_Chunk_Header) || ch.size > file.size - off) {
-                unmap_file(&file);
-                arena_reset(scratch, mark);
-                return fail(err, "shade donor has an invalid chunk at 0x%llx", static_cast<unsigned long long>(off));
-            }
-            RscfInfo r{};
-            if (rscf_info(ch, &r) && r.type == ASURA_RESOURCEFILE_TYPE_PLATFORMSPECIFIC &&
-                r.subtype == ASURA_RESOURCEFILE_TYPE_PC_ENVIRONMENT &&
-                str_ieq(r.name, str_from_c(cfg.env_name))) {
-                payload = r.payload;
-                payload_size = r.payload_size;
-                break;
-            }
-            off += ch.size;
-        }
-        if (!payload) {
-            unmap_file(&file);
-            arena_reset(scratch, mark);
-            return fail(err, "shade donor contains no PC environment RSCF named '%s'", cfg.env_name);
-        }
-    }
-    if (payload_size > 0xffffffffull) {
-        unmap_file(&file);
-        arena_reset(scratch, mark);
-        return fail(err, "shade Env payload exceeds 4 GiB");
-    }
-    Buffer fake{};
-    fake.base = const_cast<uint8_t*>(payload);
-    fake.size = fake.committed = fake.reserved = payload_size;
-    EnvView env{};
-    if (!env_view(fake, &env, scratch, err)) {
-        unmap_file(&file);
-        arena_reset(scratch, mark);
-        return false;
-    }
-    uint64_t sample_count = 0;
-    for (uint32_t ai = 0; ai < env.module_count; ++ai) {
-        const Asura_PC_EnvironmentRenderer_Module& a = env.modules[ai];
-        if (a.m_uBufferIndex >= env.block_count)
-            continue;
-        const uint32_t nv = read_u32(env.blocks[a.m_uBufferIndex]);
-        for (uint32_t k = 0; k < a.m_uNumberOfStrips && a.m_uFirstStrip + k < env.strip_count; ++k) {
-            const Asura_PC_EnvironmentRenderer_Strip& b = env.strips[a.m_uFirstStrip + k];
-            if (b.m_uLowestVertexUsed < nv) {
-                const uint32_t available = nv - b.m_uLowestVertexUsed;
-                sample_count += b.m_uNumberOfVertices < available ? b.m_uNumberOfVertices : available;
-            }
-        }
-    }
-    if (!sample_count || sample_count > 0xffffffffull) {
-        unmap_file(&file);
-        arena_reset(scratch, mark);
-        return fail(err, "shade Env has no usable vertex samples or too many samples");
-    }
-    ShadeSample* samples = arena_array<ShadeSample>(arena, sample_count, err, false);
-    if (!samples) {
-        unmap_file(&file);
-        arena_reset(scratch, mark);
-        return false;
-    }
-    Asura_Vector_3 offset{};
-    if (!shade_alignment_offset(cfg, target, scratch, &offset, err)) {
-        unmap_file(&file);
-        arena_reset(scratch, mark);
-        return false;
-    }
-    uint32_t written = 0;
-    for (uint32_t ai = 0; ai < env.module_count; ++ai) {
-        const Asura_PC_EnvironmentRenderer_Module& a = env.modules[ai];
-        if (a.m_uBufferIndex >= env.block_count)
-            continue;
-        const uint8_t* block = env.blocks[a.m_uBufferIndex];
-        const uint32_t nv = read_u32(block);
-        const uint8_t* verts = block + 8;
-        for (uint32_t k = 0; k < a.m_uNumberOfStrips && a.m_uFirstStrip + k < env.strip_count; ++k) {
-            const Asura_PC_EnvironmentRenderer_Strip& b = env.strips[a.m_uFirstStrip + k];
-            const uint32_t available = b.m_uLowestVertexUsed < nv ? nv - b.m_uLowestVertexUsed : 0;
-            const uint32_t take = b.m_uNumberOfVertices < available ? b.m_uNumberOfVertices : available;
-            const uint32_t end = b.m_uLowestVertexUsed + take;
-            for (uint32_t vi = b.m_uLowestVertexUsed; vi < end; ++vi) {
-                const uint8_t* v = verts + static_cast<uint64_t>(vi) * sizeof(Asura_PC_EnvironmentRenderer_Vertex);
-                samples[written++] = {{read_f32(v) + offset.x, read_f32(v + 4) + offset.y, read_f32(v + 8) + offset.z},
-                                      {read_f32(v + 12), read_f32(v + 16), read_f32(v + 20)},
-                                      read_u32(v + 24),
-                                      static_cast<uint32_t>(b.m_iOriginalMaterialIndex)};
-            }
-        }
-    }
-    if (!written) {
-        unmap_file(&file);
-        arena_reset(scratch, mark);
-        return fail(err, "shade Env produced no usable samples");
-    }
-    float nearest[128]{};
-    uint32_t nearest_count = 0;
-    const uint32_t stride = written > 128 ? written / 128 : 1;
-    for (uint32_t si = 0; si < written && nearest_count < 128; si += stride) {
-        float best = 3.402823466e+38f;
-        const Asura_Vector_3 p = samples[si].position;
-        for (uint32_t j = 0; j < written; ++j) {
-            const float dx = samples[j].position.x - p.x, dy = samples[j].position.y - p.y,
-                        dz = samples[j].position.z - p.z, d2 = dx * dx + dy * dy + dz * dz;
-            if (d2 > 1e-12f && d2 < best)
-                best = d2;
-        }
-        if (best < 3.402823466e+38f)
-            nearest[nearest_count++] = sqrt(best);
-    }
-    if (nearest_count)
-        heap_sort(nearest, nearest_count, [](float a, float b) { return a < b; });
-    const float cell = nearest_count ? fmax(.05f, nearest[nearest_count / 2] * 1.25f) : .25f;
-    uint32_t cap = next_pow2(written > 0x3fffffffu ? 0x80000000u : written * 2 + 1);
-    if (!cap) {
-        unmap_file(&file);
-        arena_reset(scratch, mark);
-        return fail(err, "shade hash table size overflow");
-    }
-    ShadeBucket* buckets = arena_array<ShadeBucket>(arena, cap, err);
-    uint32_t* next = arena_array<uint32_t>(arena, written, err, false);
-    if (err->set) {
-        unmap_file(&file);
-        arena_reset(scratch, mark);
-        return false;
-    }
-    for (uint32_t i = 0; i < written; ++i)
-        next[i] = 0xffffffffu;
-    const float inv = 1.0f / cell;
-    for (uint32_t i = 0; i < written; ++i) {
-        const Asura_Vector_3 p = samples[i].position;
-        const int32_t x = static_cast<int32_t>(p.x * inv), y = static_cast<int32_t>(p.y * inv),
-                      z = static_cast<int32_t>(p.z * inv);
-        uint32_t slot = static_cast<uint32_t>(shade_cell_hash(x, y, z)) & (cap - 1);
-        while (buckets[slot].used && (buckets[slot].x != x || buckets[slot].y != y || buckets[slot].z != z))
-            slot = (slot + 1) & (cap - 1);
-        if (!buckets[slot].used) {
-            buckets[slot].used = 1;
-            buckets[slot].x = x;
-            buckets[slot].y = y;
-            buckets[slot].z = z;
-            buckets[slot].head = 0xffffffffu;
-        }
-        next[i] = buckets[slot].head;
-        buckets[slot].head = i;
-    }
-    out->samples = samples;
-    out->next = next;
-    out->buckets = buckets;
-    out->count = written;
-    out->bucket_mask = cap - 1;
-    out->cell_size = cell;
-    unmap_file(&file);
-    arena_reset(scratch, mark);
-    return true;
-}
-
-bool shade_pick(const ShadeSource* shade, Asura_Vector_3 p, Asura_Vector_3 normal, uint32_t material, uint32_t* out_color) {
-    if (!shade || !shade->count)
-        return false;
-    const float inv = 1.0f / shade->cell_size, max_d2 = shade->cell_size * shade->cell_size;
-    const int32_t cx = static_cast<int32_t>(p.x * inv), cy = static_cast<int32_t>(p.y * inv),
-                  cz = static_cast<int32_t>(p.z * inv);
-    const float nl = sqrt(normal.x * normal.x + normal.y * normal.y + normal.z * normal.z);
-    if (nl > 1e-12f) {
-        normal.x /= nl;
-        normal.y /= nl;
-        normal.z /= nl;
-    }
-    for (uint32_t pass = 0; pass < 2; ++pass) {
-        float best_score = 3.402823466e+38f;
-        uint32_t best = 0xffffffffu;
-        for (int32_t dz = -1; dz <= 1; ++dz)
-            for (int32_t dy = -1; dy <= 1; ++dy)
-                for (int32_t dx = -1; dx <= 1; ++dx) {
-                    const int32_t x = cx + dx, y = cy + dy, z = cz + dz;
-                    uint32_t slot = static_cast<uint32_t>(shade_cell_hash(x, y, z)) & shade->bucket_mask;
-                    while (shade->buckets[slot].used &&
-                           (shade->buckets[slot].x != x || shade->buckets[slot].y != y || shade->buckets[slot].z != z))
-                        slot = (slot + 1) & shade->bucket_mask;
-                    if (!shade->buckets[slot].used)
-                        continue;
-                    for (uint32_t i = shade->buckets[slot].head; i != 0xffffffffu; i = shade->next[i]) {
-                        const ShadeSample& s = shade->samples[i];
-                        if (!pass && s.material != material)
-                            continue;
-                        const float qx = s.position.x - p.x, qy = s.position.y - p.y, qz = s.position.z - p.z,
-                                    d2 = qx * qx + qy * qy + qz * qz;
-                        if (d2 > max_d2)
-                            continue;
-                        float score = d2;
-                        if (nl > 1e-12f) {
-                            const float sl =
-                                sqrt(s.normal.x * s.normal.x + s.normal.y * s.normal.y + s.normal.z * s.normal.z);
-                            if (sl > 1e-12f) {
-                                float dot =
-                                    (normal.x * s.normal.x + normal.y * s.normal.y + normal.z * s.normal.z) / sl;
-                                dot = fmin(1.0f, fmax(-1.0f, dot));
-                                const float nd = 1 - dot;
-                                score += max_d2 * nd * nd;
-                            }
-                        }
-                        if (score < best_score) {
-                            best_score = score;
-                            best = i;
-                        }
-                    }
-                }
-        if (best != 0xffffffffu) {
-            *out_color = shade->samples[best].color;
-            return true;
-        }
-    }
-    return false;
-}
-
 struct CollTri {
     uint16_t a, b, c, flags, material;
 };
@@ -1493,12 +931,8 @@ bool append_module_collision_v3(Buffer* out, const EnvView& env, uint32_t module
         mx.z = fmax(mx.z, p.z);
     }
     Asura_Vector_3 c{(mn.x + mx.x) * .5f, (mn.y + mx.y) * .5f, (mn.z + mx.z) * .5f};
-    const float dx = fmax(mx.x - mn.x, 1.0f), dy = fmax(mx.y - mn.y, 1.0f), dz = fmax(mx.z - mn.z, 1.0f);
-    const float px = fmax(cfg.module_pad_min, dx * cfg.module_pad_scale),
-                py = fmax(cfg.module_pad_min, dy * cfg.module_pad_scale),
-                pz = fmax(cfg.module_pad_min, dz * cfg.module_pad_scale);
-    const float bounds[6] = {mn.x - c.x - px, mx.x - c.x + px, mn.y - c.y - py,
-                             mx.y - c.y + py, mn.z - c.z - pz, mx.z - c.z + pz};
+    const float bounds[6] = {mn.x - c.x, mx.x - c.x, mn.y - c.y,
+                             mx.y - c.y, mn.z - c.z, mx.z - c.z};
     const float rx = bounds[1] - bounds[0], ry = bounds[3] - bounds[2], rz = bounds[5] - bounds[4];
     const float radius = .5f * sqrt(rx * rx + ry * ry + rz * rz);
     metric->translation = c;
@@ -1605,23 +1039,6 @@ bool append_nav1(Buffer* out, uint32_t n, Error* err) {
     return end_chunk(out, ch, err);
 }
 
-bool append_skyb(Buffer* out, Error* err) {
-    ChunkMark ch = begin_chunk(out, ASURA_CHUNK_SKYBOX, 7, 0, err);
-    const Asura_Chunk_SkyBox_PayloadPrefixV7 prefix{255.0f, 230.0f, 200.0f, 3.107175588607788f};
-    buffer_append(out, &prefix, sizeof(prefix), err);
-    // Empty first path plus these seven padded strings is the exact v7 count.
-    append_u32(out, 0, err);
-    const char* names[] = {"\\sky\\fr.tga", "\\sky\\lf.tga",        "\\sky\\bk.tga",       "\\sky\\rt.tga",
-                           "\\sky\\up.tga", "\\sky\\ch_04_sky.bmp", "\\sky\\ch_04_sky.bmp"};
-    static_assert(sizeof(names) / sizeof(names[0]) + 1 == ASURA_SKYBOX_V5_V7_TEXTURE_PATH_COUNT,
-                  "SKYB v7 path count changed");
-    for (const char* name : names)
-        append_padded_cstr(out, str_from_c(name), err);
-    const Asura_Chunk_SkyBox_TrailingFlagsV7 flags{1, 0, 0};
-    buffer_append(out, &flags, sizeof(flags), err);
-    return end_chunk(out, ch, err);
-}
-
 bool append_fog(Buffer* out, Error* err) {
     const Asura_Chunk_Fog_ChunkDataV0 fog{{0.4705885946750641f, 0.41176480054855347f, 0.29411765933036804f, 0.0f},
                                     0.0f,
@@ -1654,70 +1071,6 @@ bool append_fnfo(Buffer* out, Error* err) {
 } // namespace
 
 namespace asura::level {
-
-bool csv_has_u32(Str csv, uint32_t wanted) {
-    if (!csv.size)
-        return true;
-    uint32_t at = 0;
-    while (at < csv.size) {
-        uint32_t end = at;
-        while (end < csv.size && csv.data[end] != ',')
-            ++end;
-        uint64_t v = 0;
-        if (parse_u64(str_trim({csv.data + at, end - at}), &v) && v == wanted)
-            return true;
-        at = end + 1;
-    }
-    return false;
-}
-bool csv_has_str(Str csv, Str wanted) {
-    if (!csv.size)
-        return true;
-    uint32_t at = 0;
-    while (at < csv.size) {
-        uint32_t end = at;
-        while (end < csv.size && csv.data[end] != ',')
-            ++end;
-        if (str_ieq(str_trim({csv.data + at, end - at}), str_trim(wanted)))
-            return true;
-        at = end + 1;
-    }
-    return false;
-}
-bool glob_i(Str text, Str pat) {
-    if (!pat.size)
-        return true;
-    uint32_t ti = 0, pi = 0, star = 0xffffffffu, retry = 0;
-    while (ti < text.size) {
-        if (pi < pat.size && (pat.data[pi] == '?' || ascii_lower(pat.data[pi]) == ascii_lower(text.data[ti]))) {
-            ++pi;
-            ++ti;
-            continue;
-        }
-        if (pi < pat.size && pat.data[pi] == '*') {
-            star = pi++;
-            retry = ti;
-            continue;
-        }
-        if (star != 0xffffffffu) {
-            pi = star + 1;
-            ti = ++retry;
-            continue;
-        }
-        return false;
-    }
-    while (pi < pat.size && pat.data[pi] == '*')
-        ++pi;
-    return pi == pat.size;
-}
-bool filter_name(Str name, Str filter) {
-    if (!filter.size)
-        return true;
-    bool has_glob = false;
-    for (uint32_t i = 0; i < filter.size; ++i)
-        has_glob |= filter.data[i] == '*' || filter.data[i] == '?';
-    return has_glob ? glob_i(name, filter) : str_contains_i(name, filter);
-}
 
 bool disk_less(const DiskFile& a, const DiskFile& b) {
     return _stricmp(a.name, b.name) < 0;
@@ -1782,125 +1135,22 @@ bool append_mtrl(Buffer* out, const int32_t* tex, const uint32_t* flags, const u
     return end_chunk(out, ch, err);
 }
 
-bool flip_dds_vertical(uint8_t* data, uint64_t size) {
-    if (size < 128 || memcmp(data, "DDS ", 4) != 0 || read_u32(data + 4) != 124 || read_u32(data + 76) != 32)
-        return false;
-    const uint32_t height = read_u32(data + 12), width = read_u32(data + 16);
-    if (!width || !height || memcmp(data + 84, "DX10", 4) == 0)
-        return false;
-    uint32_t block_bytes = 0;
-    if (memcmp(data + 84, "DXT1", 4) == 0)
-        block_bytes = 8;
-    else if (memcmp(data + 84, "DXT5", 4) == 0)
-        block_bytes = 16;
-    else
-        return false;
-    const uint64_t blocks_w = (static_cast<uint64_t>(width) + 3) / 4,
-                   blocks_h = (static_cast<uint64_t>(height) + 3) / 4, row_bytes = blocks_w * block_bytes;
-    if (!row_bytes || row_bytes > size - 128 || blocks_h > (size - 128) / row_bytes)
-        return false;
-    uint8_t* image = data + 128;
-    for (uint64_t y = 0; y < blocks_h; ++y)
-        for (uint64_t x = 0; x < blocks_w; ++x) {
-            uint8_t* block = image + y * row_bytes + x * block_bytes;
-            if (block_bytes == 16) {
-                uint64_t alpha = 0;
-                for (uint32_t i = 0; i < 6; ++i)
-                    alpha |= static_cast<uint64_t>(block[2 + i]) << (i * 8);
-                uint64_t flipped = 0;
-                for (uint32_t row = 0; row < 4; ++row)
-                    for (uint32_t column = 0; column < 4; ++column) {
-                        const uint32_t dst = 3 * (row * 4 + column), src = 3 * ((3 - row) * 4 + column);
-                        flipped |= ((alpha >> src) & 7ull) << dst;
-                    }
-                for (uint32_t i = 0; i < 6; ++i)
-                    block[2 + i] = static_cast<uint8_t>(flipped >> (i * 8));
-                uint8_t t = block[12];
-                block[12] = block[15];
-                block[15] = t;
-                t = block[13];
-                block[13] = block[14];
-                block[14] = t;
-            } else {
-                uint8_t t = block[4];
-                block[4] = block[7];
-                block[7] = t;
-                t = block[5];
-                block[5] = block[6];
-                block[6] = t;
-            }
-        }
-    uint8_t temp[16];
-    for (uint64_t y = 0; y < blocks_h / 2; ++y)
-        for (uint64_t x = 0; x < blocks_w; ++x) {
-            uint8_t *a = image + y * row_bytes + x * block_bytes,
-                    *b = image + (blocks_h - 1 - y) * row_bytes + x * block_bytes;
-            memcpy(temp, a, block_bytes);
-            memcpy(a, b, block_bytes);
-            memcpy(b, temp, block_bytes);
-        }
-    return true;
-}
-
-bool append_file_rscf(Buffer* out, Str name, uint32_t type, uint32_t subtype, const char* path, Arena* scratch,
-                      bool flip, Error* err) {
+bool append_file_rscf(Buffer* out, Str name, uint32_t type, uint32_t subtype,
+                      const char* path, Arena* scratch, Error* err) {
     ArenaMark mark = arena_mark(scratch);
-    MappedFile f{};
-    if (!map_file(path, &f, err))
+    MappedFile file{};
+    if (!map_file(path, &file, err))
         return false;
-    if (f.size > 0xffffffffull) {
-        unmap_file(&f);
+    if (file.size > 0xffffffffull) {
+        unmap_file(&file);
         return fail(err, "resource exceeds 4 GiB: %s", path);
     }
-    const uint8_t* data = f.data;
-    if (flip && f.size) {
-        uint8_t* copy = arena_array<uint8_t>(scratch, f.size, err, false);
-        if (!copy) {
-            unmap_file(&f);
-            return false;
-        }
-        memcpy(copy, f.data, static_cast<size_t>(f.size));
-        data = copy;
-        uint64_t pixel_off = 0, row = 0, height = 0;
-        Str ext = path_basename(str_from_c(path));
-        if (flip_dds_vertical(copy, f.size)) {
-        } else if (f.size >= 18 && str_ends_i(ext, str_lit(".tga")) && copy[2] == 2 &&
-                   (copy[16] == 24 || copy[16] == 32)) {
-            const uint32_t cmap = copy[1] ? read_u16(copy + 5) * ((copy[7] + 7) / 8) : 0;
-            const uint32_t w = read_u16(copy + 12), h = read_u16(copy + 14);
-            pixel_off = 18u + copy[0] + cmap;
-            row = static_cast<uint64_t>(w) * (copy[16] / 8);
-            height = h;
-        } else if (f.size >= 54 && str_ends_i(ext, str_lit(".bmp")) && copy[0] == 'B' && copy[1] == 'M' &&
-                   read_u32(copy + 14) >= 40 && read_u16(copy + 26) == 1 && read_u32(copy + 30) == 0 &&
-                   (read_u16(copy + 28) == 24 || read_u16(copy + 28) == 32)) {
-            const int32_t w = static_cast<int32_t>(read_u32(copy + 18)), h = static_cast<int32_t>(read_u32(copy + 22));
-            if (w > 0 && h) {
-                pixel_off = read_u32(copy + 10);
-                row = align_up(static_cast<uint64_t>(w) * (read_u16(copy + 28) / 8), 4);
-                height = h < 0 ? static_cast<uint64_t>(-static_cast<int64_t>(h)) : static_cast<uint64_t>(h);
-            }
-        }
-        if (row && height && pixel_off + row * height <= f.size) {
-            uint8_t* temp = arena_array<uint8_t>(scratch, row, err, false);
-            if (!temp) {
-                unmap_file(&f);
-                return false;
-            }
-            for (uint64_t y = 0; y < height / 2; ++y) {
-                uint8_t *a = copy + pixel_off + y * row, *b = copy + pixel_off + (height - 1 - y) * row;
-                memcpy(temp, a, static_cast<size_t>(row));
-                memcpy(a, b, static_cast<size_t>(row));
-                memcpy(b, temp, static_cast<size_t>(row));
-            }
-        }
-    }
-    const bool ok = append_rscf(out, name, type, subtype, data, static_cast<uint32_t>(f.size), err);
-    unmap_file(&f);
+    const bool ok = append_rscf(out, name, type, subtype, file.data,
+                                static_cast<uint32_t>(file.size), err);
+    unmap_file(&file);
     arena_reset(scratch, mark);
     return ok;
 }
-
 bool append_textures(Buffer* out, const Config& cfg, const EnvView& env, const MaterialMap& map, Arena* arena,
                      Arena* scratch, TextureSet* set, Error* err) {
     memset(set, 0, sizeof(*set));
@@ -1947,7 +1197,7 @@ bool append_textures(Buffer* out, const Config& cfg, const EnvView& env, const M
         const uint32_t fl = 0, su = 1;
         if (!append_mtrl(out, &ti, &fl, &su, 1, err) ||
             !append_file_rscf(out, str_from_c(rscf_name), ASURA_RESOURCEFILE_TYPE_TEXTURE, 0, set->files.data[i].path,
-                              scratch, false, err))
+                              scratch, err))
             return false;
     }
     // Global material table indexed by each Env strip's serialized original
@@ -2031,9 +1281,8 @@ bool append_sky_resources(Buffer* out, const Config& cfg, Arena* scratch, Error*
             continue;
         char name[256];
         snprintf(name, sizeof(name), "\\graphics\\sky\\%s", face.stem);
-        const bool flip = cfg.sky_flip_faces.size && csv_has_str(cfg.sky_flip_faces, str_from_c(face.stem));
-        if (!append_file_rscf(out, str_from_c(name), ASURA_RESOURCEFILE_TYPE_TEXTURE, 0, source->path, scratch, flip,
-                              err))
+        if (!append_file_rscf(out, str_from_c(name), ASURA_RESOURCEFILE_TYPE_TEXTURE, 0,
+                              source->path, scratch, err))
             return false;
     }
     arena_reset(scratch, files_mark);
@@ -2044,151 +1293,11 @@ bool append_sky_resources(Buffer* out, const Config& cfg, Arena* scratch, Error*
 
 namespace asura::level {
 
-bool append_rsfl(Buffer* out, const Config& cfg, Arena* scratch, Error* err) {
-    if (cfg.rsfl_from_pc) {
-        ArenaMark mark = arena_mark(scratch);
-        ChunkList donor{};
-        if (!parse_chunks(cfg.rsfl_from_pc, &donor, scratch, err))
-            return false;
-        for (uint32_t i = 0; i < donor.count; ++i)
-            if (donor.chunks[i].cid == ASURA_CHUNK_RESOURCEFILELIST) {
-                const bool ok = append_chunk_copy(out, donor.chunks[i], err);
-                unmap_file(&donor.file);
-                arena_reset(scratch, mark);
-                return ok;
-            }
-        unmap_file(&donor.file);
-        arena_reset(scratch, mark);
-        return fail(err, "RSFL donor contains no RSFL chunk: %s", cfg.rsfl_from_pc);
-    }
-    ChunkMark ch = begin_chunk(out, ASURA_CHUNK_RESOURCEFILELIST, 1, 0, err);
+bool append_rsfl(Buffer* out, Error* err) {
+    ChunkMark chunk = begin_chunk(out, ASURA_CHUNK_RESOURCEFILELIST, 1, 0, err);
     append_u32(out, 0, err);
-    return end_chunk(out, ch, err);
+    return end_chunk(out, chunk, err);
 }
-
-bool append_first_cid(Buffer* out, const char* path, uint32_t cid, Arena* scratch, bool required, bool* was_found,
-                      Error* err) {
-    if (was_found)
-        *was_found = false;
-    if (!path)
-        return true;
-    ArenaMark mark = arena_mark(scratch);
-    ChunkList donor{};
-    if (!parse_chunks(path, &donor, scratch, err))
-        return false;
-    bool found = false;
-    for (uint32_t i = 0; i < donor.count; ++i)
-        if (donor.chunks[i].cid == cid) {
-            found = append_chunk_copy(out, donor.chunks[i], err);
-            if (was_found)
-                *was_found = found;
-            break;
-        }
-    unmap_file(&donor.file);
-    arena_reset(scratch, mark);
-    if (!found && required)
-        return fail(err, "donor '%s' contains no requested chunk", path);
-    return !err->set;
-}
-
-bool append_filtered_rscf(Buffer* out, const Config& cfg, Arena* scratch, Error* err) {
-    if (!cfg.rscf_from_pc)
-        return true;
-    ArenaMark mark = arena_mark(scratch);
-    ChunkList donor{};
-    if (!parse_chunks(cfg.rscf_from_pc, &donor, scratch, err))
-        return false;
-    uint32_t skipped = 0, added = 0;
-    for (uint32_t i = 0; i < donor.count; ++i) {
-        RscfInfo r{};
-        if (!rscf_info(donor.chunks[i], &r))
-            continue;
-        if (str_ieq_c(r.name, cfg.env_name))
-            continue;
-        if (cfg.rscf_types.size && !csv_has_u32(cfg.rscf_types, r.type))
-            continue;
-        if (cfg.rscf_names.size && !csv_has_str(cfg.rscf_names, r.name))
-            continue;
-        if (!filter_name(r.name, cfg.rscf_name_filter))
-            continue;
-        if (skipped < cfg.rscf_skip) {
-            ++skipped;
-            continue;
-        }
-        if (cfg.rscf_limit_set && added >= cfg.rscf_limit)
-            break;
-        if (!append_chunk_copy(out, donor.chunks[i], err))
-            break;
-        ++added;
-    }
-    unmap_file(&donor.file);
-    arena_reset(scratch, mark);
-    return !err->set;
-}
-
-bool append_filtered_enti(Buffer* out, const Config& cfg, Arena* scratch, Error* err) {
-    if (!cfg.enti_from_pc)
-        return true;
-    ArenaMark mark = arena_mark(scratch);
-    ChunkList donor{};
-    if (!parse_chunks(cfg.enti_from_pc, &donor, scratch, err))
-        return false;
-    for (uint32_t i = 0; i < donor.count; ++i) {
-        const ChunkRef& ch = donor.chunks[i];
-        if (ch.cid != ASURA_CHUNK_ENTITY || ch.size < sizeof(Asura_Chunk_Entity))
-            continue;
-        const uint32_t type =
-            read_u16(ch.data + sizeof(Asura_Chunk_Header) + offsetof(Asura_Chunk_Entity_PayloadHeader, Classification));
-        if (type == SnipeEntityClass_SpawnPoint && !cfg.enti_keep_spawnpoints)
-            continue;
-        if (cfg.enti_types.size && !csv_has_u32(cfg.enti_types, type))
-            continue;
-        if (!append_chunk_copy(out, ch, err))
-            break;
-    }
-    unmap_file(&donor.file);
-    arena_reset(scratch, mark);
-    return !err->set;
-}
-
-bool append_smsg_boot(Buffer* out, const char* path, Arena* scratch, Error* err) {
-    if (!path)
-        return true;
-    ArenaMark mark = arena_mark(scratch);
-    ChunkList donor{};
-    if (!parse_chunks(path, &donor, scratch, err))
-        return false;
-    int32_t first_enti = -1, smsg = -1;
-    for (uint32_t i = 0; i < donor.count; ++i)
-        if (donor.chunks[i].cid == ASURA_CHUNK_ENTITY) {
-            first_enti = static_cast<int32_t>(i);
-            break;
-        }
-    if (first_enti >= 0)
-        for (int32_t i = first_enti - 1; i >= 0; --i)
-            if (donor.chunks[i].cid == ASURA_CHUNK_STATICMESSAGES) {
-                smsg = i;
-                break;
-            }
-    if (smsg >= 0) {
-        int32_t start = smsg;
-        for (int32_t i = smsg - 1; i >= 0; --i) {
-            uint32_t c = donor.chunks[i].cid;
-            if (c == fourcc('S', 'H', 'P', 'D') || c == fourcc('S', 'H', 'A', 'P'))
-                start = i;
-            else
-                break;
-        }
-        for (int32_t i = start; i <= smsg; ++i)
-            append_chunk_copy(out, donor.chunks[i], err);
-        for (int32_t i = smsg + 1; i < first_enti && donor.chunks[i].cid == ASURA_CHUNK_TEXTURENAMES; ++i)
-            append_chunk_copy(out, donor.chunks[i], err);
-    }
-    unmap_file(&donor.file);
-    arena_reset(scratch, mark);
-    return !err->set;
-}
-
 bool bytes_contains_i(const uint8_t* data, uint32_t size, const char* needle) {
     Str n = str_from_c(needle);
     return str_contains_i({reinterpret_cast<const char*>(data), size}, n);
@@ -2403,391 +1512,13 @@ bool append_weapon_support(Buffer* out, const Config& cfg, Arena* scratch, Error
     return !err->set;
 }
 
-bool append_ambient(Buffer* out, const Config& cfg, Error* err) {
-    if (!cfg.ambient_stream_path)
-        return true;
-    char path[28]{};
-    Str s = str_from_c(cfg.ambient_stream_path);
-    if (!str_contains_i(s, str_lit("\\")) && !str_contains_i(s, str_lit("/"))) {
-        const char* pre = "Sounds\\Streams\\";
-        if (strlen(pre) + s.size > 27)
-            return fail(err, "ambient stream path exceeds 27 bytes");
-        memcpy(path, pre, strlen(pre));
-        memcpy(path + strlen(pre), s.data, s.size);
-    } else {
-        if (s.size > 27)
-            return fail(err, "ambient stream path exceeds 27 bytes");
-        for (uint32_t i = 0; i < s.size; ++i)
-            path[i] = s.data[i] == '/' ? '\\' : s.data[i];
-    }
-    ChunkMark ch = begin_chunk(out, ASURA_CHUNK_STREAMINGBACKGROUNDSOUND, 1, 0, err);
-    append_u32(out, 0, err);
-    append_u32(out, 0, err);
-    append_f32(out, cfg.ambient_volume, err);
-    buffer_append(out, path, sizeof(path), err);
-    return end_chunk(out, ch, err);
-}
-
-bool json_vec3_or(Json* object, const char* key, Asura_Vector_3 fallback, Asura_Vector_3* out) {
-    Json* n = json_get(object, key);
-    if (!n) {
-        *out = fallback;
-        return true;
-    }
-    float v[3];
-    if (!json_floats(n, v, 3))
-        return false;
-    *out = {v[0], v[1], v[2]};
-    return true;
-}
-
-bool append_lite_json(Buffer* out, const char* path, Arena* scratch, Error* err) {
-    if (!path)
-        return true;
-    ArenaMark mark = arena_mark(scratch);
-    MappedFile f{};
-    if (!map_file(path, &f, err))
-        return false;
-    Json* root = json_parse(&f, scratch, err);
-    if (!root || root->kind != JsonKind::Object) {
-        unmap_file(&f);
-        return fail(err, "lite JSON root must be an object");
-    }
-    Json* lights = json_get(root, "lights");
-    uint32_t count = json_count(lights);
-    if (!count)
-        count = 1;
-    ChunkMark ch = begin_chunk(out, ASURA_CHUNK_LIGHTS, 5, 0, err);
-    append_u32(out, count, err);
-    Asura_Vector_3 a, b, c;
-    if (!json_vec3_or(root, "hdr_a", {80, 80, 80}, &a) || !json_vec3_or(root, "hdr_b", {.3f, .3f, .3f}, &b) ||
-        !json_vec3_or(root, "hdr_c", {130, 100, 50}, &c)) {
-        unmap_file(&f);
-        return fail(err, "LITE header vectors must contain three numbers");
-    }
-    buffer_append(out, &a, sizeof(a), err);
-    buffer_append(out, &b, sizeof(b), err);
-    buffer_append(out, &c, sizeof(c), err);
-    append_u32(out, static_cast<uint32_t>(json_integer(root, "hdr_c_flag", 1)), err);
-    Json fallback{};
-    fallback.kind = JsonKind::Object;
-    Json* it = count == 1 && json_count(lights) == 0 ? &fallback : lights->child;
-    for (uint32_t i = 0; i < count; ++i, it = it ? it->next : nullptr) {
-        if (!it || it->kind != JsonKind::Object) {
-            unmap_file(&f);
-            return fail(err, "LITE lights must be objects");
-        }
-        Asura_Light rec{};
-        Asura_Vector_3 colour{};
-        if (!json_vec3_or(it, "pos", {0, 0, 0}, &rec.Position) ||
-            !json_vec3_or(it, "dir", {0, 0, 0}, &rec.Direction) ||
-            !json_vec3_or(it, "color_rgb255", {255, 255, 255}, &colour) ||
-            !json_vec3_or(it, "repeat_pos", rec.Position, &rec.OldPosition)) {
-            unmap_file(&f);
-            return fail(err, "LITE vector must contain three numbers");
-        }
-        if (!json_get(it, "color_rgb255")) {
-            Json* cn = json_get(it, "color");
-            float cv[3];
-            if (cn && json_floats(cn, cv, 3)) {
-                colour = {cv[0], cv[1], cv[2]};
-                if (fmax(fabs(colour.x), fmax(fabs(colour.y), fabs(colour.z))) <= 1.000001f) {
-                    colour.x *= 255;
-                    colour.y *= 255;
-                    colour.z *= 255;
-                }
-            }
-        }
-        rec.R = colour.x;
-        rec.G = colour.y;
-        rec.B = colour.z;
-        rec.Brightness = static_cast<float>(json_number(it, "intensity", 2.5));
-        rec.Range = static_cast<float>(json_number(it, "radius", 1500));
-        rec.m_fInnerRange = static_cast<float>(json_number(it, "inner_range", 0));
-        rec.Angle = static_cast<float>(json_number(it, "cone_deg", 360));
-        rec.m_uFlags = static_cast<uint32_t>(json_integer(it, "flags", ASURA_LIGHT_FLAG_AFFECTS_ENTITIES));
-        rec.ShadowStrength = static_cast<float>(json_number(it, "shadow_strength", 0));
-        rec.OldPosition = rec.Position;
-        rec.OldRange = static_cast<float>(json_number(it, "old_range", rec.Range));
-        rec.HasChanged = json_boolean(it, "has_changed", false);
-        buffer_append(out, &rec, sizeof(rec), err);
-    }
-    const bool ok = end_chunk(out, ch, err);
-    unmap_file(&f);
-    arena_reset(scratch, mark);
-    return ok;
-}
-
-bool append_spawnpoints(Buffer* out, const char* path, Arena* scratch, Error* err) {
-    if (!path)
-        return true;
-    ArenaMark mark = arena_mark(scratch);
-    MappedFile f{};
-    if (!map_file(path, &f, err))
-        return false;
-    Json* root = json_parse(&f, scratch, err);
-    if (!root || root->kind != JsonKind::Array) {
-        unmap_file(&f);
-        return fail(err, "spawnpoints JSON root must be an array");
-    }
-    uint32_t i = 0;
-    for (Json* it = root->child; it; it = it->next, ++i) {
-        if (it->kind != JsonKind::Object) {
-            unmap_file(&f);
-            return fail(err, "spawnpoint %u is not an object", i);
-        }
-        Snipe_ServerEntity_SpawnPoint_ChunkDataV0 data{};
-        data.m_xPosition = {static_cast<float>(json_number(it, "x", NAN)),
-                            static_cast<float>(json_number(it, "y", NAN)),
-                            static_cast<float>(json_number(it, "z", NAN))};
-        if (!isfinite(data.m_xPosition.x) || !isfinite(data.m_xPosition.y) || !isfinite(data.m_xPosition.z)) {
-            unmap_file(&f);
-            return fail(err, "spawnpoint %u needs x/y/z", i);
-        }
-        const float yaw = static_cast<float>(json_number(it, "yaw", 0) * 3.14159265358979323846 / 180.0),
-                    pitch = static_cast<float>(json_number(it, "pitch", 0) * 3.14159265358979323846 / 180.0);
-        data.m_xDirection = {static_cast<float>(cos(pitch) * sin(yaw)), static_cast<float>(sin(pitch)),
-                             static_cast<float>(cos(pitch) * cos(yaw))};
-        data.m_xEntity.Guid = static_cast<uint32_t>(json_integer(it, "guid", kToolCreatedGuidFirst + i));
-        data.m_xEntity.Classification = SnipeEntityClass_SpawnPoint;
-        data.m_xEntity.m_usPadding =
-            static_cast<uint16_t>(json_integer(it, "entity_padding", json_integer(it, "u16_unk", 0)));
-        data.m_iSpawnIndex = static_cast<int32_t>(json_integer(it, "spawn_index", i));
-        data.m_iPosture = static_cast<int32_t>(json_integer(it, "posture", 0));
-        data.m_uTeamMask = static_cast<uint32_t>(json_integer(
-            it, "team_mask", json_integer(it, "team", SnipeSpawnTeam_Deathmatch)));
-        data.m_uGameModeMask = static_cast<uint32_t>(json_integer(
-            it, "game_mode_mask",
-            json_integer(it, "gamemode", SnipeSpawnGameMode_Deathmatch | SnipeSpawnGameMode_TeamDeathmatch)));
-        data.m_fSpawnTimer = 5.0f;
-        ChunkMark ch = begin_chunk(out, ASURA_CHUNK_ENTITY, 0, 0, err);
-        buffer_append(out, &data, sizeof(data), err);
-        end_chunk(out, ch, err);
-    }
-    if (!i) {
-        unmap_file(&f);
-        return fail(err, "spawnpoints JSON is empty");
-    }
-    unmap_file(&f);
-    arena_reset(scratch, mark);
-    return !err->set;
-}
-
-} // namespace
-
-namespace asura::level {
-
-Json* json_first(Json* object, const char* a, const char* b = nullptr, const char* c = nullptr,
-                 const char* d = nullptr) {
-    Json* n = json_get(object, a);
-    if (!n && b)
-        n = json_get(object, b);
-    if (!n && c)
-        n = json_get(object, c);
-    if (!n && d)
-        n = json_get(object, d);
-    return n;
-}
-bool json_array_or(Json* object, const char* a, const char* b, float* dst, uint32_t n, const float* defaults) {
-    Json* v = json_first(object, a, b);
-    if (!v) {
-        memcpy(dst, defaults, n * sizeof(float));
-        return true;
-    }
-    return json_floats(v, dst, n);
-}
-
-Str normalize_sound_name(Str raw, Arena* arena, Error* err) {
-    raw = str_trim(raw);
-    if (!raw.size) {
-        fail(err, "sound resource name is empty");
-        return {};
-    }
-    uint32_t sounds_at = 0xffffffffu;
-    for (uint32_t i = 0; i + 6 <= raw.size; ++i)
-        if (str_ieq({raw.data + i, 6}, str_lit("sounds")) &&
-            (i == 0 || raw.data[i - 1] == '\\' || raw.data[i - 1] == '/') &&
-            (i + 6 == raw.size || raw.data[i + 6] == '\\' || raw.data[i + 6] == '/')) {
-            sounds_at = i;
-            break;
-        }
-    const bool prefix = sounds_at == 0xffffffffu;
-    Str src = prefix ? raw : Str{raw.data + sounds_at, raw.size - sounds_at};
-    const uint32_t cap = src.size + (prefix ? 7 : 0) + 1;
-    char* p = arena_array<char>(arena, cap, err, false);
-    if (!p)
-        return {};
-    uint32_t at = 0;
-    if (prefix) {
-        memcpy(p, "sounds\\", 7);
-        at = 7;
-    }
-    bool slash = false;
-    for (uint32_t i = 0; i < src.size; ++i) {
-        char c = src.data[i] == '/' ? '\\' : src.data[i];
-        if (c == '\\') {
-            if (!at || slash)
-                continue;
-            slash = true;
-        } else
-            slash = false;
-        p[at++] = c;
-    }
-    while (at && p[at - 1] == '\\')
-        --at;
-    p[at] = 0;
-    return {p, at};
-}
-const char* json_relative_file(Str raw, const char* json_path, Arena* arena, Error* err) {
-    if (!raw.size)
-        return nullptr;
-    bool absolute = (raw.size >= 2 && raw.data[1] == ':') || raw.data[0] == '\\' || raw.data[0] == '/';
-    uint32_t dir_len = 0;
-    if (!absolute) {
-        const uint32_t n = static_cast<uint32_t>(strlen(json_path));
-        for (uint32_t i = 0; i < n; ++i)
-            if (json_path[i] == '\\' || json_path[i] == '/')
-                dir_len = i + 1;
-    }
-    char* p = arena_array<char>(arena, dir_len + raw.size + 1, err, false);
-    if (!p)
-        return nullptr;
-    if (dir_len)
-        memcpy(p, json_path, dir_len);
-    for (uint32_t i = 0; i < raw.size; ++i)
-        p[dir_len + i] = raw.data[i] == '/' ? '\\' : raw.data[i];
-    p[dir_len + raw.size] = 0;
-    return p;
-}
-
-bool load_sounds(const Config& cfg, Sounds* out, Arena* arena, Error* err) {
-    memset(out, 0, sizeof(*out));
-    if (!cfg.sounds_json)
-        return true;
-    MappedFile f{};
-    if (!map_file(cfg.sounds_json, &f, err))
-        return false;
-    Json* root = json_parse(&f, arena, err);
-    if (!root || root->kind != JsonKind::Array) {
-        unmap_file(&f);
-        return fail(err, "sounds JSON root must be an array");
-    }
-    const uint32_t count = json_count(root);
-    if (!count) {
-        unmap_file(&f);
-        return fail(err, "sounds JSON is empty");
-    }
-    SoundEntry* items = arena_array<SoundEntry>(arena, count, err);
-    if (!items) {
-        unmap_file(&f);
-        return false;
-    }
-    uint32_t next_id = 1, i = 0;
-    const float da[7] = {0, 0, 0, 1, 1, 1, 1}, db[6] = {5, 5, 5, 10, 10, 10}, dc[6] = {0, 0, 0, 0, 0, 0},
-                dd[4] = {0, 0, 0, 1};
-    for (Json* it = root->child; it; it = it->next, ++i) {
-        if (it->kind != JsonKind::Object) {
-            unmap_file(&f);
-            return fail(err, "sound %u is not an object", i);
-        }
-        SoundEntry& s = items[i];
-        s.emit_enti = json_boolean(it, "emit_enti", json_boolean(it, "with_enti", false));
-        const bool loop = json_boolean(it, "loop", !s.emit_enti);
-        s.active = json_boolean(
-            it, "active", json_boolean(it, "controller_active", json_boolean(it, "enabled", loop && s.emit_enti)));
-        float pos[3];
-        Json* pv = json_first(it, "pos", "position");
-        if (pv) {
-            if (!json_floats(pv, pos, 3)) {
-                unmap_file(&f);
-                return fail(err, "sound %u pos needs three numbers", i);
-            }
-            s.position = {pos[0], pos[1], pos[2]};
-        } else {
-            s.position = {static_cast<float>(json_number(it, "x", NAN)), static_cast<float>(json_number(it, "y", NAN)),
-                          static_cast<float>(json_number(it, "z", NAN))};
-            if (!isfinite(s.position.x) || !isfinite(s.position.y) || !isfinite(s.position.z)) {
-                unmap_file(&f);
-                return fail(err, "sound %u needs pos or x/y/z", i);
-            }
-        }
-        float dist[2];
-        Json* dv = json_first(it, "distance", "distances");
-        if (dv) {
-            if (!json_floats(dv, dist, 2)) {
-                unmap_file(&f);
-                return fail(err, "sound %u distance needs two numbers", i);
-            }
-            s.inner_radius = dist[0];
-            s.outer_radius = dist[1];
-        } else {
-            s.inner_radius = static_cast<float>(
-                json_number(it, "min_distance", json_number(it, "inner_radius", s.emit_enti ? 50 : 20)));
-            s.outer_radius = static_cast<float>(
-                json_number(it, "max_distance", json_number(it, "outer_radius", s.emit_enti ? 250 : 200)));
-        }
-        float cuboid[6], retrigger_box[6], orientation[4];
-        if (!json_array_or(it, "sound_params_a", "params_a", s.legacy_volume_parameters, 7, da) ||
-            !json_array_or(it, "sound_params_b", "params_b", cuboid, 6, db) ||
-            !json_array_or(it, "sound_params_c", "params_c", retrigger_box, 6, dc) ||
-            !json_array_or(it, "sound_params_d", "params_d", orientation, 4, dd)) {
-            unmap_file(&f);
-            return fail(err, "sound %u parameter array has the wrong length", i);
-        }
-        s.inner_cuboid_radius = {cuboid[0], cuboid[1], cuboid[2]};
-        s.outer_cuboid_radius = {cuboid[3], cuboid[4], cuboid[5]};
-        s.retrigger_bounding_box = {retrigger_box[0], retrigger_box[1], retrigger_box[2],
-                                    retrigger_box[3], retrigger_box[4], retrigger_box[5]};
-        s.orientation = {orientation[0], orientation[1], orientation[2], orientation[3]};
-        s.controller_guid =
-            static_cast<uint32_t>(json_integer(it, "controller_guid", json_integer(it, "guid", kSoundControllerGuidBase + i)));
-        s.controller_padding = static_cast<uint16_t>(json_integer(
-            it, "controller_padding", json_integer(it, "controller_u16_unk", json_integer(it, "u16_unk", 0x4974))));
-        s.phonon_guid = static_cast<uint32_t>(json_integer(it, "phonon_guid", kToolCreatedGuidFirst + i));
-        const uint32_t default_flags = ASURA_PHONON_FLAG_UNKNOWN_02 |
-                                       (s.emit_enti ? 0u : ASURA_PHONON_FLAG_STARTS_ACTIVE) |
-                                       (loop ? ASURA_PHONON_FLAG_REPEAT : 0u);
-        s.flags = static_cast<uint32_t>(json_integer(it, "flags", default_flags));
-        Json* id = json_get(it, "sound_id");
-        uint32_t requested = id ? static_cast<uint32_t>(json_integer(it, "sound_id", 0)) : 0;
-        if (!requested) {
-            Json* rid = json_first(it, "rscf_dummy", "resource_id", "resource_dummy");
-            if (rid)
-                requested = static_cast<uint32_t>(rid->kind == JsonKind::Number ? rid->number : 0);
-        }
-        s.sound_resource_id = requested ? requested : next_id++;
-        if (s.sound_resource_id >= next_id)
-            next_id = s.sound_resource_id + 1;
-        Json* name = json_first(it, "rscf_name", "sound_name", "name");
-        Json* file = json_first(it, "path", "file", "wav_path", "sound_path");
-        if (name && name->kind == JsonKind::String)
-            s.name = normalize_sound_name(name->string, arena, err);
-        else if (file && file->kind == JsonKind::String)
-            s.name = normalize_sound_name(file->string, arena, err);
-        if (file && file->kind == JsonKind::String)
-            s.file = json_relative_file(file->string, cfg.sounds_json, arena, err);
-        if (!s.name.size && !id) {
-            unmap_file(&f);
-            return fail(err, "sound %u needs sound_id, resource name, or file", i);
-        }
-        if (err->set) {
-            unmap_file(&f);
-            return false;
-        }
-    }
-    out->items = items;
-    out->count = count;
-    unmap_file(&f);
-    return true;
-}
-
 bool append_sound_resources(Buffer* out, const Sounds& s, Arena* scratch, Error* err) {
     for (uint32_t i = 0; i < s.count; ++i)
         if (s.items[i].file) {
             if (!file_exists(s.items[i].file))
                 return fail(err, "sound file not found: %s", s.items[i].file);
             if (!append_file_rscf(out, s.items[i].name, ASURA_RESOURCEFILE_TYPE_SOUND, s.items[i].sound_resource_id,
-                                  s.items[i].file, scratch, false, err))
+                                  s.items[i].file, scratch, err))
                 return false;
         }
     return true;
@@ -2836,123 +1567,3 @@ bool append_sound_entities(Buffer* out, const Sounds& s, Error* err) {
 }
 
 } // namespace
-
-#ifndef ASURA_CONSTRUCT_NO_MAIN
-using namespace asura::level;
-
-int main(int argc, char** argv) {
-    Error err{};
-    Config cfg{};
-    if (!parse_cli(argc, argv, &cfg, &err)) {
-        if (err.set)
-            console_format(true, "error: %s\n", err.message);
-        return 2;
-    }
-    Arena arena{}, scratch{};
-    Buffer output{}, env_payload{};
-    MappedFile obj_file{};
-    MaterialMap material_map{};
-    ObjData obj{};
-    EnvBuild env{};
-    EnvView view{};
-    ShadeSource shade{};
-    Sounds sounds{};
-    TextureSet textures{};
-    ModuleMetric* metrics = nullptr;
-    const char* lite = nullptr;
-    bool lite_found = false;
-    uint32_t modules = 0;
-    int result = 1;
-    if (!arena_init(&arena, cfg.arena_reserve, &err) || !arena_init(&scratch, cfg.arena_reserve, &err) ||
-        !buffer_init(&output, cfg.output_reserve, &err))
-        goto done;
-    if (!map_file(cfg.obj, &obj_file, &err))
-        goto done;
-    if (!parse_obj(&obj_file, &obj, &arena, &err))
-        goto done;
-    if (!load_material_map(cfg, &material_map, &arena, &err))
-        goto done;
-    if (!load_shade_source(cfg, obj, &shade, &arena, &scratch, &err))
-        goto done;
-    if (!build_env(cfg, obj, material_map, shade.count ? &shade : nullptr, &arena, &scratch, &env, &err))
-        goto done;
-    env_payload = env.payload;
-    if (!env_view(env_payload, &view, &arena, &err))
-        goto done;
-    if (view.module_count > kMaxAabbTreeObjects) {
-        fail(&err, "generated Env has %u modules; the 2005 AABB tree supports at most %u", view.module_count,
-             kMaxAabbTreeObjects);
-        goto done;
-    }
-    if (!view.module_count) {
-        fail(&err, "generated Env has no modules");
-        goto done;
-    }
-    modules = view.module_count;
-    metrics = arena_array<ModuleMetric>(&arena, modules, &err);
-    if (!metrics)
-        goto done;
-    if (!load_sounds(cfg, &sounds, &arena, &err))
-        goto done;
-    buffer_append(&output, kAsuraMagic, sizeof(kAsuraMagic), &err);
-    if (!append_fnfo(&output, &err) || !append_rsfl(&output, cfg, &scratch, &err))
-        goto done;
-    if (!append_weapon_support(&output, cfg, &scratch, &err) || !append_sky_resources(&output, cfg, &scratch, &err))
-        goto done;
-    if (!append_textures(&output, cfg, view, material_map, &arena, &scratch, &textures, &err))
-        goto done;
-    if (!append_rscf(&output, str_from_c(cfg.env_name), ASURA_RESOURCEFILE_TYPE_PLATFORMSPECIFIC,
-                     ASURA_RESOURCEFILE_TYPE_PC_ENVIRONMENT, env_payload.base,
-                     static_cast<uint32_t>(env_payload.size), &err))
-        goto done;
-    if (!append_filtered_rscf(&output, cfg, &scratch, &err) ||
-        !append_sound_resources(&output, sounds, &scratch, &err) || !append_ambient(&output, cfg, &err))
-        goto done;
-    lite =
-        cfg.lite_from_pc
-            ? cfg.lite_from_pc
-            : (cfg.smsg_from_pc ? cfg.smsg_from_pc
-                                : (cfg.import_tex_from_pc ? cfg.import_tex_from_pc
-                                                          : (cfg.rsfl_from_pc ? cfg.rsfl_from_pc : cfg.rscf_from_pc)));
-    if (lite && !append_first_cid(&output, lite, ASURA_CHUNK_LIGHTS, &scratch, false, &lite_found, &err))
-        goto done;
-    if (!lite_found && cfg.lite_json && !append_lite_json(&output, cfg.lite_json, &scratch, &err))
-        goto done;
-    if (cfg.rscf_bootstrap_name &&
-        !append_rscf_zero(&output, str_from_c(cfg.rscf_bootstrap_name), ASURA_RESOURCEFILE_TYPE_PLATFORMSPECIFIC,
-                          cfg.rscf_bootstrap_subtype, cfg.rscf_bootstrap_payload_size, &err))
-        goto done;
-    if (!append_phon(&output, sounds, &err) ||
-        !append_emod(&output, view, modules, cfg, material_map, &scratch, metrics, &err) ||
-        !append_mlin(&output, metrics, modules, &err) ||
-        !append_mrvb(&output, modules, &err) ||
-        !append_nav1(&output, modules, &err))
-        goto done;
-    if (!append_smsg_boot(&output, cfg.smsg_from_pc, &scratch, &err) ||
-        !append_filtered_enti(&output, cfg, &scratch, &err) || !append_sound_entities(&output, sounds, &err) ||
-        !append_spawnpoints(&output, cfg.spawnpoints_json, &scratch, &err))
-        goto done;
-    if (!append_skyb(&output, &err) || !append_fog(&output, &err) || !append_wthr(&output, &err) ||
-        buffer_append(&output, nullptr, sizeof(Asura_Chunk_Header), &err) == ~0ull)
-        goto done;
-    if (!write_entire_file(cfg.out, output.base, output.size, &err))
-        goto done;
-    console_format(false, "Wrote: %s (%llu bytes, %u Env modules, %u strips)\n", cfg.out,
-                   static_cast<unsigned long long>(output.size), view.module_count, env.strip_count);
-    console_write("MLIN: all-to-all\n");
-    for (uint32_t i = 0; i < modules; ++i)
-        console_format(false, "  module %u: collision vertices=%u, triangles=%u, links=%u\n", i,
-                       metrics[i].vertex_count, metrics[i].triangle_count, metrics[i].link_count);
-    result = 0;
-done:
-    if (result && err.set)
-        console_format(true, "error: %s\n", err.message);
-    unmap_file(&material_map.file);
-    unmap_file(&obj_file);
-    buffer_release(&env_payload);
-    buffer_release(&output);
-    arena_release(&scratch);
-    arena_release(&arena);
-    return result;
-}
-#endif

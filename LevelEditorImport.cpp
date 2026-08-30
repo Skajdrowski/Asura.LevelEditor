@@ -12,11 +12,9 @@ bool load_preview_mesh(const std::string& path, const std::string& material_map_
     ObjData obj{};
     MaterialMap materials{};
     Config cfg{};
-    char editor_arg[] = "LevelEditor";
-    char out_arg[] = "preview.pc";
-    char* args[] = {editor_arg, const_cast<char*>(path.c_str()), out_arg};
     bool ok = arena_init(&arena, sizeof(void*) == 4 ? 256 * MiB : 2 * GiB, &err) &&
-              parse_cli(3, args, &cfg, &err) && map_file(path.c_str(), &file, &err) &&
+              initialize_editor_config(path.c_str(), &cfg, &err) &&
+              map_file(path.c_str(), &file, &err) &&
               parse_obj(&file, &obj, &arena, &err);
     cfg.material_map = material_map_path.empty() ? nullptr : material_map_path.c_str();
     if (ok)

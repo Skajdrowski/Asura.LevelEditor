@@ -1114,9 +1114,7 @@ bool pack_document(Document& doc, const char* output_path, std::string* why) {
     }
     Error err{};
     Config cfg{};
-    char editor_arg[] = "LevelEditor";
-    char* args[] = {editor_arg, const_cast<char*>(doc.obj_path.c_str()), const_cast<char*>(output_path)};
-    if (!parse_cli(3, args, &cfg, &err)) {
+    if (!initialize_editor_config(doc.obj_path.c_str(), &cfg, &err)) {
         if (why)
             *why = err.message;
         return false;
@@ -1134,7 +1132,6 @@ bool pack_document(Document& doc, const char* output_path, std::string* why) {
     ObjData obj{};
     EnvBuild env{};
     EnvView view{};
-    ShadeSource shade{};
     Sounds sounds{};
     TextureSet textures{};
     ModuleMetric* metrics = nullptr;
@@ -1145,8 +1142,7 @@ bool pack_document(Document& doc, const char* output_path, std::string* why) {
     if (ok)
         ok = buffer_init(&output, cfg.output_reserve, &err) &&
              load_material_map(cfg, &material_map, &arena, &err) &&
-             load_shade_source(cfg, obj, &shade, &arena, &scratch, &err) &&
-             build_env(cfg, obj, material_map, shade.count ? &shade : nullptr, &arena, &scratch, &env, &err);
+             build_env(cfg, obj, material_map, &arena, &scratch, &env, &err);
     if (ok) {
         env_payload = env.payload;
         ok = env_view(env_payload, &view, &arena, &err) && view.module_count &&
@@ -1160,7 +1156,7 @@ bool pack_document(Document& doc, const char* output_path, std::string* why) {
     }
     if (ok) {
         buffer_append(&output, kAsuraMagic, sizeof(kAsuraMagic), &err);
-        ok = append_fnfo(&output, &err) && append_rsfl(&output, cfg, &scratch, &err) &&
+        ok = append_fnfo(&output, &err) && append_rsfl(&output, &err) &&
              append_weapon_support(&output, cfg, &scratch, &err) &&
              append_static_object_support(&output, doc, nullptr, &err) &&
              append_sky_resources(&output, cfg, &scratch, &err) &&

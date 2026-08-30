@@ -68,52 +68,18 @@ struct ChunkMark {
 
 struct Config {
     const char* obj;
-    const char* out;
     const char* env_name;
-    const char* axis_map;
-    bool flip_x, flip_y, flip_z;
+    bool flip_y, flip_z;
     bool allow_unknown_materials;
     uint32_t diffuse_abgr;
-    bool force_material;
-    uint32_t force_material_index;
     uint32_t max_prim_count;
     uint32_t max_collision_polys;
     float auto_block_xz_cell;
-    float module_pad_min;
-    float module_pad_scale;
     const char* material_map;
     const char* texture_dir;
     const char* texture_prefix;
     const char* sky_texture_dir;
-    Str sky_flip_faces;
-    const char* import_tex_from_pc;
-    const char* import_mtrl_from_pc;
-    const char* rsfl_from_pc;
-    Str rsfl_names;
-    const char* smsg_from_pc;
-    const char* lite_from_pc;
-    const char* lite_json;
-    const char* enti_from_pc;
-    bool enti_keep_spawnpoints;
-    Str enti_types;
-    const char* rscf_from_pc;
-    Str rscf_types;
-    Str rscf_name_filter;
-    Str rscf_names;
-    uint32_t rscf_skip;
-    bool rscf_limit_set;
-    uint32_t rscf_limit;
-    const char* rscf_bootstrap_name;
-    uint32_t rscf_bootstrap_subtype;
-    uint32_t rscf_bootstrap_payload_size;
     const char* weapon_from_pc;
-    const char* spawnpoints_json;
-    const char* sounds_json;
-    const char* ambient_stream_path;
-    float ambient_volume;
-    const char* shade_from;
-    const char* shade_align_from_obj;
-    Asura_Vector_3 shade_offset;
     uint64_t arena_reserve;
     uint64_t output_reserve;
 };
@@ -139,7 +105,7 @@ struct ObjData {
 };
 
 struct VertexKey {
-    uint32_t v, vt, vn, shade_material;
+    uint32_t v, vt, vn;
 };
 
 struct MaterialMap {
@@ -161,25 +127,6 @@ struct EnvView {
     uint32_t module_count, strip_count, block_count;
     const uint8_t** blocks;
     uint32_t* block_sizes;
-};
-
-struct ShadeSample {
-    Asura_Vector_3 position, normal;
-    uint32_t color, material;
-};
-
-struct ShadeBucket {
-    int32_t x, y, z;
-    uint32_t head;
-    uint8_t used;
-};
-
-struct ShadeSource {
-    ShadeSample* samples;
-    uint32_t* next;
-    ShadeBucket* buckets;
-    uint32_t count, bucket_mask;
-    float cell_size;
 };
 
 struct ModuleMetric {
@@ -225,7 +172,7 @@ bool append_chunk_copy(Buffer* out, const ChunkRef& chunk, Error* err);
 bool append_rscf(Buffer* out, Str name, uint32_t type, uint32_t subtype, const void* payload,
                  uint32_t payload_size, Error* err);
 
-bool parse_cli(int argc, char** argv, Config* out, Error* err);
+bool initialize_editor_config(const char* obj_path, Config* out, Error* err);
 Asura_Vector_3 transform_vec(Asura_Vector_3 value, const Config& config);
 bool transform_reverses_winding(const Config& config);
 bool parse_obj(MappedFile* file, ObjData* out, Arena* arena, Error* err);
@@ -236,14 +183,12 @@ bool resolve_material(const MaterialMap& materials, Str name, bool allow_unknown
 Str material_texture_name(const MaterialMap& materials, uint32_t material_ordinal);
 uint32_t material_override(const MaterialMap& materials, const char* section, uint32_t material_ordinal,
                            uint32_t fallback);
-bool load_shade_source(const Config& config, const ObjData& target, ShadeSource* out, Arena* arena,
-                       Arena* scratch, Error* err);
 bool build_env(const Config& config, const ObjData& obj, const MaterialMap& materials,
-               const ShadeSource* shade, Arena* arena, Arena* scratch, EnvBuild* out, Error* err);
+               Arena* arena, Arena* scratch, EnvBuild* out, Error* err);
 bool env_view(const Buffer& payload, EnvView* out, Arena* arena, Error* err);
 
 bool append_fnfo(Buffer* out, Error* err);
-bool append_rsfl(Buffer* out, const Config& config, Arena* scratch, Error* err);
+bool append_rsfl(Buffer* out, Error* err);
 bool append_weapon_support(Buffer* out, const Config& config, Arena* scratch, Error* err);
 bool append_sky_resources(Buffer* out, const Config& config, Arena* scratch, Error* err);
 bool append_textures(Buffer* out, const Config& config, const EnvView& env, const MaterialMap& materials,
@@ -256,7 +201,6 @@ bool append_mlin(Buffer* out, ModuleMetric* metrics, uint32_t module_count, Erro
 bool append_mrvb(Buffer* out, uint32_t module_count, Error* err);
 bool append_nav1(Buffer* out, uint32_t module_count, Error* err);
 bool append_sound_entities(Buffer* out, const Sounds& sounds, Error* err);
-bool append_skyb(Buffer* out, Error* err);
 bool append_fog(Buffer* out, Error* err);
 bool append_wthr(Buffer* out, Error* err);
 bool text_name_matches_resource(Str text, Str resource);

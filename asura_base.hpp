@@ -22,32 +22,6 @@ struct Error {
     char message[2048];
 };
 
-inline void console_write(const char *text, bool error_stream = false) {
-    HANDLE handle = GetStdHandle(error_stream ? STD_ERROR_HANDLE : STD_OUTPUT_HANDLE);
-    if (!text || handle == nullptr || handle == INVALID_HANDLE_VALUE)
-        return;
-    const char *at = text;
-    uint64_t left = strlen(text);
-    while (left) {
-        const DWORD ask = left > 0x7fffffffull ? 0x7fffffffu : static_cast<DWORD>(left);
-        DWORD wrote = 0;
-        if (!WriteFile(handle, at, ask, &wrote, nullptr) || !wrote)
-            return;
-        at += wrote;
-        left -= wrote;
-    }
-}
-
-inline void console_format(bool error_stream, const char *fmt, ...) {
-    char buffer[4096];
-    va_list ap;
-    va_start(ap, fmt);
-    const int n = vsnprintf(buffer, sizeof(buffer), fmt, ap);
-    va_end(ap);
-    buffer[n < 0 ? 0 : (n < static_cast<int>(sizeof(buffer)) ? n : static_cast<int>(sizeof(buffer)) - 1)] = 0;
-    console_write(buffer, error_stream);
-}
-
 inline bool fail(Error *err, const char *fmt, ...) {
     if (err && !err->set) {
         err->set = true;
