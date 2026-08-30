@@ -3013,9 +3013,12 @@ void command_export_material_map() {
     Arena arena{};
     ChunkList chunks{};
     std::vector<PcEnvironmentMaterialBinding> materials;
+    std::vector<uint32_t> collision_flags;
     bool ok = arena_init(&arena, 8 * MiB, &err) &&
               parse_chunks(g.document.source_pc_path.c_str(), &chunks, &arena, &err) &&
-              pc_environment_material_bindings(chunks, &materials, &err);
+              pc_environment_material_bindings(chunks, &materials, &err) &&
+              pc_environment_collision_flags(chunks, static_cast<uint32_t>(materials.size()),
+                                             &collision_flags, &err);
 
     std::string out = "{\n";
     if (ok && !materials.empty()) {
@@ -3047,10 +3050,25 @@ void command_export_material_map() {
             snprintf(line, sizeof(line), "    \"%zu\": %u%s\n", i, materials[i].surface_type, i + 1 == materials.size() ? "" : ",");
             out += line;
         }
+        out += "  },\n";
+
+        out += "  \"collision_flags\": {\n";
+        for (size_t i = 0; i < materials.size(); ++i) {
+            char line[256];
+            snprintf(line, sizeof(line), "    \"%zu\": %u%s\n", i, collision_flags[i],
+                     i + 1 == materials.size() ? "" : ",");
+            out += line;
+        }
         out += "  }\n";
     }
     unmap_file(&chunks.file);
     arena_release(&arena);
+
+    if (!ok) {
+        MessageBoxA(g.window, err.set ? err.message : "Failed to export material map.",
+                    "Error", MB_ICONERROR);
+        return;
+    }
 
     out += "}\n";
 
@@ -3641,7 +3659,7 @@ void create_skybox_properties_controls(SkyboxPropertiesState* state) {
         SendMessageA(state->paths[i], EM_SETLIMITTEXT, 4096, 0);
     }
 
-    make_skybox_control(state, "STATIC", "Clearing path 6 and 7 disables clouds animation.", SS_LEFT,
+    make_skybox_control(state, "STATIC", "Clearing cloud paths disables clouds animation.", SS_LEFT,
                         0, 14, 359, 332, 22);
     state->version_6 = make_skybox_control(state, "BUTTON", "SKYB format version 6",
                                             BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP,
@@ -3656,7 +3674,7 @@ void create_skybox_properties_controls(SkyboxPropertiesState* state) {
         state, "BUTTON", "Right texture is left upside down", BS_AUTOCHECKBOX | WS_TABSTOP,
         ID_SKYBOX_RIGHT_FLIPPED, 366, 386, 346, 24);
     make_skybox_control(state, "STATIC",
-                        "Both target formats render the same cube; v7 only adds the right-face mapping flag.",
+                        "Both target SKYB versions render the same skybox; v7 only adds the right-face mapping flag.",
                         SS_LEFT, 0, 14, 414, 760, 20);
     make_skybox_control(state, "STATIC", "Preview resources", SS_LEFT, 0, 14, 438, 112, 22);
     state->preview_folder = make_skybox_control(state, "EDIT", "", ES_AUTOHSCROLL | WS_BORDER | ES_READONLY,

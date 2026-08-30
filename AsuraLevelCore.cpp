@@ -10,7 +10,6 @@ namespace asura::level {
 // traversal frames (28 bytes each) and returned object IDs (4 bytes each).
 // Keep a complete module query comfortably below that workspace limit.
 constexpr uint32_t kDefaultMaxCollisionPolys = 3000;
-constexpr uint16_t kCollisionPolyFlagBulletIgnore = 0x240; // material map 'collision_flags'
 
 bool parse_chunks(const char* path, ChunkList* out, Arena* arena, Error* err) {
     memset(out, 0, sizeof(*out));

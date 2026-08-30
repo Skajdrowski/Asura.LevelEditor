@@ -25,6 +25,12 @@ bool pc_environment_material_bindings(
     std::vector<PcEnvironmentMaterialBinding>* materials,
     asura::Error* err);
 
+bool pc_environment_collision_flags(
+    const asura::level::ChunkList& chunks,
+    uint32_t material_count,
+    std::vector<uint32_t>* flags,
+    asura::Error* err);
+
 DirectX::XMFLOAT4 material_map_color(uint32_t key);
 Asura_Vector_3 oriented_box_dimensions(const Entity& entity);
 

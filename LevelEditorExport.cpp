@@ -1,5 +1,7 @@
 #include "LevelEditorInternal.h"
 
+#include <unordered_map>
+
 using namespace asura;
 using namespace asura::level;
 
@@ -1314,6 +1316,163 @@ bool pc_environment_material_bindings(const ChunkList& chunks,
     }
     if (!reached_environment)
         return fail(err, "the PC environment resource is absent from the chunk stream");
+    return true;
+}
+
+bool advance_pc_padded_string(const ChunkRef& chunk, uint64_t* at, Error* err) {
+    if (*at >= chunk.size)
+        return fail(err, "the PC EMOD string table is truncated");
+    const Str value = padded_string_at(chunk.data, chunk.size, static_cast<uint32_t>(*at));
+    if (!value.data)
+        return fail(err, "the PC EMOD string table is unterminated");
+    const uint64_t padded_size = align_up(static_cast<uint64_t>(value.size) + 1, 4);
+    if (padded_size > chunk.size - *at)
+        return fail(err, "the PC EMOD string padding exceeds its chunk");
+    *at += padded_size;
+    return true;
+}
+
+bool pc_environment_collision_flags(const ChunkList& chunks, uint32_t material_count,
+                                    std::vector<uint32_t>* output, Error* err) {
+    output->assign(material_count, 0);
+    const ChunkRef* module_list = nullptr;
+    for (uint32_t i = 0; i < chunks.count; ++i) {
+        if (chunks.chunks[i].cid == ASURA_CHUNK_ENVIRONMENT_MODULELIST) {
+            module_list = &chunks.chunks[i];
+            break;
+        }
+    }
+    if (!module_list)
+        return fail(err, "the .PC contains no EMOD collision data");
+
+    // SniperElite.exe's Asura_Chunk_Environment_ModuleList::Process
+    // (MCP2 0x43B5F0) embeds sized collision meshes starting with EMOD v6.
+    if (module_list->version != 6)
+        return fail(err, "the PC EMOD collision table uses unsupported version %u",
+                    module_list->version);
+    if (module_list->size < sizeof(Asura_Chunk_Environment_ModuleList))
+        return fail(err, "the PC EMOD collision table is truncated");
+
+    const uint32_t module_count =
+        read_u32(module_list->data + offsetof(Asura_Chunk_Environment_ModuleList,
+                                              m_iNumberOfModules));
+    uint64_t at = sizeof(Asura_Chunk_Environment_ModuleList);
+    if (!advance_pc_padded_string(*module_list, &at, err))
+        return false;
+
+    std::vector<std::unordered_map<uint16_t, uint32_t>> frequencies(material_count);
+    for (uint32_t module_index = 0; module_index < module_count; ++module_index) {
+        if (!advance_pc_padded_string(*module_list, &at, err))
+            return false;
+        if (at > module_list->size ||
+            sizeof(Asura_Chunk_Environment_ModuleList_EntryV6) > module_list->size - at)
+            return fail(err, "the PC EMOD module %u is truncated", module_index);
+
+        const uint8_t* entry = module_list->data + at;
+        const uint32_t collision_size = read_u32(
+            entry + offsetof(Asura_Chunk_Environment_ModuleList_EntryV6,
+                             m_uCollisionDataSize));
+        at += sizeof(Asura_Chunk_Environment_ModuleList_EntryV6);
+        if (collision_size > module_list->size - at)
+            return fail(err, "the PC EMOD module %u collision mesh is truncated", module_index);
+        const uint8_t* collision = module_list->data + at;
+        at += collision_size;
+        if (!collision_size)
+            continue;
+        if (collision_size < sizeof(uint32_t))
+            return fail(err, "the PC EMOD module %u collision version is truncated", module_index);
+
+        // MCP2's collision-mesh constructor at 0x4367C0 accepts versions 0-3.
+        // Only v2 and v3 serialize material IDs, so older meshes cannot
+        // contribute to a material-indexed collision_flags table.
+        const uint32_t version = read_u32(collision);
+        if (version > 3)
+            return fail(err, "the PC EMOD module %u uses unsupported collision version %u",
+                        module_index, version);
+        if (version < 2)
+            continue;
+
+        const uint32_t fixed_size = version == 2 ? 56u : 52u;
+        if (collision_size < fixed_size)
+            return fail(err, "the PC EMOD module %u collision header is truncated", module_index);
+        const uint32_t vertex_count = read_u32(collision + 4);
+        const uint32_t polygon_count = read_u32(collision + 8);
+        const bool has_polygon_flags = read_u32(collision + 12) != 0;
+        const bool has_polygon_materials = read_u32(collision + 16) != 0;
+        const uint16_t overall_flags = version == 2
+                                           ? static_cast<uint16_t>(read_u32(collision + 20))
+                                           : read_u16(collision + 20);
+        const uint16_t overall_material = version == 2
+                                              ? static_cast<uint16_t>(read_u32(collision + 24))
+                                              : read_u16(collision + 22);
+        const uint32_t item_size = version == 2 ? sizeof(uint32_t) : sizeof(uint16_t);
+
+        uint64_t arrays_at = fixed_size;
+        const uint64_t vertex_bytes = static_cast<uint64_t>(vertex_count) * 12;
+        const uint64_t polygon_bytes = static_cast<uint64_t>(polygon_count) * 8;
+        if (vertex_bytes > collision_size - arrays_at)
+            return fail(err, "the PC EMOD module %u collision vertices are truncated", module_index);
+        arrays_at += vertex_bytes;
+        if (polygon_bytes > collision_size - arrays_at)
+            return fail(err, "the PC EMOD module %u collision polygons are truncated", module_index);
+        arrays_at += polygon_bytes;
+
+        const uint64_t polygon_array_bytes = static_cast<uint64_t>(polygon_count) * item_size;
+        const uint64_t flags_at = arrays_at;
+        if (has_polygon_flags) {
+            if (polygon_array_bytes > collision_size - arrays_at)
+                return fail(err, "the PC EMOD module %u collision flags are truncated", module_index);
+            arrays_at += polygon_array_bytes;
+        }
+        const uint64_t materials_at = arrays_at;
+        if (has_polygon_materials && polygon_array_bytes > collision_size - arrays_at)
+            return fail(err, "the PC EMOD module %u collision materials are truncated", module_index);
+
+        for (uint32_t polygon = 0; polygon < polygon_count; ++polygon) {
+            const uint16_t flags = !has_polygon_flags
+                                       ? overall_flags
+                                       : version == 2
+                                             ? static_cast<uint16_t>(read_u32(
+                                                   collision + flags_at +
+                                                   static_cast<uint64_t>(polygon) * item_size))
+                                             : read_u16(collision + flags_at +
+                                                        static_cast<uint64_t>(polygon) * item_size);
+            const uint16_t material = !has_polygon_materials
+                                          ? overall_material
+                                          : version == 2
+                                                ? static_cast<uint16_t>(read_u32(
+                                                      collision + materials_at +
+                                                      static_cast<uint64_t>(polygon) * item_size))
+                                                : read_u16(collision + materials_at +
+                                                           static_cast<uint64_t>(polygon) * item_size);
+            if (material == 0xffff)
+                continue;
+            const uint32_t ordinal = material >= 1000
+                                         ? static_cast<uint32_t>(material) - 1000
+                                         : material;
+            if (ordinal < material_count)
+                ++frequencies[ordinal][flags];
+        }
+    }
+    if (at != module_list->size)
+        return fail(err, "the PC EMOD collision table has %llu trailing bytes",
+                    static_cast<unsigned long long>(module_list->size - at));
+
+    // Retail collision flags may vary polygon-by-polygon even when polygons
+    // share a render material. collision_flags is material-level, so choose
+    // the mode: it exactly preserves the largest possible number of source
+    // polygons. Prefer the lower mask on a tie for deterministic output.
+    for (uint32_t material = 0; material < material_count; ++material) {
+        uint32_t best_count = 0;
+        uint16_t best_flags = 0;
+        for (const auto& [flags, count] : frequencies[material]) {
+            if (count > best_count || (count == best_count && flags < best_flags)) {
+                best_count = count;
+                best_flags = flags;
+            }
+        }
+        (*output)[material] = best_flags;
+    }
     return true;
 }
 
