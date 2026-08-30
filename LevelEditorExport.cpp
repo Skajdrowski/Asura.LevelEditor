@@ -1125,6 +1125,10 @@ bool pack_document(Document& doc, const char* output_path, std::string* why) {
     cfg.texture_dir = doc.texture_dir.empty() ? nullptr : doc.texture_dir.c_str();
     cfg.weapon_from_pc = doc.weapons_donor.empty() ? nullptr : doc.weapons_donor.c_str();
     cfg.sky_texture_dir = doc.sky_texture_dir.empty() ? nullptr : doc.sky_texture_dir.c_str();
+    for (uint32_t slot = 0; slot < ASURA_SKYBOX_V5_V7_TEXTURE_PATH_COUNT; ++slot)
+        cfg.sky_texture_paths[slot] = doc.skybox.texture_paths[slot].empty()
+                                           ? nullptr
+                                           : doc.skybox.texture_paths[slot].c_str();
     cfg.allow_unknown_materials = doc.material_map.empty();
 
     Arena arena{}, scratch{};

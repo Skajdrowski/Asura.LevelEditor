@@ -88,9 +88,9 @@ struct SkyboxSettings {
     float green = 230.0f;
     float blue = 200.0f;
     float orientation_radians = 3.107175588607788f;
-    std::array<std::string, ASURA_SKYBOX_V5_V7_TEXTURE_PATH_COUNT> texture_paths{
-        "", "\\sky\\fr.tga", "\\sky\\lf.tga", "\\sky\\bk.tga", "\\sky\\rt.tga",
-        "\\sky\\up.tga", "\\sky\\ch_04_sky.bmp", "\\sky\\ch_04_sky.bmp"};
+    // New documents acquire extensionless target resource names by scanning
+    // the selected sky folder. Imported levels retain their serialized names.
+    std::array<std::string, ASURA_SKYBOX_V5_V7_TEXTURE_PATH_COUNT> texture_paths{};
     bool draw_clouds = true;
     // These are independent target compatibility flags, not SKYB versions.
     // Retail v7 levels legitimately contain either flag, both, or neither.

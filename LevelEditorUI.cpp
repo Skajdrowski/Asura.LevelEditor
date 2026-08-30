@@ -3602,6 +3602,11 @@ void refresh_skybox_folder_text(SkyboxPropertiesState* state) {
                    state->texture_directory.empty() ? "Embedded/source resources" : state->texture_directory.c_str());
 }
 
+void refresh_skybox_path_text(SkyboxPropertiesState* state) {
+    for (uint32_t slot = 0; slot < ASURA_SKYBOX_V5_V7_TEXTURE_PATH_COUNT; ++slot)
+        SetWindowTextA(state->paths[slot], state->value.texture_paths[slot].c_str());
+}
+
 void refresh_skybox_version_controls(SkyboxPropertiesState* state) {
     const bool version_7 =
         SendMessageA(state->version_7, BM_GETCHECK, 0, 0) == BST_CHECKED;
@@ -3667,8 +3672,7 @@ void create_skybox_properties_controls(SkyboxPropertiesState* state) {
     set_float(state->green, state->value.green);
     set_float(state->blue, state->value.blue);
     set_float(state->orientation, state->value.orientation_radians);
-    for (int i = 0; i < static_cast<int>(_countof(state->paths)); ++i)
-        SetWindowTextA(state->paths[i], state->value.texture_paths[i].c_str());
+    refresh_skybox_path_text(state);
     SendMessageA(state->version_6, BM_SETCHECK,
                  state->value.chunk_version == 6 ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageA(state->version_7, BM_SETCHECK,
@@ -3720,8 +3724,16 @@ LRESULT CALLBACK skybox_properties_proc(HWND hwnd, UINT message, WPARAM wparam, 
         } else if (LOWORD(wparam) == ID_SKYBOX_PREVIEW_FOLDER) {
             std::string path = state->texture_directory;
             if (choose_directory(hwnd, "Choose skybox texture folder", &path)) {
-                state->texture_directory = std::move(path);
-                refresh_skybox_folder_text(state);
+                SkyboxTextureScan scan{};
+                std::string why;
+                if (!scan_skybox_texture_folder(path, &scan, &why)) {
+                    MessageBoxA(hwnd, why.c_str(), "Could not scan skybox textures", MB_ICONWARNING);
+                } else {
+                    state->texture_directory = std::move(path);
+                    state->value.texture_paths = std::move(scan.texture_paths);
+                    refresh_skybox_folder_text(state);
+                    refresh_skybox_path_text(state);
+                }
             }
         } else if (LOWORD(wparam) == ID_SKYBOX_USE_EMBEDDED) {
             state->texture_directory.clear();

@@ -1302,25 +1302,56 @@ bool append_sky_resources(Buffer* out, const Config& cfg, Arena* scratch, Error*
     Vec<DiskFile> disk_files{};
     if (!list_files(cfg.sky_texture_dir, scratch, &disk_files, err))
         return false;
-    struct SkyFaceFile {
-        const char* stem;
+
+    const auto hash_stem = [](Str path) {
+        Str stem = path_basename(path);
+        for (uint32_t i = 0; i < stem.size; ++i)
+            if (stem.data[i] == '.') {
+                stem.size = i;
+                break;
+            }
+        return stem;
     };
-    const SkyFaceFile faces[] = {{"fr"}, {"lf"}, {"bk"},
-                                 {"rt"}, {"up"}, {"ch_04_sky"}};
-    for (const SkyFaceFile& face : faces) {
+    Str emitted[ASURA_SKYBOX_V5_V7_TEXTURE_PATH_COUNT]{};
+    uint32_t emitted_count = 0;
+    for (uint32_t slot = 0; slot < ASURA_SKYBOX_V5_V7_TEXTURE_PATH_COUNT; ++slot) {
+        if (!cfg.sky_texture_paths[slot])
+            continue;
+        const Str wanted = hash_stem(str_from_c(cfg.sky_texture_paths[slot]));
+        if (!wanted.size)
+            continue;
+        bool already_emitted = false;
+        for (uint32_t i = 0; i < emitted_count; ++i)
+            already_emitted |= str_ieq(wanted, emitted[i]);
+        if (already_emitted)
+            continue;
+
         const DiskFile* source = nullptr;
-        for (uint32_t i = 0; i < disk_files.count; ++i)
-            if (str_ieq(path_stem(str_from_c(disk_files.data[i].name)), str_from_c(face.stem))) {
+        for (uint32_t i = 0; i < disk_files.count; ++i) {
+            if (!str_ieq(hash_stem(str_from_c(disk_files.data[i].name)), wanted))
+                continue;
+            MappedFile file{};
+            if (!map_file(disk_files.data[i].path, &file, err))
+                return false;
+            const bool dds = file.size >= 4 && memcmp(file.data, "DDS ", 4) == 0;
+            unmap_file(&file);
+            if (dds) {
                 source = &disk_files.data[i];
                 break;
             }
+        }
         if (!source)
-            continue;
+            return fail(err, "no DDS payload in the sky texture folder matches SKYB resource '%.*s'",
+                        static_cast<int>(wanted.size), wanted.data);
         char name[256];
-        snprintf(name, sizeof(name), "\\graphics\\sky\\%s", face.stem);
+        const int written = snprintf(name, sizeof(name), "\\graphics\\sky\\%.*s",
+                                     static_cast<int>(wanted.size), wanted.data);
+        if (written < 0 || written >= static_cast<int>(sizeof(name)))
+            return fail(err, "SKYB resource name is too long");
         if (!append_file_rscf(out, str_from_c(name), ASURA_RESOURCEFILE_TYPE_TEXTURE, 0,
                               source->path, scratch, err))
             return false;
+        emitted[emitted_count++] = wanted;
     }
     arena_reset(scratch, files_mark);
     return true;

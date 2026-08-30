@@ -79,6 +79,7 @@ struct Config {
     const char* texture_dir;
     const char* texture_prefix;
     const char* sky_texture_dir;
+    const char* sky_texture_paths[ASURA_SKYBOX_V5_V7_TEXTURE_PATH_COUNT];
     const char* weapon_from_pc;
     uint64_t arena_reserve;
     uint64_t output_reserve;

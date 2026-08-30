@@ -8,6 +8,14 @@
 
 namespace editor {
 
+struct SkyboxTextureScan {
+    // Physical DDS payload selected for each SKYB slot.
+    std::array<std::string, ASURA_SKYBOX_V5_V7_TEXTURE_PATH_COUNT> source_paths{};
+    // Extensionless target resource paths derived from the discovered files.
+    std::array<std::string, ASURA_SKYBOX_V5_V7_TEXTURE_PATH_COUNT> texture_paths{};
+    uint32_t file_count = 0;
+};
+
 bool gpu_ready();
 bool gpu_has_skybox_cloud();
 bool gpu_has_rain_texture();
@@ -17,6 +25,8 @@ void gpu_set_environment_wet_weather(bool enabled);
 bool gpu_reload_environment_textures(std::string* why = nullptr,
                                      uint32_t* loaded_count = nullptr,
                                      uint32_t* missing_count = nullptr);
+bool scan_skybox_texture_folder(const std::string& directory, SkyboxTextureScan* scan,
+                                std::string* why);
 bool gpu_load_skybox(const std::string& directory, std::string* why);
 bool gpu_load_pc_skybox(const std::string& pc_path, const SkyboxSettings& settings,
                         std::string* why);

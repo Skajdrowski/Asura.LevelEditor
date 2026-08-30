@@ -1,5 +1,7 @@
 #include "LevelEditorInternal.h"
 
+#include <initializer_list>
+
 using namespace asura;
 using namespace asura::level;
 
@@ -797,53 +799,220 @@ bool gpu_reload_environment_textures(std::string* why, uint32_t* loaded_count,
     return (!use_external_textures && !g.document.source_pc_path.empty()) ? (ok && pc_loaded) : ok;
 }
 
-bool find_skybox_texture(const std::string& directory, const char* stem, char* output, uint32_t output_size) {
+namespace {
+
+struct SkyboxTextureCandidate {
+    std::string source_path;
+    std::string target_stem;
+    int semantic_slot = -1;
+    bool assigned = false;
+};
+
+std::string lowercase_ascii(std::string value) {
+    for (char& c : value)
+        if (c >= 'A' && c <= 'Z')
+            c = static_cast<char>(c - 'A' + 'a');
+    return value;
+}
+
+bool skybox_name_has_token(const std::string& stem, const char* wanted) {
+    size_t at = 0;
+    while (at < stem.size()) {
+        while (at < stem.size() && !((stem[at] >= 'a' && stem[at] <= 'z') ||
+                                     (stem[at] >= '0' && stem[at] <= '9')))
+            ++at;
+        const size_t begin = at;
+        while (at < stem.size() && ((stem[at] >= 'a' && stem[at] <= 'z') ||
+                                    (stem[at] >= '0' && stem[at] <= '9')))
+            ++at;
+        if (stem.compare(begin, at - begin, wanted) == 0)
+            return true;
+    }
+    return false;
+}
+
+int skybox_semantic_slot(const std::string& raw_stem) {
+    const std::string stem = lowercase_ascii(raw_stem);
+    const auto has = [&stem](std::initializer_list<const char*> names) {
+        for (const char* name : names)
+            if (skybox_name_has_token(stem, name))
+                return true;
+        return false;
+    };
+    // SKYB slots are lower, front, left, back, right, upper, cloud A/B.
+    // Directional aliases are only a convenience; unrecognised DDS names are
+    // still assigned deterministically below.
+    if (has({"bottom", "down", "dn", "lower", "ny"}))
+        return 0;
+    if (has({"front", "forward", "fr", "ft", "pz"}))
+        return 1;
+    if (has({"left", "lf", "lt", "nx"}))
+        return 2;
+    if (has({"back", "backward", "rear", "bk", "nz"}))
+        return 3;
+    if (has({"right", "rt", "px"}))
+        return 4;
+    if (has({"upper", "top", "up", "py"}))
+        return 5;
+    if (stem.find("cloud") != std::string::npos ||
+        (skybox_name_has_token(stem, "ch") && skybox_name_has_token(stem, "sky")))
+        return 6;
+    return -1;
+}
+
+void assign_skybox_candidate(SkyboxTextureScan* scan, uint32_t slot,
+                             SkyboxTextureCandidate* candidate) {
+    scan->source_paths[slot] = candidate->source_path;
+    scan->texture_paths[slot] = "\\sky\\" + candidate->target_stem;
+    candidate->assigned = true;
+}
+
+} // namespace
+
+bool scan_skybox_texture_folder(const std::string& directory, SkyboxTextureScan* scan,
+                                std::string* why) {
+    if (!scan) {
+        if (why)
+            *why = "No skybox scan destination was supplied.";
+        return false;
+    }
+    *scan = {};
+    if (directory.empty()) {
+        if (why)
+            *why = "No skybox texture folder was selected.";
+        return false;
+    }
     char search[MAX_PATH * 4]{};
     if (!join_path(search, sizeof(search), directory.c_str(), str_from_c("*")))
-        return false;
+        return why ? (*why = "The skybox texture folder path is too long.", false) : false;
     WIN32_FIND_DATAA entry{};
     HANDLE find = FindFirstFileA(search, &entry);
-    if (find == INVALID_HANDLE_VALUE)
+    if (find == INVALID_HANDLE_VALUE) {
+        if (why)
+            *why = "Could not scan the selected skybox texture folder.";
         return false;
-    char first_matching_file[MAX_PATH * 4]{};
-    bool found = false;
+    }
+    std::vector<SkyboxTextureCandidate> candidates;
     do {
         if (entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
-            continue;
-        std::string name = entry.cFileName;
-        const size_t dot = name.find_last_of('.');
-        if (dot != std::string::npos)
-            name.resize(dot);
-        if (_stricmp(name.c_str(), stem) != 0)
             continue;
         char candidate[MAX_PATH * 4]{};
         if (!join_path(candidate, sizeof(candidate), directory.c_str(), str_from_c(entry.cFileName)))
             continue;
-        if (!first_matching_file[0])
-            strncpy_s(first_matching_file, candidate, _TRUNCATE);
         std::ifstream file(candidate, std::ios::binary);
         char magic[4]{};
         file.read(magic, sizeof(magic));
-        if (file.gcount() == sizeof(magic) && memcmp(magic, "DDS ", sizeof(magic)) == 0) {
-            strncpy_s(output, output_size, candidate, _TRUNCATE);
-            found = true;
-            break;
+        if (file.gcount() != sizeof(magic) || memcmp(magic, "DDS ", sizeof(magic)) != 0)
+            continue;
+        std::string target_stem = entry.cFileName;
+        // MCP2's resource hash stops at the first dot. Use that same basename
+        // for generated SKYB/RSCF names so extensions (including fake .tga or
+        // .bmp suffixes on DDS payloads) never participate in the lookup.
+        const size_t dot = target_stem.find('.');
+        if (dot != std::string::npos)
+            target_stem.resize(dot);
+        if (target_stem.empty())
+            continue;
+        const auto duplicate = std::find_if(
+            candidates.begin(), candidates.end(), [&target_stem](const SkyboxTextureCandidate& existing) {
+                return _stricmp(existing.target_stem.c_str(), target_stem.c_str()) == 0;
+            });
+        if (duplicate != candidates.end()) {
+            FindClose(find);
+            if (why)
+                *why = "Two DDS files have the same target basename (extensions are ignored): " +
+                       target_stem;
+            return false;
         }
+        candidates.push_back({candidate, target_stem, skybox_semantic_slot(target_stem)});
     } while (FindNextFileA(find, &entry));
     FindClose(find);
-    if (!found && first_matching_file[0]) {
-        strncpy_s(output, output_size, first_matching_file, _TRUNCATE);
-        found = true;
+    std::sort(candidates.begin(), candidates.end(), [](const SkyboxTextureCandidate& a,
+                                                       const SkyboxTextureCandidate& b) {
+        const int order = _stricmp(a.target_stem.c_str(), b.target_stem.c_str());
+        return order < 0 || (order == 0 && a.target_stem < b.target_stem);
+    });
+    if (candidates.empty()) {
+        if (why)
+            *why = "The selected folder contains no files with DDS payloads.";
+        return false;
     }
-    return found;
+    if (candidates.size() > ASURA_SKYBOX_V5_V7_TEXTURE_PATH_COUNT) {
+        if (why)
+            *why = "The selected folder contains more than eight DDS textures; use a folder containing only one skybox.";
+        return false;
+    }
+    scan->file_count = static_cast<uint32_t>(candidates.size());
+
+    bool slot_used[ASURA_SKYBOX_V5_V7_TEXTURE_PATH_COUNT]{};
+    for (SkyboxTextureCandidate& candidate : candidates) {
+        if (candidate.semantic_slot < 0 || candidate.semantic_slot >= 6 ||
+            slot_used[candidate.semantic_slot])
+            continue;
+        assign_skybox_candidate(scan, static_cast<uint32_t>(candidate.semantic_slot), &candidate);
+        slot_used[candidate.semantic_slot] = true;
+    }
+    for (SkyboxTextureCandidate& candidate : candidates) {
+        if (candidate.assigned || candidate.semantic_slot != 6)
+            continue;
+        const uint32_t slot = !slot_used[6] ? 6u : 7u;
+        if (slot_used[slot])
+            continue;
+        assign_skybox_candidate(scan, slot, &candidate);
+        slot_used[slot] = true;
+    }
+
+    size_t remaining = 0;
+    for (const SkyboxTextureCandidate& candidate : candidates)
+        remaining += !candidate.assigned;
+    size_t free_non_lower_faces = 0;
+    for (uint32_t slot = 1; slot < 6; ++slot)
+        free_non_lower_faces += !slot_used[slot];
+    const bool need_lower_face = !slot_used[0] && remaining > free_non_lower_faces;
+    std::vector<uint32_t> free_slots;
+    if (need_lower_face)
+        free_slots.push_back(0);
+    for (uint32_t slot = 1; slot < 6; ++slot)
+        if (!slot_used[slot])
+            free_slots.push_back(slot);
+    if (!need_lower_face && !slot_used[0])
+        free_slots.push_back(0);
+    for (uint32_t slot = 6; slot < ASURA_SKYBOX_V5_V7_TEXTURE_PATH_COUNT; ++slot)
+        if (!slot_used[slot])
+            free_slots.push_back(slot);
+
+    size_t free_index = 0;
+    for (SkyboxTextureCandidate& candidate : candidates) {
+        if (candidate.assigned)
+            continue;
+        if (free_index >= free_slots.size()) {
+            if (why)
+                *why = "Could not assign every discovered DDS texture to a SKYB slot.";
+            return false;
+        }
+        assign_skybox_candidate(scan, free_slots[free_index++], &candidate);
+    }
+    // The target exposes two independently scrolling cloud slots. Reusing one
+    // discovered cloud in both slots preserves the common single-cloud setup.
+    if (!scan->source_paths[6].empty() && scan->source_paths[7].empty()) {
+        scan->source_paths[7] = scan->source_paths[6];
+        scan->texture_paths[7] = scan->texture_paths[6];
+    }
+    return true;
 }
 
-std::string skybox_texture_stem(const std::string& path) {
+std::string skybox_texture_hash_stem(const std::string& path) {
     if (path.empty())
         return {};
     const Str source{path.data(), static_cast<uint32_t>(path.size())};
-    const Str stem = path_stem(path_basename(source));
-    return {stem.data, stem.size};
+    const Str name = path_basename(source);
+    uint32_t length = name.size;
+    for (uint32_t i = 0; i < name.size; ++i)
+        if (name.data[i] == '.') {
+            length = i;
+            break;
+        }
+    return {name.data, length};
 }
 
 bool gpu_rebuild_skybox_vertices(float orientation, bool back_texture_is_front_upside_down,
@@ -863,44 +1032,55 @@ bool gpu_load_skybox(const std::string& directory, std::string* why) {
                                      g.document.skybox.back_texture_is_front_upside_down,
                                      g.document.skybox.right_texture_is_left_upside_down, why))
         return false;
+    SkyboxTextureScan scan{};
+    if (!scan_skybox_texture_folder(directory, &scan, why))
+        return false;
     gpu.skybox_tint = {1, 1, 1, 1};
-    // Resolve exactly the document's path stems. Empty SKYB slots are
-    // intentional, so substituting default names here would make clearing a
-    // path in the properties window leave the old-looking face rendered.
+    bool has_explicit_paths = false;
+    for (const std::string& texture_path : g.document.skybox.texture_paths)
+        has_explicit_paths |= !texture_path.empty();
+    const auto source_for = [&scan](const std::string& texture_path) -> const std::string* {
+        const std::string wanted = skybox_texture_hash_stem(texture_path);
+        if (wanted.empty())
+            return nullptr;
+        for (uint32_t candidate = 0; candidate < ASURA_SKYBOX_V5_V7_TEXTURE_PATH_COUNT; ++candidate) {
+            if (_stricmp(skybox_texture_hash_stem(scan.texture_paths[candidate]).c_str(), wanted.c_str()) == 0)
+                return &scan.source_paths[candidate];
+        }
+        return nullptr;
+    };
     ID3D11ShaderResourceView* next[6]{};
     ID3D11ShaderResourceView* next_cloud = nullptr;
     uint32_t found = 0;
     for (uint32_t slot = 0; slot < _countof(next); ++slot) {
-        std::string stem = skybox_texture_stem(g.document.skybox.texture_paths[slot]);
-        if (stem.empty())
-            continue;
-        char path[MAX_PATH * 4]{};
-        if (!find_skybox_texture(directory, stem.c_str(), path, sizeof(path)))
+        const std::string* source = has_explicit_paths
+                                        ? source_for(g.document.skybox.texture_paths[slot])
+                                        : &scan.source_paths[slot];
+        if (!source || source->empty())
             continue;
         ++found;
-        if (!gpu_create_dds_view(path, &next[slot], why)) {
+        if (!gpu_create_dds_view(source->c_str(), &next[slot], why)) {
             for (ID3D11ShaderResourceView*& face : next)
                 gpu_release(face);
             return false;
         }
     }
     for (uint32_t slot = 6; slot < ASURA_SKYBOX_V5_V7_TEXTURE_PATH_COUNT && !next_cloud; ++slot) {
-        std::string stem = skybox_texture_stem(g.document.skybox.texture_paths[slot]);
-        if (stem.empty())
+        const std::string* source = has_explicit_paths
+                                        ? source_for(g.document.skybox.texture_paths[slot])
+                                        : &scan.source_paths[slot];
+        if (!source || source->empty())
             continue;
-        char cloud_path[MAX_PATH * 4]{};
-        if (find_skybox_texture(directory, stem.c_str(), cloud_path, sizeof(cloud_path))) {
-            ++found;
-            if (!gpu_create_dds_view(cloud_path, &next_cloud, why)) {
-                for (ID3D11ShaderResourceView*& face : next)
-                    gpu_release(face);
-                return false;
-            }
+        ++found;
+        if (!gpu_create_dds_view(source->c_str(), &next_cloud, why)) {
+            for (ID3D11ShaderResourceView*& face : next)
+                gpu_release(face);
+            return false;
         }
     }
     if (!found) {
         if (why)
-            *why = "The selected folder contains no DDS files matching the SKYB path basenames.";
+            *why = "The selected folder contains DDS files, but none match the editable SKYB resource names.";
         return false;
     }
     for (uint32_t i = 0; i < _countof(next); ++i)
