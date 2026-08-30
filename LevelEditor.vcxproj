@@ -102,21 +102,31 @@
   <ItemGroup>
     <ClCompile Include="Construct.cpp" />
     <ClCompile Include="LevelEditor.cpp" />
+    <ClCompile Include="LevelEditorExport.cpp" />
     <ClCompile Include="LevelEditorGeometry.cpp" />
     <ClCompile Include="LevelEditorHistory.cpp" />
+    <ClCompile Include="LevelEditorImport.cpp" />
     <ClCompile Include="LevelEditorRaycast.cpp" />
+    <ClCompile Include="LevelEditorRendering.cpp" />
     <ClCompile Include="LevelEditorProject.cpp" />
+    <ClCompile Include="LevelEditorUI.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="AsuraEnums.h" />
     <ClInclude Include="AsuraLevelCore.h" />
     <ClInclude Include="AsuraStructs.h" />
     <ClInclude Include="asura_base.hpp" />
+    <ClInclude Include="LevelEditorAppState.h" />
     <ClInclude Include="LevelEditorDocument.h" />
+    <ClInclude Include="LevelEditorExport.h" />
     <ClInclude Include="LevelEditorGeometry.h" />
     <ClInclude Include="LevelEditorHistory.h" />
+    <ClInclude Include="LevelEditorImport.h" />
+    <ClInclude Include="LevelEditorInternal.h" />
     <ClInclude Include="LevelEditorRaycast.h" />
     <ClInclude Include="LevelEditorProject.h" />
+    <ClInclude Include="LevelEditorRendering.h" />
+    <ClInclude Include="LevelEditorUI.h" />
     <ClInclude Include="resource.h" />
   </ItemGroup>
   <ItemGroup>
