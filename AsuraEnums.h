@@ -297,22 +297,18 @@ enum ASURA_ENTITY_CLASSIFICATION : int32_t {
     AsuraEntityClass_ProjectSpecific = 0x8000
 };
 
-// Project-specific classification used by Sniper Elite 2005. The target's
-// source assertions identify this class as Snipe_ServerEntity_SpawnPoint.
+// Project-specific classification used by Sniper Elite 2005
 enum SNIPE_ENTITY_CLASSIFICATION_2005 : uint16_t {
     SnipeEntityClass_StaticObject = 0x7,
     SnipeEntityClass_Pickup = 0x8,
     SnipeEntityClass_SpawnPoint = 0x803A,
     SnipeEntityClass_BuildingVolume = 0x804D,
     SnipeEntityClass_AssassinationTarget = 0x804F,
-    SnipeEntityClass_PositionMarker = 0x8052
+    SnipeEntityClass_PositionMarker = 0x8052 // Assasination extract point
 };
 
 // Bit masks serialized by Snipe_ServerEntity_SpawnPoint v0.  The target's
-// SupportsTeam switch maps actor teams to these four bits.  The first three
-// names also match the retail spawn records and editor character resources.
-// The public semantic name of actor-team zero is unresolved, so that remaining
-// mask is named for the exact switch input rather than guessed.
+// SupportsTeam switch maps actor teams to these four bits.
 enum SNIPE_SPAWN_TEAM_MASK_2005 : uint32_t {
     SnipeSpawnTeam_Deathmatch = 0x01,
     SnipeSpawnTeam_German = 0x02,
@@ -355,6 +351,7 @@ enum SNIPE_ITEM_ID_2005 : uint8_t {
     SnipeItem_DP28 = 0x1B,
     SnipeItem_TimeBomb = 0x1C,
     SnipeItem_Panzerschreck = 0x1D,
+    SnipeItem_TripWire = 0x1E,
     SnipeItem_PanzerschreckAmmo = 0x26
 };
 

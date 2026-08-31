@@ -281,6 +281,7 @@ const char* snipe_item_name(uint32_t item_id) {
     case SnipeItem_DP28: return "DP 28";
     case SnipeItem_TimeBomb: return "Time Bomb";
     case SnipeItem_Panzerschreck: return "Panzerschreck";
+    case SnipeItem_TripWire: return "Trip-wire grenade";
     case SnipeItem_PanzerschreckAmmo: return "Panzerschreck Ammo";
     default: return nullptr;
     }
