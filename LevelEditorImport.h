@@ -34,6 +34,14 @@ const asura::level::RscfInfo* find_pc_environment(const asura::level::ChunkList&
 bool decode_pc_environment(const asura::level::RscfInfo& resource, Mesh* mesh,
                            asura::Arena* arena, asura::Error* err);
 
+const asura::level::RscfInfo* find_ps2_environment(const asura::level::ChunkList& chunks,
+                                                   asura::level::RscfInfo* storage);
+bool decode_ps2_environment(const asura::level::RscfInfo& resource, Mesh* mesh,
+                            asura::Error* err);
+bool decode_ps2_tim2(const uint8_t* bytes, uint32_t byte_count, uint32_t* width,
+                     uint32_t* height, std::vector<uint8_t>* rgba,
+                     asura::Error* err);
+
 bool load_static_object_donors(const std::vector<std::string>& paths,
                                std::vector<StaticObjectTemplate>* templates,
                                std::vector<StaticObjectModel>* models,
@@ -59,9 +67,19 @@ struct PcSkyboxInfo {
 
 bool pc_skybox_info(const asura::level::ChunkList& chunks, PcSkyboxInfo* info,
                     asura::Error* err);
+bool ps2_skybox_info(const asura::level::ChunkList& chunks, PcSkyboxInfo* info,
+                     asura::Error* err);
 
 bool load_pc_level(const std::string& path, Document* document, Mesh* mesh,
                    std::string* why, std::vector<PickupModel>* pickup_models = nullptr,
                    std::vector<StaticObjectModel>* object_models = nullptr);
+bool load_ps2_level(const std::string& path, Document* document, Mesh* mesh,
+                    std::string* why,
+                    std::vector<StaticObjectModel>* object_models = nullptr);
+
+bool decode_ps2_static_object_models(const asura::level::ChunkList& chunks,
+                                     const Document& document,
+                                     std::vector<StaticObjectModel>* models,
+                                     asura::Error* err);
 
 } // namespace editor

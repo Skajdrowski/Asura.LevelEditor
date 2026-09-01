@@ -30,6 +30,8 @@ bool scan_skybox_texture_folder(const std::string& directory, SkyboxTextureScan*
 bool gpu_load_skybox(const std::string& directory, std::string* why);
 bool gpu_load_pc_skybox(const std::string& pc_path, const SkyboxSettings& settings,
                         std::string* why);
+bool gpu_load_ps2_skybox(const std::string& ps2_path, const SkyboxSettings& settings,
+                         std::string* why);
 bool gpu_rebuild_skybox_vertices(float orientation, bool back_texture_is_front_upside_down,
                                  bool right_texture_is_left_upside_down, std::string* why);
 bool gpu_init(HWND viewport);

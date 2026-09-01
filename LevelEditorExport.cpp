@@ -284,8 +284,11 @@ void make_pickup_body(const Entity& entity, std::array<uint8_t, kPickupBodySize>
 }
 
 bool append_editor_pickups(Buffer* out, const Document& doc, Error* err) {
+    const size_t source_dot = doc.source_pc_path.find_last_of('.');
+    const bool ps2_source = source_dot != std::string::npos &&
+                            _stricmp(doc.source_pc_path.c_str() + source_dot, ".ps2") == 0;
     for (const Entity& entity : doc.entities) {
-        if (entity.kind != EntityKind::Pickup || entity.source_entity_record)
+        if (entity.kind != EntityKind::Pickup || (entity.source_entity_record && !ps2_source))
             continue;
         if (!entity.pickup_has_template)
             return fail(err, "pickup '%s' has no resolved item asset profile", entity.name.c_str());
@@ -323,8 +326,11 @@ void make_static_object_body(const Entity& entity,
 }
 
 bool append_editor_static_objects(Buffer* out, const Document& doc, Error* err) {
+    const size_t source_dot = doc.source_pc_path.find_last_of('.');
+    const bool ps2_source = source_dot != std::string::npos &&
+                            _stricmp(doc.source_pc_path.c_str() + source_dot, ".ps2") == 0;
     for (const Entity& entity : doc.entities) {
-        if (entity.kind != EntityKind::StaticObject || entity.source_entity_record)
+        if (entity.kind != EntityKind::StaticObject || (entity.source_entity_record && !ps2_source))
             continue;
         if (!entity.static_object_has_template)
             return fail(err, "Object '%s' has no resolved asset profile", entity.name.c_str());
@@ -696,6 +702,10 @@ bool append_pc_material_map_override(Buffer* out, const ChunkList& source,
                                      const char* material_map_path, Arena* arena, Error* err);
 bool pc_environment_material_chunk_indices(const ChunkList& source, uint32_t* text_chunk_index,
                                            uint32_t* material_chunk_index, Error* err);
+bool append_ps2_static_object_support(Buffer* out, const Document& document,
+                                      const ChunkList& source,
+                                      std::vector<uint32_t>* object_ids,
+                                      std::vector<uint32_t>* shape_ids, Error* err);
 
 bool contains_u32(const std::vector<uint32_t>& values, uint32_t value) {
     return std::find(values.begin(), values.end(), value) != values.end();
@@ -752,7 +762,9 @@ bool static_text_references(const ChunkRef& chunk, Str resource_name) {
 }
 
 bool append_static_object_support(Buffer* out, const Document& document,
-                                  const ChunkList* existing, Error* err) {
+                                  const ChunkList* existing,
+                                  const std::vector<uint32_t>* provided_objects,
+                                  const std::vector<uint32_t>* provided_shapes, Error* err) {
     std::vector<uint32_t> required_roots;
     for (const Entity& entity : document.entities) {
         if (entity.kind != EntityKind::StaticObject)
@@ -775,6 +787,10 @@ bool append_static_object_support(Buffer* out, const Document& document,
 
     std::vector<uint32_t> present_objects, present_shapes;
     std::vector<std::string> present_textures;
+    if (provided_objects)
+        present_objects = *provided_objects;
+    if (provided_shapes)
+        present_shapes = *provided_shapes;
     if (existing) {
         for (uint32_t i = 0; i < existing->count; ++i) {
             const ChunkRef& chunk = existing->chunks[i];
@@ -981,7 +997,7 @@ bool pack_pc_document(const Document& doc, const char* output_path, std::string*
     auto write_object_support = [&]() {
         if (!wrote_object_support) {
             wrote_object_support = true;
-            ok = ok && append_static_object_support(&output, doc, &source, &err);
+            ok = ok && append_static_object_support(&output, doc, &source, nullptr, nullptr, &err);
         }
     };
     auto write_entities = [&]() {
@@ -1092,11 +1108,824 @@ bool pack_pc_document(const Document& doc, const char* output_path, std::string*
     return ok;
 }
 
-bool pack_document(Document& doc, const char* output_path, std::string* why) {
+struct Ps2ConvertedDdsPixelFormat {
+    uint32_t size;
+    uint32_t flags;
+    uint32_t four_cc;
+    uint32_t rgb_bit_count;
+    uint32_t r_mask;
+    uint32_t g_mask;
+    uint32_t b_mask;
+    uint32_t a_mask;
+};
+
+struct Ps2ConvertedDdsHeader {
+    uint32_t size;
+    uint32_t flags;
+    uint32_t height;
+    uint32_t width;
+    uint32_t pitch_or_linear_size;
+    uint32_t depth;
+    uint32_t mip_count;
+    uint32_t reserved[11];
+    Ps2ConvertedDdsPixelFormat pixel_format;
+    uint32_t caps;
+    uint32_t caps2;
+    uint32_t caps3;
+    uint32_t caps4;
+    uint32_t reserved2;
+};
+
+static_assert(sizeof(Ps2ConvertedDdsHeader) == 124);
+
+uint16_t dds_rgb565(const uint8_t* colour) {
+    return static_cast<uint16_t>(((colour[0] * 31u + 127u) / 255u) << 11u |
+                                 ((colour[1] * 63u + 127u) / 255u) << 5u |
+                                 ((colour[2] * 31u + 127u) / 255u));
+}
+
+void dds_expand_rgb565(uint16_t packed, uint8_t* colour) {
+    colour[0] = static_cast<uint8_t>(((packed >> 11u) & 31u) * 255u / 31u);
+    colour[1] = static_cast<uint8_t>(((packed >> 5u) & 63u) * 255u / 63u);
+    colour[2] = static_cast<uint8_t>((packed & 31u) * 255u / 31u);
+}
+
+uint32_t dds_colour_distance(const uint8_t* a, const uint8_t* b) {
+    const int32_t red = static_cast<int32_t>(a[0]) - b[0];
+    const int32_t green = static_cast<int32_t>(a[1]) - b[1];
+    const int32_t blue = static_cast<int32_t>(a[2]) - b[2];
+    return static_cast<uint32_t>(red * red + green * green + blue * blue);
+}
+
+void dds_compress_colour_block(const uint8_t pixels[16][4], bool allow_transparency,
+                               uint8_t* output) {
+    bool transparent = false;
+    uint32_t opaque_count = 0;
+    for (uint32_t pixel = 0; pixel < 16; ++pixel) {
+        transparent |= allow_transparency && pixels[pixel][3] < 128u;
+        opaque_count += !allow_transparency || pixels[pixel][3] >= 128u;
+    }
+
+    uint32_t endpoint_a = 0;
+    uint32_t endpoint_b = 0;
+    uint32_t greatest_distance = 0;
+    for (uint32_t a = 0; a < 16; ++a) {
+        if (allow_transparency && pixels[a][3] < 128u)
+            continue;
+        for (uint32_t b = a + 1; b < 16; ++b) {
+            if (allow_transparency && pixels[b][3] < 128u)
+                continue;
+            const uint32_t distance = dds_colour_distance(pixels[a], pixels[b]);
+            if (distance > greatest_distance) {
+                greatest_distance = distance;
+                endpoint_a = a;
+                endpoint_b = b;
+            }
+        }
+    }
+
+    uint16_t colour0 = opaque_count ? dds_rgb565(pixels[endpoint_a]) : 0u;
+    uint16_t colour1 = opaque_count ? dds_rgb565(pixels[endpoint_b]) : 0u;
+    if (transparent) {
+        if (colour0 > colour1)
+            std::swap(colour0, colour1);
+    } else {
+        if (colour0 < colour1)
+            std::swap(colour0, colour1);
+        if (colour0 == colour1) {
+            if (colour0 < 0xffffu)
+                ++colour0;
+            else
+                --colour1;
+        }
+    }
+
+    uint8_t palette[4][3]{};
+    dds_expand_rgb565(colour0, palette[0]);
+    dds_expand_rgb565(colour1, palette[1]);
+    if (colour0 > colour1) {
+        for (uint32_t channel = 0; channel < 3; ++channel) {
+            palette[2][channel] = static_cast<uint8_t>((2u * palette[0][channel] + palette[1][channel]) / 3u);
+            palette[3][channel] = static_cast<uint8_t>((palette[0][channel] + 2u * palette[1][channel]) / 3u);
+        }
+    } else {
+        for (uint32_t channel = 0; channel < 3; ++channel)
+            palette[2][channel] = static_cast<uint8_t>((palette[0][channel] + palette[1][channel]) / 2u);
+    }
+
+    uint32_t indices = 0;
+    for (uint32_t pixel = 0; pixel < 16; ++pixel) {
+        uint32_t best = transparent && pixels[pixel][3] < 128u ? 3u : 0u;
+        if (best != 3u) {
+            uint32_t best_distance = ~0u;
+            const uint32_t colour_count = colour0 > colour1 ? 4u : 3u;
+            for (uint32_t candidate = 0; candidate < colour_count; ++candidate) {
+                const uint32_t distance = dds_colour_distance(pixels[pixel], palette[candidate]);
+                if (distance < best_distance) {
+                    best_distance = distance;
+                    best = candidate;
+                }
+            }
+        }
+        indices |= best << (pixel * 2u);
+    }
+    output[0] = static_cast<uint8_t>(colour0);
+    output[1] = static_cast<uint8_t>(colour0 >> 8u);
+    output[2] = static_cast<uint8_t>(colour1);
+    output[3] = static_cast<uint8_t>(colour1 >> 8u);
+    for (uint32_t byte = 0; byte < 4; ++byte)
+        output[4 + byte] = static_cast<uint8_t>(indices >> (byte * 8u));
+}
+
+void dds_compress_alpha_block(const uint8_t pixels[16][4], uint8_t* output) {
+    uint8_t alpha0 = 0;
+    uint8_t alpha1 = 255;
+    for (uint32_t pixel = 0; pixel < 16; ++pixel) {
+        alpha0 = std::max(alpha0, pixels[pixel][3]);
+        alpha1 = std::min(alpha1, pixels[pixel][3]);
+    }
+    if (alpha0 == alpha1) {
+        if (alpha0)
+            --alpha1;
+        else
+            ++alpha0;
+    }
+    uint8_t palette[8]{alpha0, alpha1};
+    if (alpha0 > alpha1) {
+        for (uint32_t i = 1; i <= 6; ++i)
+            palette[i + 1] = static_cast<uint8_t>(((7u - i) * alpha0 + i * alpha1) / 7u);
+    } else {
+        for (uint32_t i = 1; i <= 4; ++i)
+            palette[i + 1] = static_cast<uint8_t>(((5u - i) * alpha0 + i * alpha1) / 5u);
+        palette[6] = 0;
+        palette[7] = 255;
+    }
+    uint64_t indices = 0;
+    for (uint32_t pixel = 0; pixel < 16; ++pixel) {
+        uint32_t best = 0;
+        uint32_t best_distance = ~0u;
+        for (uint32_t candidate = 0; candidate < 8; ++candidate) {
+            const int32_t delta = static_cast<int32_t>(pixels[pixel][3]) - palette[candidate];
+            const uint32_t distance = static_cast<uint32_t>(delta * delta);
+            if (distance < best_distance) {
+                best_distance = distance;
+                best = candidate;
+            }
+        }
+        indices |= static_cast<uint64_t>(best) << (pixel * 3u);
+    }
+    output[0] = alpha0;
+    output[1] = alpha1;
+    for (uint32_t byte = 0; byte < 6; ++byte)
+        output[2 + byte] = static_cast<uint8_t>(indices >> (byte * 8u));
+}
+
+void dds_compress_mip(const std::vector<uint8_t>& rgba, uint32_t width, uint32_t height,
+                      bool dxt5, std::vector<uint8_t>* output) {
+    const uint32_t blocks_x = std::max(1u, (width + 3u) / 4u);
+    const uint32_t blocks_y = std::max(1u, (height + 3u) / 4u);
+    const uint32_t block_size = dxt5 ? 16u : 8u;
+    const size_t start = output->size();
+    output->resize(start + static_cast<size_t>(blocks_x) * blocks_y * block_size);
+    for (uint32_t block_y = 0; block_y < blocks_y; ++block_y) {
+        for (uint32_t block_x = 0; block_x < blocks_x; ++block_x) {
+            uint8_t pixels[16][4]{};
+            for (uint32_t y = 0; y < 4; ++y) {
+                for (uint32_t x = 0; x < 4; ++x) {
+                    const uint32_t source_x = std::min(width - 1u, block_x * 4u + x);
+                    const uint32_t source_y = std::min(height - 1u, block_y * 4u + y);
+                    memcpy(pixels[y * 4u + x],
+                           rgba.data() + (static_cast<size_t>(source_y) * width + source_x) * 4u,
+                           4);
+                }
+            }
+            uint8_t* block = output->data() + start +
+                             (static_cast<size_t>(block_y) * blocks_x + block_x) * block_size;
+            if (dxt5) {
+                dds_compress_alpha_block(pixels, block);
+                dds_compress_colour_block(pixels, false, block + 8);
+            } else {
+                dds_compress_colour_block(pixels, true, block);
+            }
+        }
+    }
+}
+
+std::vector<uint8_t> dds_next_mip(const std::vector<uint8_t>& source, uint32_t width,
+                                  uint32_t height) {
+    const uint32_t next_width = std::max(1u, width / 2u);
+    const uint32_t next_height = std::max(1u, height / 2u);
+    std::vector<uint8_t> next(static_cast<size_t>(next_width) * next_height * 4u);
+    for (uint32_t y = 0; y < next_height; ++y) {
+        for (uint32_t x = 0; x < next_width; ++x) {
+            uint32_t sum[4]{};
+            uint32_t samples = 0;
+            for (uint32_t source_y = y * 2u; source_y < std::min(height, y * 2u + 2u); ++source_y) {
+                for (uint32_t source_x = x * 2u; source_x < std::min(width, x * 2u + 2u); ++source_x) {
+                    const uint8_t* pixel = source.data() +
+                                           (static_cast<size_t>(source_y) * width + source_x) * 4u;
+                    for (uint32_t channel = 0; channel < 4; ++channel)
+                        sum[channel] += pixel[channel];
+                    ++samples;
+                }
+            }
+            uint8_t* target = next.data() + (static_cast<size_t>(y) * next_width + x) * 4u;
+            for (uint32_t channel = 0; channel < 4; ++channel)
+                target[channel] = static_cast<uint8_t>((sum[channel] + samples / 2u) / samples);
+        }
+    }
+    return next;
+}
+
+bool convert_ps2_tim2_to_dds(const RscfInfo& texture, std::vector<uint8_t>* dds,
+                             Error* err) {
+    uint32_t width = 0, height = 0;
+    std::vector<uint8_t> rgba;
+    Error decode_error{};
+    if (!decode_ps2_tim2(texture.payload, texture.payload_size, &width, &height, &rgba,
+                         &decode_error))
+        return fail(err, "%s: %.*s",
+                    decode_error.set ? decode_error.message : "could not decode PS2 TIM2 texture",
+                    texture.name.size, texture.name.data);
+
+    bool has_fractional_alpha = false;
+    for (size_t pixel = 3; pixel < rgba.size(); pixel += 4)
+        has_fractional_alpha |= rgba[pixel] > 0u && rgba[pixel] < 250u;
+    const bool dxt5 = str_ends_i(texture.name, str_lit(".tga")) || has_fractional_alpha;
+
+    uint32_t mip_count = 1;
+    for (uint32_t mip_width = width, mip_height = height;
+         mip_width > 1u || mip_height > 1u;
+         mip_width = std::max(1u, mip_width / 2u),
+         mip_height = std::max(1u, mip_height / 2u))
+        ++mip_count;
+    std::vector<uint8_t> compressed;
+    std::vector<uint8_t> mip = std::move(rgba);
+    uint32_t mip_width = width;
+    uint32_t mip_height = height;
+    for (uint32_t level = 0; level < mip_count; ++level) {
+        dds_compress_mip(mip, mip_width, mip_height, dxt5, &compressed);
+        if (level + 1u < mip_count) {
+            mip = dds_next_mip(mip, mip_width, mip_height);
+            mip_width = std::max(1u, mip_width / 2u);
+            mip_height = std::max(1u, mip_height / 2u);
+        }
+    }
+
+    Ps2ConvertedDdsHeader header{};
+    header.size = sizeof(header);
+    header.flags = 0x000a1007u; // CAPS | HEIGHT | WIDTH | PIXELFORMAT | LINEARSIZE | MIPMAPCOUNT
+    header.height = height;
+    header.width = width;
+    header.pitch_or_linear_size = std::max(1u, (width + 3u) / 4u) *
+                                  std::max(1u, (height + 3u) / 4u) * (dxt5 ? 16u : 8u);
+    header.mip_count = mip_count;
+    header.pixel_format.size = sizeof(header.pixel_format);
+    header.pixel_format.flags = 0x4u; // FOURCC
+    header.pixel_format.four_cc = dxt5 ? fourcc('D', 'X', 'T', '5')
+                                       : fourcc('D', 'X', 'T', '1');
+    header.caps = 0x00401008u; // TEXTURE | COMPLEX | MIPMAP
+    dds->resize(4 + sizeof(header) + compressed.size());
+    memcpy(dds->data(), "DDS ", 4);
+    memcpy(dds->data() + 4, &header, sizeof(header));
+    memcpy(dds->data() + 4 + sizeof(header), compressed.data(), compressed.size());
+    return true;
+}
+
+bool append_ps2_object_material_support(Buffer* out, const StaticObjectModel& model,
+                                        Error* err) {
+    if (model.mesh.materials.empty())
+        return fail(err, "PS2 object %08X has no material binding", model.file_id);
+    const SpawnPuppetMaterial& material = model.mesh.materials[0];
+    const Str texture_name{material.texture_name.data(),
+                           static_cast<uint32_t>(material.texture_name.size())};
+
+    ChunkMark text = begin_chunk(out, ASURA_CHUNK_TEXTURENAMES, 3, 0, err);
+    append_u32(out, 1, err);
+    append_padded_cstr(out, texture_name, err);
+    if (!end_chunk(out, text, err))
+        return false;
+
+    ChunkMark txfl = begin_chunk(out, ASURA_CHUNK_TEXTUREFLAGS, 1, 0, err);
+    append_u32(out, 1, err);
+    append_u32(out, material.texture_flags ? material.texture_flags : 0x2000u, err);
+    if (!end_chunk(out, txfl, err))
+        return false;
+
+    ChunkMark mtrl = begin_chunk(out, ASURA_CHUNK_MATERIAL, 1, 0, err);
+    append_u32(out, 1, err);
+    append_u32(out, 0, err);
+    append_u32(out, material.flags, err);
+    append_u32(out, 4, err);
+    if (!end_chunk(out, mtrl, err))
+        return false;
+
+    ChunkMark shpd = begin_chunk(out, ASURA_CHUNK_SHAPEDATA, 0, 0, err);
+    append_u32(out, model.file_id, err);
+    append_u32(out, 0, err);
+    return end_chunk(out, shpd, err);
+}
+
+bool make_pc_object_payload(const StaticObjectModel& model, Buffer* payload, Error* err) {
+    const SpawnPuppet& mesh = model.mesh;
+    if (mesh.vertices.empty() || mesh.faces.empty() || mesh.vertices.size() > 65535)
+        return fail(err, "PS2 object %08X has no PC-compatible geometry", model.file_id);
+    if (mesh.faces.size() > (UINT32_MAX - 3u) / 6u + 1u)
+        return fail(err, "PS2 object %08X has too many faces", model.file_id);
+
+    std::vector<uint16_t> indices;
+    indices.reserve(3 + (mesh.faces.size() - 1) * 6);
+    for (size_t face_index = 0; face_index < mesh.faces.size(); ++face_index) {
+        const std::array<uint16_t, 3>& face = mesh.faces[face_index];
+        if (face[0] >= mesh.vertices.size() || face[1] >= mesh.vertices.size() ||
+            face[2] >= mesh.vertices.size())
+            return fail(err, "PS2 object %08X has an out-of-range face", model.file_id);
+        if (!face_index) {
+            indices.insert(indices.end(), face.begin(), face.end());
+            continue;
+        }
+        // Reset a single PC triangle strip with six degenerate indices. The
+        // even-sized bridge keeps every real source face on the same strip
+        // parity, so its winding is preserved exactly.
+        const uint16_t previous = indices.back();
+        indices.push_back(previous);
+        indices.push_back(previous);
+        indices.push_back(face[0]);
+        indices.push_back(face[0]);
+        indices.push_back(face[1]);
+        indices.push_back(face[2]);
+    }
+    if (indices.size() > UINT32_MAX)
+        return fail(err, "PS2 object %08X has too many strip indices", model.file_id);
+
+    const uint32_t index_count = static_cast<uint32_t>(indices.size());
+    const uint32_t triangle_count = index_count - 2;
+    const uint64_t reserve = 20ull + static_cast<uint64_t>(mesh.vertices.size()) * 32 +
+                             static_cast<uint64_t>(index_count) * 2 + 8;
+    if (!buffer_init(payload, reserve, err))
+        return false;
+    append_u32(payload, model.file_id, err);
+    append_u32(payload, triangle_count, err);
+    append_u32(payload, static_cast<uint32_t>(mesh.vertices.size()), err);
+    append_u32(payload, index_count, err);
+    append_u32(payload, 0, err);
+    for (const SpawnPuppetVertex& vertex : mesh.vertices) {
+        append_f32(payload, vertex.position.x, err);
+        append_f32(payload, vertex.position.y, err);
+        append_f32(payload, vertex.position.z, err);
+        append_f32(payload, vertex.normal.x, err);
+        append_f32(payload, vertex.normal.y, err);
+        append_f32(payload, vertex.normal.z, err);
+        append_f32(payload, vertex.texcoord.x, err);
+        append_f32(payload, vertex.texcoord.y, err);
+    }
+    for (uint16_t index : indices)
+        append_u16(payload, index, err);
+    append_f32(payload, 0.0f, err);
+    append_u32(payload, 0, err);
+    return !err->set;
+}
+
+bool append_pc_object_rscf(Buffer* out, const StaticObjectModel& model, Error* err) {
+    Buffer payload{};
+    if (!make_pc_object_payload(model, &payload, err))
+        return false;
+    const Str resource_name{model.mesh.resource_name.data(),
+                            static_cast<uint32_t>(model.mesh.resource_name.size())};
+    ChunkMark chunk = begin_chunk(out, ASURA_CHUNK_RESOURCEFILE, 1, 0, err);
+    append_u32(out, ASURA_RESOURCEFILE_TYPE_PLATFORMSPECIFIC, err);
+    append_u32(out, ASURA_RESOURCEFILE_TYPE_PC_OBJECT, err);
+    append_u32(out, static_cast<uint32_t>(payload.size), err);
+    append_padded_cstr(out, resource_name, err);
+    buffer_append(out, payload.base, payload.size, err);
+    const bool ok = end_chunk(out, chunk, err);
+    buffer_release(&payload);
+    return ok;
+}
+
+bool append_ps2_static_object_support(Buffer* out, const Document& document,
+                                      const ChunkList& source,
+                                      std::vector<uint32_t>* object_ids,
+                                      std::vector<uint32_t>* shape_ids, Error* err) {
+    std::vector<StaticObjectModel> models;
+    if (!decode_ps2_static_object_models(source, document, &models, err))
+        return false;
+
+    std::vector<std::string> emitted_textures;
+    for (const StaticObjectModel& model : models) {
+        if (model.mesh.materials.empty() || model.mesh.materials[0].texture_bytes.empty())
+            return fail(err, "PS2 object %08X has no source TIM2 texture", model.file_id);
+        const SpawnPuppetMaterial& material = model.mesh.materials[0];
+        const std::string identity = normalized_resource_path(
+            Str{material.texture_name.data(), static_cast<uint32_t>(material.texture_name.size())});
+        if (std::find(emitted_textures.begin(), emitted_textures.end(), identity) !=
+            emitted_textures.end())
+            continue;
+        RscfInfo texture{};
+        texture.type = ASURA_RESOURCEFILE_TYPE_TEXTURE;
+        texture.name = {material.texture_name.data(),
+                        static_cast<uint32_t>(material.texture_name.size())};
+        texture.payload = material.texture_bytes.data();
+        texture.payload_size = static_cast<uint32_t>(material.texture_bytes.size());
+        std::vector<uint8_t> dds;
+        if (!convert_ps2_tim2_to_dds(texture, &dds, err))
+            return false;
+        std::string resource_name = material.texture_name;
+        if (resource_name.rfind("\\graphics", 0) != 0 &&
+            resource_name.rfind("/graphics", 0) != 0)
+            resource_name = "\\graphics" + resource_name;
+        if (!append_rscf(out, {resource_name.data(), static_cast<uint32_t>(resource_name.size())},
+                         ASURA_RESOURCEFILE_TYPE_TEXTURE, 0, dds.data(),
+                         static_cast<uint32_t>(dds.size()), err))
+            return false;
+        emitted_textures.push_back(identity);
+    }
+
+    for (const StaticObjectModel& model : models) {
+        if (!append_ps2_object_material_support(out, model, err) ||
+            !append_pc_object_rscf(out, model, err))
+            return false;
+        object_ids->push_back(model.file_id);
+    }
+    for (const StaticObjectModel& model : models) {
+        for (uint32_t chunk_index = 0; chunk_index < source.count; ++chunk_index) {
+            const ChunkRef& shape = source.chunks[chunk_index];
+            if (shape.cid != ASURA_CHUNK_SHAPE ||
+                shape.size < sizeof(Asura_Chunk_Header) + 4 ||
+                read_u32(shape.data + sizeof(Asura_Chunk_Header)) != model.file_id)
+                continue;
+            if (!append_chunk_copy(out, shape, err))
+                return false;
+            if (chunk_index + 1 < source.count &&
+                source.chunks[chunk_index + 1].cid == ASURA_CHUNK_SHAPEDATA &&
+                !append_chunk_copy(out, source.chunks[chunk_index + 1], err))
+                return false;
+            shape_ids->push_back(model.file_id);
+            break;
+        }
+    }
+    return true;
+}
+
+bool append_ps2_passthrough_entities(Buffer* out, const ChunkList& source, Error* err) {
+    for (uint32_t chunk_index = 0; chunk_index < source.count; ++chunk_index) {
+        const ChunkRef& chunk = source.chunks[chunk_index];
+        if (chunk.cid != ASURA_CHUNK_ENTITY || chunk.size < sizeof(Asura_Chunk_Entity))
+            continue;
+        const uint16_t classification = read_u16(
+            chunk.data + sizeof(Asura_Chunk_Header) +
+            offsetof(Asura_Chunk_Entity_PayloadHeader, Classification));
+        // The cutscene controller is an existing engine classification and
+        // contains only versioned scalar/string data. Unknown project-specific
+        // classifications are deliberately not carried into the PC output.
+        if (classification != AsuraEntityClass_CutsceneController)
+            continue;
+        if (!append_chunk_copy(out, chunk, err))
+            return false;
+    }
+    return true;
+}
+
+bool append_ps2_environment_textures_as_pc(
+    Buffer* output, const ChunkList& source,
+    const std::vector<PcEnvironmentMaterialBinding>& materials, Error* err) {
+    std::vector<std::string> emitted;
+    for (const PcEnvironmentMaterialBinding& material : materials) {
+        if (material.texture_index < 0 || !material.texture_name.size)
+            continue;
+        const std::string identity = normalized_resource_path(str_trim(material.texture_name));
+        if (std::find(emitted.begin(), emitted.end(), identity) != emitted.end())
+            continue;
+
+        RscfInfo texture{};
+        bool found = false;
+        for (uint32_t chunk_index = 0; chunk_index < source.count; ++chunk_index) {
+            RscfInfo candidate{};
+            if (rscf_info(source.chunks[chunk_index], &candidate) &&
+                candidate.type == ASURA_RESOURCEFILE_TYPE_TEXTURE &&
+                text_name_matches_resource(material.texture_name, candidate.name)) {
+                texture = candidate;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            // Retail PS2 material tables contain a named Untextured! slot with
+            // no texture RSCF. A path-like entry, however, must resolve or the
+            // converted PC level would silently lose a real material.
+            if (identity.find('\\') == std::string::npos &&
+                identity.find('/') == std::string::npos) {
+                emitted.push_back(identity);
+                continue;
+            }
+            return fail(err, "PS2 environment texture is absent: %.*s",
+                        material.texture_name.size, material.texture_name.data);
+        }
+
+        std::vector<uint8_t> dds;
+        if (!convert_ps2_tim2_to_dds(texture, &dds, err))
+            return false;
+        const Str resource_name = str_trim(texture.name);
+        if (!append_rscf(output, resource_name, ASURA_RESOURCEFILE_TYPE_TEXTURE, 0,
+                         dds.data(), static_cast<uint32_t>(dds.size()), err))
+            return false;
+        emitted.push_back(identity);
+    }
+
+    RscfInfo environment{};
+    if (!find_ps2_environment(source, &environment))
+        return fail(err, "the .PS2 contains no PS2 environment RSCF");
+    const ChunkRef* text = nullptr;
+    const ChunkRef* txfl = nullptr;
+    const ChunkRef* mtrl = nullptr;
+    for (uint32_t chunk_index = 0; chunk_index < source.count; ++chunk_index) {
+        const ChunkRef& chunk = source.chunks[chunk_index];
+        RscfInfo resource{};
+        if (rscf_info(chunk, &resource) && resource.payload == environment.payload)
+            break;
+        if (chunk.cid == ASURA_CHUNK_TEXTURENAMES)
+            text = &chunk;
+        else if (chunk.cid == ASURA_CHUNK_TEXTUREFLAGS)
+            txfl = &chunk;
+        else if (chunk.cid == ASURA_CHUNK_MATERIAL)
+            mtrl = &chunk;
+    }
+    if (!text || !mtrl)
+        return fail(err, "the PS2 environment has no active TEXT/MTRL material table");
+    return append_chunk_copy(output, *text, err) &&
+           (!txfl || append_chunk_copy(output, *txfl, err)) &&
+           append_chunk_copy(output, *mtrl, err);
+}
+
+bool append_ps2_sky_resources_as_pc(Buffer* output, const Document& document,
+                                    const ChunkList& source, Error* err) {
+    // An external sky folder is an explicit replacement. Otherwise retain the
+    // authored PS2 SKYB paths and transcode their matching TIM2 RSCFs to DDS.
+    if (!document.sky_texture_dir.empty() || !document.skybox.source_record)
+        return true;
+    std::vector<std::string> emitted;
+    for (const std::string& texture_path : document.skybox.texture_paths) {
+        if (texture_path.empty())
+            continue;
+        const Str wanted{texture_path.data(), static_cast<uint32_t>(texture_path.size())};
+        const std::string identity = normalized_resource_path(wanted);
+        if (std::find(emitted.begin(), emitted.end(), identity) != emitted.end())
+            continue;
+        RscfInfo texture{};
+        bool found = false;
+        for (uint32_t chunk_index = 0; chunk_index < source.count; ++chunk_index) {
+            RscfInfo candidate{};
+            if (rscf_info(source.chunks[chunk_index], &candidate) &&
+                candidate.type == ASURA_RESOURCEFILE_TYPE_TEXTURE &&
+                text_name_matches_resource(wanted, candidate.name)) {
+                texture = candidate;
+                found = true;
+                break;
+            }
+        }
+        if (!found)
+            return fail(err, "PS2 SKYB texture is absent: %s", texture_path.c_str());
+        std::vector<uint8_t> dds;
+        if (!convert_ps2_tim2_to_dds(texture, &dds, err))
+            return false;
+        const Str resource_name = str_trim(texture.name);
+        if (!append_rscf(output, resource_name, ASURA_RESOURCEFILE_TYPE_TEXTURE, 0,
+                         dds.data(), static_cast<uint32_t>(dds.size()), err))
+            return false;
+        emitted.push_back(identity);
+    }
+    return true;
+}
+
+bool obj_data_from_ps2_mesh(const Mesh& mesh, bool double_sided, ObjData* obj,
+                            std::vector<std::string>* material_names,
+                            Arena* arena, Error* err) {
+    if (mesh.positions.empty() || mesh.faces.empty() ||
+        mesh.positions.size() > UINT32_MAX || mesh.faces.size() > UINT32_MAX ||
+        (double_sided && mesh.faces.size() > UINT32_MAX / 2u))
+        return fail(err, "decoded PS2 environment geometry is empty or too large");
+    const bool have_normals = mesh.normals.size() == mesh.positions.size();
+    const bool have_texcoords = mesh.texcoords.size() == mesh.positions.size();
+    const bool have_colors = mesh.diffuse_abgr.size() == mesh.positions.size();
+    obj->position_count = static_cast<uint32_t>(mesh.positions.size());
+    obj->normal_count = have_normals ? obj->position_count : 0;
+    obj->texcoord_count = have_texcoords ? obj->position_count : 0;
+    obj->face_count = static_cast<uint32_t>(mesh.faces.size()) * (double_sided ? 2u : 1u);
+    obj->positions = arena_array<Asura_Vector_3>(arena, obj->position_count, err, false);
+    obj->colors = arena_array<uint32_t>(arena, obj->position_count, err, false);
+    obj->has_color = arena_array<uint8_t>(arena, obj->position_count, err);
+    obj->normals = have_normals
+                       ? arena_array<Asura_Vector_3>(arena, obj->normal_count, err, false)
+                       : nullptr;
+    obj->texcoords = have_texcoords
+                         ? arena_array<Asura_Vector_2>(arena, obj->texcoord_count, err, false)
+                         : nullptr;
+    obj->faces = arena_array<ObjFace>(arena, obj->face_count, err, false);
+    if (err->set)
+        return false;
+    memcpy(obj->positions, mesh.positions.data(), mesh.positions.size() * sizeof(mesh.positions[0]));
+    if (have_normals)
+        memcpy(obj->normals, mesh.normals.data(), mesh.normals.size() * sizeof(mesh.normals[0]));
+    if (have_texcoords) {
+        memcpy(obj->texcoords, mesh.texcoords.data(), mesh.texcoords.size() * sizeof(mesh.texcoords[0]));
+        // build_env performs the OBJ-to-target V flip. Undo it in this
+        // in-memory OBJ view so the PS2 target UV reaches the PC Env exactly.
+        for (uint32_t i = 0; i < obj->texcoord_count; ++i)
+            obj->texcoords[i].y = 1.0f - obj->texcoords[i].y;
+    }
+    for (uint32_t i = 0; i < obj->position_count; ++i) {
+        obj->colors[i] = have_colors ? mesh.diffuse_abgr[i] : 0xffffffffu;
+        obj->has_color[i] = 1;
+    }
+
+    uint32_t maximum_material = 0;
+    for (int32_t material : mesh.face_materials)
+        if (material > 0)
+            maximum_material = std::max(maximum_material, static_cast<uint32_t>(material));
+    material_names->resize(static_cast<size_t>(maximum_material) + 1);
+    for (uint32_t i = 0; i <= maximum_material; ++i)
+        (*material_names)[i] = "mat_" + std::to_string(i);
+
+    for (uint32_t source_index = 0; source_index < mesh.faces.size(); ++source_index) {
+        const std::array<uint32_t, 3>& source_face = mesh.faces[source_index];
+        if (source_face[0] >= obj->position_count || source_face[1] >= obj->position_count ||
+            source_face[2] >= obj->position_count)
+            return fail(err, "decoded PS2 environment face %u has an invalid vertex", source_index);
+        const uint32_t material = source_index < mesh.face_materials.size() &&
+                                          mesh.face_materials[source_index] >= 0
+                                      ? static_cast<uint32_t>(mesh.face_materials[source_index])
+                                      : 0u;
+        const auto index = [have_texcoords, have_normals](uint32_t vertex) {
+            const int32_t one_based = static_cast<int32_t>(vertex + 1u);
+            return ObjIndex{one_based, have_texcoords ? one_based : 0,
+                            have_normals ? one_based : 0};
+        };
+        const uint32_t face_index = source_index * (double_sided ? 2u : 1u);
+        ObjFace& face = obj->faces[face_index];
+        face.a = index(source_face[0]);
+        face.b = index(source_face[1]);
+        face.c = index(source_face[2]);
+        const std::string& name = (*material_names)[material];
+        face.material = {name.data(), static_cast<uint32_t>(name.size())};
+        face.order = face_index;
+        if (double_sided) {
+            ObjFace& reverse = obj->faces[face_index + 1];
+            reverse.a = face.a;
+            reverse.b = face.c;
+            reverse.c = face.b;
+            reverse.material = face.material;
+            reverse.order = face_index + 1;
+        }
+    }
+    return true;
+}
+
+bool pack_ps2_document(const Document& doc, const Mesh& mesh, const char* output_path,
+                       std::string* why) {
+    bool has_pickups = false;
+    for (const Entity& entity : doc.entities) {
+        has_pickups |= entity.kind == EntityKind::Pickup;
+    }
+    if (has_pickups && doc.weapons_donor.empty()) {
+        if (why)
+            *why = "Choose a Weapons donor .PC before exporting PS2 geometry with pickups.";
+        return false;
+    }
+    Error err{};
+    Config cfg{};
+    if (!initialize_editor_config(doc.source_pc_path.c_str(), &cfg, &err)) {
+        if (why)
+            *why = err.message;
+        return false;
+    }
+    cfg.flip_y = true;
+    cfg.flip_z = false;
+    cfg.diffuse_abgr = 0xffffffffu;
+    cfg.allow_unknown_materials = true;
+    cfg.weapon_from_pc = doc.weapons_donor.empty() ? nullptr : doc.weapons_donor.c_str();
+    cfg.sky_texture_dir = doc.sky_texture_dir.empty() ? nullptr : doc.sky_texture_dir.c_str();
+    for (uint32_t slot = 0; slot < ASURA_SKYBOX_V5_V7_TEXTURE_PATH_COUNT; ++slot)
+        cfg.sky_texture_paths[slot] = doc.skybox.texture_paths[slot].empty()
+                                           ? nullptr
+                                           : doc.skybox.texture_paths[slot].c_str();
+
+    Arena arena{}, scratch{};
+    ChunkList source{};
+    Buffer output{}, env_payload{}, collision_payload{};
+    MaterialMap material_map{};
+    ObjData render_obj{}, collision_obj{};
+    EnvBuild env{}, collision_env{};
+    EnvView view{}, collision_view{};
+    Sounds sounds{};
+    ModuleMetric* metrics = nullptr;
+    std::vector<std::string> render_material_names, collision_material_names;
+    std::vector<PcEnvironmentMaterialBinding> materials;
+    std::vector<uint32_t> source_object_ids, source_shape_ids;
+    bool ok = arena_init(&arena, cfg.arena_reserve, &err) &&
+              arena_init(&scratch, cfg.arena_reserve, &err) &&
+              parse_chunks(doc.source_pc_path.c_str(), &source, &arena, &err) &&
+              ps2_environment_material_bindings(source, &materials, &err) &&
+              obj_data_from_ps2_mesh(mesh, true, &render_obj, &render_material_names,
+                                     &arena, &err) &&
+              obj_data_from_ps2_mesh(mesh, false, &collision_obj,
+                                     &collision_material_names, &arena, &err) &&
+              validate_spawn_clearance(doc, collision_obj, cfg, &err) &&
+              buffer_init(&output, cfg.output_reserve, &err);
+    if (ok) {
+        // PS2 GS rendering is two-sided. Each source face contributes two
+        // render faces but one collision face, so scale the per-module limit
+        // by the same factor and retain identical spatial module boundaries.
+        Config render_cfg = cfg;
+        render_cfg.max_collision_polys =
+            cfg.max_collision_polys <= UINT32_MAX / 2u
+                ? cfg.max_collision_polys * 2u
+                : UINT32_MAX;
+        ok = build_env(render_cfg, render_obj, material_map, &arena, &scratch, &env, &err);
+        if (ok) {
+            env_payload = env.payload;
+            ok = build_env(cfg, collision_obj, material_map, &arena, &scratch,
+                           &collision_env, &err);
+        }
+        if (ok)
+            collision_payload = collision_env.payload;
+    }
+    if (ok) {
+        ok = env_view(env_payload, &view, &arena, &err) && view.module_count &&
+             view.module_count <= kMaxAabbTreeObjects &&
+             env_view(collision_payload, &collision_view, &arena, &err) &&
+             collision_view.module_count == view.module_count;
+        if (!ok && !err.set)
+            fail(&err, "two-sided render and single-sided collision module counts disagree");
+    }
+    if (ok) {
+        metrics = arena_array<ModuleMetric>(&arena, view.module_count, &err);
+        ok = metrics && make_editor_sounds(doc, &sounds, &arena, &err);
+    }
+    if (ok) {
+        buffer_append(&output, kAsuraMagic, sizeof(kAsuraMagic), &err);
+        ok = append_fnfo(&output, &err) && append_rsfl(&output, &err) &&
+             append_weapon_support(&output, cfg, &scratch, &err) &&
+             append_ps2_static_object_support(&output, doc, source,
+                                              &source_object_ids, &source_shape_ids, &err) &&
+             append_static_object_support(&output, doc, nullptr, &source_object_ids,
+                                          &source_shape_ids, &err) &&
+             append_sky_resources(&output, cfg, &scratch, &err) &&
+             append_ps2_sky_resources_as_pc(&output, doc, source, &err) &&
+             append_ps2_environment_textures_as_pc(&output, source, materials, &err) &&
+             append_rscf(&output, str_from_c(cfg.env_name),
+                         ASURA_RESOURCEFILE_TYPE_PLATFORMSPECIFIC,
+                         ASURA_RESOURCEFILE_TYPE_PC_ENVIRONMENT, env_payload.base,
+                         static_cast<uint32_t>(env_payload.size), &err) &&
+             append_sound_resources(&output, sounds, &scratch, &err) &&
+             (doc.ambient_stream_path.empty() || append_editor_ambience(&output, doc, &err)) &&
+             append_editor_lights(&output, doc, &err) && append_phon(&output, sounds, &err) &&
+             append_emod(&output, collision_view, collision_view.module_count, cfg,
+                         material_map, &scratch, metrics, &err) &&
+             append_mlin(&output, metrics, view.module_count, &err) &&
+             append_mrvb(&output, view.module_count, &err) &&
+             append_nav1(&output, view.module_count, &err) &&
+             append_sound_entities(&output, sounds, &err) &&
+             append_ps2_passthrough_entities(&output, source, &err) &&
+             append_editor_spawnpoints(&output, doc, &err) &&
+             append_editor_pickups(&output, doc, &err) &&
+             append_editor_static_objects(&output, doc, &err) &&
+             append_editor_building_volumes(&output, doc, &err) &&
+             append_editor_skybox(&output, doc.skybox, &err) &&
+             append_fog(&output, &err) && append_editor_weather(&output, doc, &err) &&
+             buffer_append(&output, nullptr, sizeof(Asura_Chunk_Header), &err) != ~0ull &&
+             patch_fnfo_file_size(&output, &err);
+    }
+
+    unmap_file(&source.file);
+    if (ok)
+        ok = write_entire_file(output_path, output.base, output.size, &err);
+    if (!ok && why)
+        *why = err.set ? err.message : "Converting the PS2 level to PC failed.";
+    buffer_release(&collision_payload);
+    buffer_release(&env_payload);
+    buffer_release(&output);
+    arena_release(&scratch);
+    arena_release(&arena);
+    return ok;
+}
+
+bool pack_document(Document& doc, const Mesh* source_mesh, const char* output_path,
+                   std::string* why) {
     if (!normalise_editor_guids(&doc, why))
         return false;
-    if (!doc.source_pc_path.empty())
+    if (!doc.source_pc_path.empty()) {
+        const size_t dot = doc.source_pc_path.find_last_of('.');
+        const char* extension = dot == std::string::npos ? "" : doc.source_pc_path.c_str() + dot;
+        if (_stricmp(extension, ".ps2") == 0) {
+            if (!source_mesh) {
+                if (why)
+                    *why = "The decoded PS2 geometry is unavailable for PC conversion.";
+                return false;
+            }
+            return pack_ps2_document(doc, *source_mesh, output_path, why);
+        }
         return pack_pc_document(doc, output_path, why);
+    }
     if (doc.obj_path.empty()) {
         if (why)
             *why = "Open an OBJ before exporting.";
@@ -1167,7 +1996,7 @@ bool pack_document(Document& doc, const char* output_path, std::string* why) {
         buffer_append(&output, kAsuraMagic, sizeof(kAsuraMagic), &err);
         ok = append_fnfo(&output, &err) && append_rsfl(&output, &err) &&
              append_weapon_support(&output, cfg, &scratch, &err) &&
-             append_static_object_support(&output, doc, nullptr, &err) &&
+             append_static_object_support(&output, doc, nullptr, nullptr, nullptr, &err) &&
              append_sky_resources(&output, cfg, &scratch, &err) &&
              append_textures(&output, cfg, view, material_map, &arena, &scratch, &textures, &err) &&
              append_rscf(&output, str_from_c(cfg.env_name), ASURA_RESOURCEFILE_TYPE_PLATFORMSPECIFIC,
@@ -1219,12 +2048,12 @@ DirectX::XMFLOAT4 material_map_color(uint32_t key) {
             .45f + (mixed & 0xff) * scale, 1.0f};
 }
 
-bool pc_environment_material_bindings(const ChunkList& chunks,
-                                      std::vector<PcEnvironmentMaterialBinding>* output, Error* err) {
+static bool environment_material_bindings(const ChunkList& chunks,
+                                          const RscfInfo& environment,
+                                          const char* platform,
+                                          std::vector<PcEnvironmentMaterialBinding>* output,
+                                          Error* err) {
     output->clear();
-    RscfInfo environment{};
-    if (!find_pc_environment(chunks, &environment))
-        return fail(err, "the .PC contains no PC environment RSCF");
 
     std::vector<Str> texture_names;
     std::vector<uint32_t> texture_flags;
@@ -1233,22 +2062,22 @@ bool pc_environment_material_bindings(const ChunkList& chunks,
         const ChunkRef& chunk = chunks.chunks[chunk_index];
         if (chunk.cid == ASURA_CHUNK_TEXTURENAMES) {
             if (chunk.version > 3)
-                return fail(err, "the active PC TEXT chunk uses unsupported version %u", chunk.version);
+                return fail(err, "the active %s TEXT chunk uses unsupported version %u", platform, chunk.version);
             if (chunk.size < sizeof(Asura_Chunk_TextureNames))
-                return fail(err, "the active PC TEXT chunk is truncated");
+                return fail(err, "the active %s TEXT chunk is truncated", platform);
             const uint32_t count = read_u32(chunk.data + sizeof(Asura_Chunk_Header));
             if (count > chunk.size - sizeof(Asura_Chunk_TextureNames))
-                return fail(err, "the active PC TEXT count exceeds its chunk");
+                return fail(err, "the active %s TEXT count exceeds its chunk", platform);
             texture_names.clear();
             texture_names.reserve(count);
             texture_flags.assign(count, 0);
             uint64_t at = sizeof(Asura_Chunk_TextureNames);
             for (uint32_t texture_index = 0; texture_index < count; ++texture_index) {
                 if (at > chunk.size)
-                    return fail(err, "the active PC TEXT string table is truncated");
+                    return fail(err, "the active %s TEXT string table is truncated", platform);
                 const Str name = padded_string_at(chunk.data, chunk.size, static_cast<uint32_t>(at));
                 if (!name.data)
-                    return fail(err, "the active PC TEXT string table is unterminated");
+                    return fail(err, "the active %s TEXT string table is unterminated", platform);
                 texture_names.push_back(name);
                 at = align_up(at + name.size + 1, 4);
             }
@@ -1264,13 +2093,13 @@ bool pc_environment_material_bindings(const ChunkList& chunks,
             }
         } else if (chunk.cid == ASURA_CHUNK_TEXTUREFLAGS) {
             if (chunk.version > 1)
-                return fail(err, "the active PC TXFL chunk uses unsupported version %u", chunk.version);
+                return fail(err, "the active %s TXFL chunk uses unsupported version %u", platform, chunk.version);
             const uint64_t values_at = sizeof(Asura_Chunk_Header) + sizeof(uint32_t);
             if (chunk.size < values_at)
-                return fail(err, "the active PC TXFL chunk is truncated");
+                return fail(err, "the active %s TXFL chunk is truncated", platform);
             const uint32_t count = read_u32(chunk.data + sizeof(Asura_Chunk_Header));
             if (count > (chunk.size - values_at) / sizeof(uint32_t) || count > texture_flags.size())
-                return fail(err, "the active PC TXFL table exceeds the active TEXT table");
+                return fail(err, "the active %s TXFL table exceeds the active TEXT table", platform);
             for (uint32_t texture_index = 0; texture_index < count; ++texture_index) {
                 uint32_t value = read_u32(chunk.data + values_at + texture_index * sizeof(uint32_t));
                 if (!chunk.version) {
@@ -1286,14 +2115,14 @@ bool pc_environment_material_bindings(const ChunkList& chunks,
                     binding.texture_flags = texture_flags[binding.texture_index];
         } else if (chunk.cid == ASURA_CHUNK_MATERIAL) {
             if (chunk.version > 1)
-                return fail(err, "the active PC MTRL chunk uses unsupported version %u", chunk.version);
+                return fail(err, "the active %s MTRL chunk uses unsupported version %u", platform, chunk.version);
             if (chunk.size < sizeof(Asura_Chunk_Header) + sizeof(uint32_t))
-                return fail(err, "the active PC MTRL chunk is truncated");
+                return fail(err, "the active %s MTRL chunk is truncated", platform);
             const uint32_t count = read_u32(chunk.data + sizeof(Asura_Chunk_Header));
             const uint32_t stride = chunk.version ? sizeof(Asura_PC_Material_V1) : 8u;
             const uint64_t records_at = sizeof(Asura_Chunk_Header) + sizeof(uint32_t);
             if (count > (chunk.size - records_at) / stride)
-                return fail(err, "the active PC MTRL record table is truncated");
+                return fail(err, "the active %s MTRL record table is truncated", platform);
             output->assign(count, {});
             for (uint32_t material_index = 0; material_index < count; ++material_index) {
                 const uint8_t* record = chunk.data + records_at + static_cast<uint64_t>(material_index) * stride;
@@ -1316,8 +2145,24 @@ bool pc_environment_material_bindings(const ChunkList& chunks,
         }
     }
     if (!reached_environment)
-        return fail(err, "the PC environment resource is absent from the chunk stream");
+        return fail(err, "the %s environment resource is absent from the chunk stream", platform);
     return true;
+}
+
+bool pc_environment_material_bindings(const ChunkList& chunks,
+                                      std::vector<PcEnvironmentMaterialBinding>* output, Error* err) {
+    RscfInfo environment{};
+    if (!find_pc_environment(chunks, &environment))
+        return fail(err, "the .PC contains no PC environment RSCF");
+    return environment_material_bindings(chunks, environment, "PC", output, err);
+}
+
+bool ps2_environment_material_bindings(const ChunkList& chunks,
+                                       std::vector<PcEnvironmentMaterialBinding>* output, Error* err) {
+    RscfInfo environment{};
+    if (!find_ps2_environment(chunks, &environment))
+        return fail(err, "the .PS2 contains no PS2 environment RSCF");
+    return environment_material_bindings(chunks, environment, "PS2", output, err);
 }
 
 namespace {

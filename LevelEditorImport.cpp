@@ -247,6 +247,534 @@ const RscfInfo* find_pc_environment(const ChunkList& chunks, RscfInfo* storage) 
     return storage;
 }
 
+namespace {
+
+struct Ps2EnvironmentPair {
+    uint16_t module_index;
+    uint16_t triangle_count;
+};
+
+struct Ps2EnvironmentGroup {
+    uint16_t material_index;
+    std::vector<Ps2EnvironmentPair> pairs;
+};
+
+struct Ps2VifBatch {
+    std::vector<Asura_Vector_3> positions;
+    std::vector<Asura_Vector_2> texcoords;
+    std::vector<uint32_t> diffuse_abgr;
+    std::vector<Asura_Vector_3> normals;
+    std::vector<uint8_t> adc;
+};
+
+struct Ps2ObjectView {
+    Str object_path{};
+    Str texture_name{};
+    float lod_distance = 0;
+    uint32_t material_flags = 0;
+    uint32_t object_flags = 0;
+    uint32_t triangle_count = 0;
+    uint32_t packet_count = 0;
+    const uint8_t* packet_table = nullptr;
+    const uint8_t* packets = nullptr;
+    uint32_t packet_bytes = 0;
+};
+
+constexpr uint32_t kPs2ObjectResourceSubtype = 6;
+
+bool ps2_object_view(const RscfInfo& resource, Ps2ObjectView* output, Error* err) {
+    if (resource.type != ASURA_RESOURCEFILE_TYPE_PLATFORMSPECIFIC ||
+        resource.subtype != kPs2ObjectResourceSubtype)
+        return false;
+    const uint8_t* data = resource.payload;
+    const uint32_t size = resource.payload_size;
+    Str object_path = padded_string_at(data, size, 0);
+    if (!object_path.data)
+        return fail(err, "PS2 object resource '%.*s' has no embedded object path",
+                    resource.name.size, resource.name.data);
+    uint64_t at = align_up(static_cast<uint64_t>(object_path.size) + 1, 4);
+    if (at + 8 > size)
+        return fail(err, "PS2 object resource '%.*s' has a truncated LOD header",
+                    resource.name.size, resource.name.data);
+    const float lod_distance = read_f32(data + at);
+    const uint32_t texture_bytes = read_u32(data + at + 4);
+    at += 8;
+    if (!isfinite(lod_distance) || !texture_bytes || texture_bytes > size - at)
+        return fail(err, "PS2 object resource '%.*s' has an invalid texture binding",
+                    resource.name.size, resource.name.data);
+    Str texture_name = padded_string_at(data + at, texture_bytes, 0);
+    if (!texture_name.data || texture_name.size + 1 > texture_bytes)
+        return fail(err, "PS2 object resource '%.*s' has a malformed texture name",
+                    resource.name.size, resource.name.data);
+    at += texture_bytes;
+    if (at + 16 > size)
+        return fail(err, "PS2 object resource '%.*s' has a truncated geometry header",
+                    resource.name.size, resource.name.data);
+    Ps2ObjectView next;
+    next.object_path = object_path;
+    next.texture_name = texture_name;
+    next.lod_distance = lod_distance;
+    next.material_flags = read_u32(data + at);
+    next.object_flags = read_u32(data + at + 4);
+    next.triangle_count = read_u32(data + at + 8);
+    next.packet_count = read_u32(data + at + 12);
+    at += 16;
+    if (next.packet_count > (size - at) / 4)
+        return fail(err, "PS2 object resource '%.*s' has a truncated packet table",
+                    resource.name.size, resource.name.data);
+    next.packet_table = data + at;
+    uint64_t packet_bytes = 0;
+    for (uint32_t packet = 0; packet < next.packet_count; ++packet)
+        packet_bytes += static_cast<uint64_t>(read_u16(next.packet_table + packet * 4)) * 16;
+    at += static_cast<uint64_t>(next.packet_count) * 4;
+    if (packet_bytes > size - at)
+        return fail(err, "PS2 object resource '%.*s' has truncated VIF packets",
+                    resource.name.size, resource.name.data);
+    if (at + packet_bytes != size)
+        return fail(err, "PS2 object resource '%.*s' has unexpected trailing data",
+                    resource.name.size, resource.name.data);
+    if ((next.triangle_count == 0) != (next.packet_count == 0))
+        return fail(err, "PS2 object resource '%.*s' has inconsistent geometry counts",
+                    resource.name.size, resource.name.data);
+    next.packets = data + at;
+    next.packet_bytes = static_cast<uint32_t>(packet_bytes);
+    *output = next;
+    return true;
+}
+
+int32_t ps2_signed_5(uint16_t value) {
+    const int32_t component = value & 31;
+    return component < 16 ? component : component - 32;
+}
+
+bool append_ps2_batch(Ps2VifBatch* batch, int32_t material_index, Mesh* mesh,
+                      uint32_t* triangle_count, Error* err) {
+    const size_t count = batch->positions.size();
+    if (!count)
+        return true;
+    if (count < 3)
+        return fail(err, "PS2 environment VIF batch has only %zu vertices", count);
+    if (!batch->texcoords.empty() && batch->texcoords.size() != count)
+        return fail(err, "PS2 environment VIF UV count does not match its positions");
+    if (!batch->diffuse_abgr.empty() && batch->diffuse_abgr.size() != count)
+        return fail(err, "PS2 environment VIF colour count does not match its positions");
+    if (!batch->normals.empty() && batch->normals.size() != count)
+        return fail(err, "PS2 environment VIF normal count does not match its positions");
+    if (!batch->adc.empty() && batch->adc.size() != count)
+        return fail(err, "PS2 environment VIF ADC count does not match its positions");
+    if (mesh->positions.size() > 0xffffffffull - count)
+        return fail(err, "PS2 environment has too many vertices for the editor");
+
+    const uint32_t base = static_cast<uint32_t>(mesh->positions.size());
+    mesh->positions.reserve(mesh->positions.size() + count);
+    mesh->normals.reserve(mesh->normals.size() + count);
+    mesh->texcoords.reserve(mesh->texcoords.size() + count);
+    mesh->diffuse_abgr.reserve(mesh->diffuse_abgr.size() + count);
+    for (size_t i = 0; i < count; ++i) {
+        Asura_Vector_3 position = batch->positions[i];
+        // The 2005 target uses negative Y as up, matching the PC renderer.
+        position.y = -position.y;
+        mesh->positions.push_back(position);
+
+        Asura_Vector_3 normal = batch->normals.empty()
+                                      ? Asura_Vector_3{0, 1, 0}
+                                      : batch->normals[i];
+        normal.y = -normal.y;
+        const float length = sqrtf(normal.x * normal.x + normal.y * normal.y + normal.z * normal.z);
+        if (length > 1e-8f) {
+            normal.x /= length;
+            normal.y /= length;
+            normal.z /= length;
+        } else {
+            normal = {0, 1, 0};
+        }
+        mesh->normals.push_back(normal);
+        mesh->texcoords.push_back(batch->texcoords.empty() ? Asura_Vector_2{} : batch->texcoords[i]);
+        mesh->diffuse_abgr.push_back(batch->diffuse_abgr.empty()
+                                         ? 0xff808080u
+                                         : batch->diffuse_abgr[i]);
+    }
+
+    for (uint32_t vertex = 2; vertex < count; ++vertex) {
+        // ADC is set on the first two vertices after a strip restart. A vertex
+        // with ADC set is transferred to VU1 but does not emit a primitive.
+        if (!batch->adc.empty() && batch->adc[vertex])
+            continue;
+        uint32_t a = base + vertex - 2;
+        uint32_t b = base + vertex - 1;
+        const uint32_t c = base + vertex;
+        if ((vertex - 2) & 1)
+            std::swap(a, b);
+        // VU1's triangle kick order is the reverse of the PC Env strip order.
+        // The Y-axis conversion below and the PS2 kick convention therefore
+        // cancel; applying the PC decoder's additional swap culls the visible
+        // side of most PS2 geometry.
+        mesh->faces.push_back({a, b, c});
+        mesh->face_materials.push_back(material_index);
+        ++*triangle_count;
+    }
+    *batch = {};
+    return true;
+}
+
+bool append_ps2_dma_page_stream(const uint8_t* pages, uint32_t page_count,
+                                uint16_t last_page_qwords, std::vector<uint8_t>* stream,
+                                Error* err) {
+    if (!page_count || !last_page_qwords || last_page_qwords > 64)
+        return fail(err, "PS2 environment render record has invalid DMA page counts");
+    stream->clear();
+    stream->reserve(static_cast<size_t>(page_count) * 1024);
+    for (uint32_t page_index = 0; page_index < page_count; ++page_index) {
+        const uint8_t* page = pages + static_cast<uint64_t>(page_index) * 1024;
+        const uint32_t valid_qwords = page_index + 1 == page_count ? last_page_qwords : 64;
+        uint32_t qword = 0;
+        while (qword < valid_qwords) {
+            const uint8_t* tag = page + static_cast<uint64_t>(qword) * 16;
+            const uint32_t transfer_qwords = read_u32(tag) & 0xffffu;
+            if (transfer_qwords > valid_qwords - qword - 1)
+                return fail(err, "PS2 environment DMA tag exceeds its 1 KiB page");
+            // With tag transfer enabled the tag's upper 64 bits enter VIF1
+            // before the qword payload. Page links split UNPACK payloads, so
+            // preserving this order is essential.
+            stream->insert(stream->end(), tag + 8, tag + 16);
+            const uint8_t* payload = tag + 16;
+            stream->insert(stream->end(), payload,
+                           payload + static_cast<uint64_t>(transfer_qwords) * 16);
+            qword += transfer_qwords + 1;
+        }
+    }
+    return true;
+}
+
+uint32_t ps2_vif_unpack_bytes(uint32_t format, uint32_t count) {
+    if (format == 0x0f)
+        return count * 2;
+    const uint32_t components = (format >> 2) + 1;
+    const uint32_t width_code = format & 3;
+    if (width_code == 3)
+        return 0;
+    return count * components * (4u >> width_code);
+}
+
+bool decode_ps2_vif_stream(const uint8_t* stream_data, size_t stream_size,
+                           int32_t material_index, Mesh* mesh,
+                           uint32_t* decoded_triangles, Error* err) {
+    Ps2VifBatch batch;
+    uint64_t at = 0;
+    while (at + 4 <= stream_size) {
+        const uint32_t code = read_u32(stream_data + at);
+        at += 4;
+        const uint32_t command = (code >> 24) & 0x7fu;
+        if (command >= 0x60) {
+            const uint32_t format = command & 0x0fu;
+            uint32_t count = (code >> 16) & 0xffu;
+            if (!count)
+                count = 256;
+            const uint32_t byte_count = ps2_vif_unpack_bytes(format, count);
+            if (!byte_count)
+                return fail(err, "PS2 environment uses unsupported VIF UNPACK format 0x%X", format);
+            if (byte_count > stream_size - at)
+                return fail(err, "PS2 environment VIF UNPACK payload is truncated");
+            const uint8_t* payload = stream_data + at;
+
+            if (format == 0x08) { // V3-32 positions
+                if (!append_ps2_batch(&batch, material_index, mesh, decoded_triangles, err))
+                    return false;
+                batch.positions.reserve(count);
+                for (uint32_t i = 0; i < count; ++i) {
+                    const uint8_t* vertex = payload + static_cast<uint64_t>(i) * 12;
+                    const Asura_Vector_3 position{read_f32(vertex), read_f32(vertex + 4),
+                                                  read_f32(vertex + 8)};
+                    if (!isfinite(position.x) || !isfinite(position.y) || !isfinite(position.z))
+                        return fail(err, "PS2 environment contains a non-finite position");
+                    batch.positions.push_back(position);
+                }
+            } else if (format == 0x05) { // V2-16 fixed-point texture coordinates
+                batch.texcoords.reserve(count);
+                for (uint32_t i = 0; i < count; ++i) {
+                    const uint8_t* uv = payload + static_cast<uint64_t>(i) * 4;
+                    batch.texcoords.push_back({static_cast<int16_t>(read_u16(uv)) / 4096.0f,
+                                               static_cast<int16_t>(read_u16(uv + 2)) / 4096.0f});
+                }
+            } else if (format == 0x0a) { // V3-8 unsigned baked RGB prelight
+                batch.diffuse_abgr.reserve(count);
+                for (uint32_t i = 0; i < count; ++i) {
+                    const uint8_t* colour = payload + static_cast<uint64_t>(i) * 3;
+                    // MCP2 uploads this array at VU address 2, between UV at
+                    // address 1 and normal/ADC at address 3. Preserve its GS
+                    // 0x80-neutral scale: the PC Env texture pass is likewise
+                    // MODULATE2X, so expanding it to 0xff would overbrighten it.
+                    batch.diffuse_abgr.push_back(0xff000000u |
+                                                 (static_cast<uint32_t>(colour[0]) << 16u) |
+                                                 (static_cast<uint32_t>(colour[1]) << 8u) |
+                                                 colour[2]);
+                }
+            } else if (format == 0x0f) { // V4-5 packed normal plus ADC
+                batch.normals.reserve(count);
+                batch.adc.reserve(count);
+                for (uint32_t i = 0; i < count; ++i) {
+                    const uint16_t packed = read_u16(payload + static_cast<uint64_t>(i) * 2);
+                    batch.normals.push_back(
+                        {static_cast<float>(ps2_signed_5(packed)),
+                         static_cast<float>(ps2_signed_5(packed >> 5)),
+                         static_cast<float>(ps2_signed_5(packed >> 10))});
+                    batch.adc.push_back((packed & 0x8000u) != 0);
+                }
+            }
+            at += align_up(byte_count, 4);
+            continue;
+        }
+
+        uint32_t payload_bytes = 0;
+        if (command == 0x20)
+            payload_bytes = 4; // STMASK
+        else if (command == 0x30 || command == 0x31)
+            payload_bytes = 16; // STROW / STCOL
+        else if (command == 0x4a) {
+            uint32_t count = (code >> 16) & 0xffu;
+            payload_bytes = (count ? count : 256) * 8; // MPG
+        } else if (command == 0x50 || command == 0x51) {
+            payload_bytes = (code & 0xffffu) * 16; // DIRECT / DIRECTHL
+        }
+        if (payload_bytes > stream_size - at)
+            return fail(err, "PS2 environment VIF command payload is truncated");
+        at += payload_bytes;
+    }
+    if (at != stream_size)
+        return fail(err, "PS2 environment VIF stream is not dword-aligned");
+    return append_ps2_batch(&batch, material_index, mesh, decoded_triangles, err);
+}
+
+bool decode_ps2_vif_record(const uint8_t* pages, uint32_t page_count,
+                           uint16_t last_page_qwords, int32_t material_index,
+                           uint16_t declared_triangles, Mesh* mesh, Error* err) {
+    std::vector<uint8_t> stream;
+    if (!append_ps2_dma_page_stream(pages, page_count, last_page_qwords, &stream, err))
+        return false;
+    uint32_t decoded_triangles = 0;
+    if (!decode_ps2_vif_stream(stream.data(), stream.size(), material_index, mesh,
+                               &decoded_triangles, err))
+        return false;
+    if (decoded_triangles != declared_triangles)
+        return fail(err, "PS2 environment render record decoded %u triangles; target metadata declares %u",
+                    decoded_triangles, declared_triangles);
+    return true;
+}
+
+} // namespace
+
+const RscfInfo* find_ps2_environment(const ChunkList& chunks, RscfInfo* storage) {
+    for (uint32_t i = 0; i < chunks.count; ++i) {
+        RscfInfo resource{};
+        if (!rscf_info(chunks.chunks[i], &resource) ||
+            resource.type != ASURA_RESOURCEFILE_TYPE_PLATFORMSPECIFIC ||
+            resource.subtype != 0)
+            continue;
+        const std::string name(resource.name.data, resource.name.size);
+        if (name.find("PS2StrippedEnv") != std::string::npos) {
+            *storage = resource;
+            return storage;
+        }
+    }
+    return nullptr;
+}
+
+bool decode_ps2_tim2(const uint8_t* bytes, uint32_t byte_count, uint32_t* width,
+                     uint32_t* height, std::vector<uint8_t>* rgba, Error* err) {
+    if (!bytes || byte_count < 16 || memcmp(bytes, "TIM2", 4) != 0)
+        return fail(err, "PS2 texture is not a TIM2 file");
+    if ((bytes[4] != 3 && bytes[4] != 4) || !read_u16(bytes + 6))
+        return fail(err, "PS2 texture uses an unsupported TIM2 header");
+
+    // MCP2 sub_1AA298 selects the 128-byte picture alignment when the TIM2
+    // format byte is non-zero; otherwise the first picture follows at +16.
+    const uint32_t picture_at = bytes[5] ? 128u : 16u;
+    if (picture_at > byte_count || byte_count - picture_at < 0x58)
+        return fail(err, "PS2 TIM2 picture header is truncated");
+    const uint8_t* picture = bytes + picture_at;
+    const uint32_t total_size = read_u32(picture);
+    const uint32_t clut_size = read_u32(picture + 4);
+    const uint32_t image_size = read_u32(picture + 8);
+    const uint32_t header_size = read_u16(picture + 12);
+    const uint32_t clut_colors = read_u16(picture + 14);
+    const uint32_t stored_width = read_u16(picture + 20);
+    const uint32_t stored_height = read_u16(picture + 22);
+    if (header_size < 0x58 || total_size < header_size || total_size > byte_count - picture_at ||
+        image_size > total_size - header_size || clut_size > total_size - header_size - image_size)
+        return fail(err, "PS2 TIM2 picture sizes are invalid");
+
+    // MCP2 sub_19D8F8 asks the TIM2 library for the user-data extension, then
+    // enables sub_1AA3C0's expanded upload layout for an ASUR record with bit
+    // zero set. Its offset depends on the picture-header variant: SKYB TIM2s
+    // place it at +0x30, while environment/object TIM2s place it at +0x50.
+    const bool asur_30 = header_size >= 0x38 && read_u32(picture + 0x30) == 0x52555341u &&
+                         (read_u32(picture + 0x34) & 1u);
+    const bool asur_50 = header_size >= 0x58 && read_u32(picture + 0x50) == 0x52555341u &&
+                         (read_u32(picture + 0x54) & 1u);
+    if (!asur_30 && !asur_50)
+        return fail(err, "PS2 TIM2 texture does not use the target ASUR layout");
+    const uint32_t clut_type = picture[18] & 0x3fu;
+    const uint32_t palette_stride =
+        clut_type == 1 ? 2u : clut_type == 2 ? 3u : clut_type == 3 ? 4u : 0u;
+    if (clut_colors != 256 || !palette_stride ||
+        clut_size < clut_colors * palette_stride)
+        return fail(err,
+                    "PS2 TIM2 texture uses unsupported palette format "
+                    "(colours=%u, bytes=%u, clut-type=%u, image-type=%u, stored=%ux%u)",
+                    clut_colors, clut_size, picture[18], picture[19], stored_width,
+                    stored_height);
+
+    const uint32_t decoded_width = stored_width * 2u;
+    const uint32_t decoded_height = stored_height * 2u;
+    if (!decoded_width || !decoded_height || decoded_width > 4096 || decoded_height > 4096)
+        return fail(err, "PS2 TIM2 texture dimensions are invalid");
+    const uint64_t pixel_count = static_cast<uint64_t>(decoded_width) * decoded_height;
+    if (pixel_count > image_size || pixel_count > SIZE_MAX / 4)
+        return fail(err, "PS2 TIM2 base image is truncated");
+
+    const uint8_t* indexed = picture + header_size;
+    const uint8_t* palette = indexed + image_size;
+    rgba->assign(static_cast<size_t>(pixel_count) * 4, 0);
+    for (uint32_t y = 0; y < decoded_height; ++y) {
+        for (uint32_t x = 0; x < decoded_width; ++x) {
+            // GS PSMT8 block/column addressing, matching the swizzled bytes
+            // consumed by the retail PS2 renderer.
+            const uint64_t block = static_cast<uint64_t>(y & ~15u) * decoded_width +
+                                   static_cast<uint64_t>(x & ~15u) * 2u;
+            const uint32_t swap = (((y + 2u) >> 2u) & 1u) * 4u;
+            const uint32_t row = ((((y & ~3u) >> 1u) + (y & 1u)) & 7u);
+            const uint64_t column = static_cast<uint64_t>(row) * decoded_width * 2u +
+                                    static_cast<uint64_t>((x + swap) & 7u) * 4u;
+            const uint32_t byte = ((y >> 1u) & 1u) + ((x >> 2u) & 2u);
+            const uint64_t source_at = block + column + byte;
+            if (source_at >= pixel_count)
+                return fail(err, "PS2 TIM2 swizzled image address exceeds its base mip");
+            const uint32_t source_index = indexed[source_at];
+            const uint32_t palette_index = (source_index & 0xe7u) |
+                                           ((source_index & 0x08u) << 1u) |
+                                           ((source_index & 0x10u) >> 1u);
+            const size_t target = (static_cast<size_t>(y) * decoded_width + x) * 4;
+            if (palette_stride == 2) {
+                const uint16_t color = read_u16(palette + palette_index * 2u);
+                (*rgba)[target] = static_cast<uint8_t>(((color >> 0u) & 31u) * 255u / 31u);
+                (*rgba)[target + 1] = static_cast<uint8_t>(((color >> 5u) & 31u) * 255u / 31u);
+                (*rgba)[target + 2] = static_cast<uint8_t>(((color >> 10u) & 31u) * 255u / 31u);
+                (*rgba)[target + 3] = (color & 0x8000u) ? 255u : 0u;
+            } else if (palette_stride == 3) {
+                const uint8_t* color = palette + palette_index * 3u;
+                (*rgba)[target] = color[0];
+                (*rgba)[target + 1] = color[1];
+                (*rgba)[target + 2] = color[2];
+                (*rgba)[target + 3] = 255u;
+            } else {
+                const uint8_t* color = palette + palette_index * 4u;
+                (*rgba)[target] = color[0];
+                (*rgba)[target + 1] = color[1];
+                (*rgba)[target + 2] = color[2];
+                // GS 32-bit colour stores alpha on a 0..0x80 scale.
+                (*rgba)[target + 3] = static_cast<uint8_t>(std::min(255u, color[3] * 2u));
+            }
+        }
+    }
+    *width = decoded_width;
+    *height = decoded_height;
+    return true;
+}
+
+bool decode_ps2_environment(const RscfInfo& resource, Mesh* mesh, Error* err) {
+    if (resource.payload_size < 32)
+        return fail(err, "PS2 environment header is truncated");
+    const uint8_t* data = resource.payload;
+    const uint64_t size = resource.payload_size;
+    const uint32_t group_count = read_u32(data);
+    const uint32_t record_count = read_u32(data + 16);
+    const uint32_t page_count = read_u32(data + 24);
+    if (!group_count || !record_count || !page_count || group_count > record_count)
+        return fail(err, "PS2 environment header has invalid material or packet counts");
+
+    std::vector<Ps2EnvironmentGroup> groups;
+    groups.reserve(group_count);
+    uint64_t at = 32;
+    uint64_t parsed_records = 0;
+    for (uint32_t group_index = 0; group_index < group_count; ++group_index) {
+        if (at + 4 > size)
+            return fail(err, "PS2 environment material table is truncated");
+        Ps2EnvironmentGroup group;
+        group.material_index = read_u16(data + at);
+        const uint16_t count = read_u16(data + at + 2);
+        const uint64_t used = 4ull + static_cast<uint64_t>(count) * 4;
+        const uint64_t stored = align_up(used, 16);
+        if (stored > size - at)
+            return fail(err, "PS2 environment material record is truncated");
+        group.pairs.reserve(count);
+        for (uint32_t pair_index = 0; pair_index < count; ++pair_index) {
+            const uint8_t* pair = data + at + 4 + static_cast<uint64_t>(pair_index) * 4;
+            group.pairs.push_back({read_u16(pair), read_u16(pair + 2)});
+        }
+        parsed_records += count;
+        groups.push_back(std::move(group));
+        at += stored;
+    }
+    if (parsed_records != record_count)
+        return fail(err, "PS2 environment material table declares %u records but contains %llu",
+                    record_count, static_cast<unsigned long long>(parsed_records));
+    // MCP2 sub_1BD6C0 reads a fixed 32-dword page-offset table after the
+    // variable material records. The retail sample uses one active page set.
+    if (at + 128 > size)
+        return fail(err, "PS2 environment page-offset table is truncated");
+    at += 128;
+    if (at + 16 > size)
+        return fail(err, "PS2 environment geometry header is truncated");
+    if (read_u32(data + at) != group_count || read_u32(data + at + 4) != page_count)
+        return fail(err, "PS2 environment geometry counts disagree with its header");
+    at += 16;
+
+    Mesh next;
+    uint64_t parsed_pages = 0;
+    for (uint32_t group_index = 0; group_index < group_count; ++group_index) {
+        const Ps2EnvironmentGroup& group = groups[group_index];
+        if (at + 16 > size)
+            return fail(err, "PS2 environment geometry material header is truncated");
+        const uint32_t serialized_group = read_u32(data + at);
+        const uint32_t serialized_count = read_u32(data + at + 4);
+        if (serialized_group != group_index || serialized_count != group.pairs.size())
+            return fail(err, "PS2 environment geometry material table is out of sequence");
+        at += 16;
+        for (uint32_t pair_index = 0; pair_index < group.pairs.size(); ++pair_index) {
+            if (at + 16 > size)
+                return fail(err, "PS2 environment render record header is truncated");
+            const uint32_t serialized_record = read_u32(data + at);
+            const uint32_t record_pages = read_u32(data + at + 4);
+            const uint16_t first_page_qwords = read_u16(data + at + 8);
+            const uint16_t last_page_qwords = read_u16(data + at + 10);
+            if (serialized_record != pair_index || !record_pages || !first_page_qwords ||
+                first_page_qwords > 64 || !last_page_qwords || last_page_qwords > 64)
+                return fail(err, "PS2 environment render record has invalid packet metadata");
+            at += 16;
+            const uint64_t packet_bytes = static_cast<uint64_t>(record_pages) * 1024;
+            if (packet_bytes > size - at)
+                return fail(err, "PS2 environment render record packets are truncated");
+            if (!decode_ps2_vif_record(data + at, record_pages, last_page_qwords,
+                                       group.material_index, group.pairs[pair_index].triangle_count,
+                                       &next, err))
+                return false;
+            at += packet_bytes;
+            parsed_pages += record_pages;
+        }
+    }
+    if (parsed_pages != page_count)
+        return fail(err, "PS2 environment declares %u DMA pages but contains %llu", page_count,
+                    static_cast<unsigned long long>(parsed_pages));
+    if (at != size)
+        return fail(err, "PS2 environment has %llu trailing bytes",
+                    static_cast<unsigned long long>(size - at));
+    if (next.faces.empty())
+        return fail(err, "PS2 environment contains no renderable triangles");
+    finish_mesh_bounds(&next);
+    *mesh = std::move(next);
+    return true;
+}
+
 std::string pc_sound_name(const ChunkList& chunks, uint32_t resource_id) {
     for (uint32_t i = 0; i < chunks.count; ++i) {
         RscfInfo resource{};
@@ -424,6 +952,12 @@ std::string static_object_resource_name(const ChunkList& chunks, uint32_t file_i
         if (resource.subtype == ASURA_RESOURCEFILE_TYPE_PC_OBJECTHIERARCHY && skin_id &&
             asura_lower_name_hash(resource.name) == skin_id)
             return std::string(resource.name.data, resource.name.size);
+        Ps2ObjectView object{};
+        Error ignored{};
+        if (resource.subtype == kPs2ObjectResourceSubtype &&
+            ps2_object_view(resource, &object, &ignored) &&
+            asura_lower_name_hash(object.object_path) == file_id)
+            return std::string(object.object_path.data, object.object_path.size);
     }
     return {};
 }
@@ -620,6 +1154,127 @@ bool decode_pc_static_object_model(const ChunkList& chunks, uint32_t chunk_index
     if (next.mesh.faces.empty())
         return false;
     *output = std::move(next);
+    return true;
+}
+
+bool decode_ps2_static_object_models(const ChunkList& chunks, const Document& document,
+                                     std::vector<StaticObjectModel>* output, Error* err) {
+    std::vector<StaticObjectModel> next_models;
+    std::vector<float> selected_lods;
+    for (uint32_t chunk_index = 0; chunk_index < chunks.count; ++chunk_index) {
+        RscfInfo resource{};
+        if (!rscf_info(chunks.chunks[chunk_index], &resource) ||
+            resource.type != ASURA_RESOURCEFILE_TYPE_PLATFORMSPECIFIC ||
+            resource.subtype != kPs2ObjectResourceSubtype)
+            continue;
+        Ps2ObjectView object{};
+        if (!ps2_object_view(resource, &object, err))
+            return false;
+        const uint32_t file_id = asura_lower_name_hash(object.object_path);
+        bool referenced = false;
+        for (const Entity& entity : document.entities)
+            referenced |= entity.kind == EntityKind::StaticObject && entity.value_u32_b == file_id;
+        if (!referenced || !object.triangle_count || !object.packet_count)
+            continue;
+
+        size_t model_index = next_models.size();
+        for (size_t existing = 0; existing < next_models.size(); ++existing) {
+            if (next_models[existing].file_id == file_id) {
+                model_index = existing;
+                break;
+            }
+        }
+        if (model_index < next_models.size() && selected_lods[model_index] <= object.lod_distance)
+            continue;
+
+        Mesh decoded;
+        uint32_t decoded_triangles = 0;
+        uint32_t packet_at = 0;
+        for (uint32_t packet = 0; packet < object.packet_count; ++packet) {
+            const uint32_t qwords = read_u16(object.packet_table + packet * 4);
+            const uint32_t bytes = qwords * 16;
+            if (!qwords || bytes > object.packet_bytes - packet_at)
+                return fail(err, "PS2 object '%.*s' has an invalid VIF packet",
+                            object.object_path.size, object.object_path.data);
+            if (!decode_ps2_vif_stream(object.packets + packet_at, bytes, 0, &decoded,
+                                       &decoded_triangles, err))
+                return false;
+            packet_at += bytes;
+        }
+        if (packet_at != object.packet_bytes || decoded_triangles != object.triangle_count)
+            return fail(err, "PS2 object '%.*s' decoded %u triangles; metadata declares %u",
+                        object.object_path.size, object.object_path.data, decoded_triangles,
+                        object.triangle_count);
+        if (decoded.positions.size() > 65535)
+            return fail(err, "PS2 object '%.*s' exceeds the PC object's 16-bit vertex limit",
+                        object.object_path.size, object.object_path.data);
+
+        StaticObjectModel model;
+        model.file_id = file_id;
+        model.mesh.resource_name.assign(object.object_path.data, object.object_path.size);
+        model.mesh.vertices.resize(decoded.positions.size());
+        for (size_t vertex_index = 0; vertex_index < decoded.positions.size(); ++vertex_index) {
+            SpawnPuppetVertex& vertex = model.mesh.vertices[vertex_index];
+            vertex.position = decoded.positions[vertex_index];
+            vertex.position.y = -vertex.position.y;
+            vertex.normal = vertex_index < decoded.normals.size()
+                                ? decoded.normals[vertex_index]
+                                : Asura_Vector_3{0, -1, 0};
+            vertex.normal.y = -vertex.normal.y;
+            if (vertex_index < decoded.texcoords.size())
+                vertex.texcoord = decoded.texcoords[vertex_index];
+            if (!vertex_index) {
+                model.mesh.min = model.mesh.max = vertex.position;
+            } else {
+                model.mesh.min.x = fminf(model.mesh.min.x, vertex.position.x);
+                model.mesh.min.y = fminf(model.mesh.min.y, vertex.position.y);
+                model.mesh.min.z = fminf(model.mesh.min.z, vertex.position.z);
+                model.mesh.max.x = fmaxf(model.mesh.max.x, vertex.position.x);
+                model.mesh.max.y = fmaxf(model.mesh.max.y, vertex.position.y);
+                model.mesh.max.z = fmaxf(model.mesh.max.z, vertex.position.z);
+            }
+        }
+        model.mesh.faces.reserve(decoded.faces.size());
+        model.mesh.face_materials.reserve(decoded.faces.size());
+        for (const std::array<uint32_t, 3>& face : decoded.faces) {
+            if (face[0] >= model.mesh.vertices.size() || face[1] >= model.mesh.vertices.size() ||
+                face[2] >= model.mesh.vertices.size())
+                return fail(err, "PS2 object '%.*s' contains an out-of-range face",
+                            object.object_path.size, object.object_path.data);
+            model.mesh.faces.push_back({static_cast<uint16_t>(face[0]),
+                                        static_cast<uint16_t>(face[1]),
+                                        static_cast<uint16_t>(face[2])});
+            model.mesh.face_materials.push_back(0);
+        }
+
+        SpawnPuppetMaterial material;
+        material.texture_name.assign(object.texture_name.data, object.texture_name.size);
+        material.flags = object.material_flags;
+        material.texture_flags = 0x2000;
+        for (uint32_t texture_index = 0; texture_index < chunks.count; ++texture_index) {
+            RscfInfo texture{};
+            if (!rscf_info(chunks.chunks[texture_index], &texture) ||
+                texture.type != ASURA_RESOURCEFILE_TYPE_TEXTURE ||
+                !text_name_matches_resource(object.texture_name, texture.name))
+                continue;
+            material.texture_bytes.assign(texture.payload, texture.payload + texture.payload_size);
+            material.texture_fingerprint = 1469598103934665603ull;
+            for (uint8_t byte : material.texture_bytes) {
+                material.texture_fingerprint ^= byte;
+                material.texture_fingerprint *= 1099511628211ull;
+            }
+            break;
+        }
+        model.mesh.materials.push_back(std::move(material));
+        if (model_index == next_models.size()) {
+            next_models.push_back(std::move(model));
+            selected_lods.push_back(object.lod_distance);
+        } else {
+            next_models[model_index] = std::move(model);
+            selected_lods[model_index] = object.lod_distance;
+        }
+    }
+    *output = std::move(next_models);
     return true;
 }
 
@@ -1052,6 +1707,54 @@ bool valid_physical_pickup_body(const Snipe_ServerEntity_Pickup_ChunkDataV0& bod
            body.m_iPhysicalObjectVersion == 7 && body.m_iAsuraPhysicalObjectVersion == 7;
 }
 
+bool valid_ps2_static_object_body(const Snipe_PS2_ServerEntity_StaticObject_ChunkDataV0& body) {
+    return body.m_iStaticObjectVersion == 2 && body.m_iAsuraStaticObjectVersion == 0 &&
+           body.m_iPhysicalObjectVersion == 6 && body.m_iAsuraPhysicalObjectVersion == 7;
+}
+
+bool valid_ps2_pickup_body(const Snipe_PS2_ServerEntity_Pickup_ChunkDataV0& body) {
+    return body.m_iPickupVersion == 2 && body.m_iAsuraPickupVersion == 2 &&
+           valid_ps2_static_object_body(body.m_xStaticObject);
+}
+
+Snipe_ServerEntity_StaticObject_ChunkDataV0
+pc_static_object_body(const Snipe_PS2_ServerEntity_StaticObject_ChunkDataV0& source) {
+    Snipe_ServerEntity_StaticObject_ChunkDataV0 output{};
+    output.m_iStaticObjectVersion = 3;
+    output.m_uStaticObjectFlags = source.m_uStaticObjectFlags;
+    output.m_iAsuraStaticObjectVersion = source.m_iAsuraStaticObjectVersion;
+    output.m_iPhysicalObjectVersion = 7;
+    output.m_uTeam = source.m_uTeam;
+    output.m_uSnipePhysicalFlags = source.m_uSnipePhysicalFlags;
+    output.m_uSnipePhysicalPropertyA = source.m_uSnipePhysicalPropertyA;
+    output.m_uSnipePhysicalPropertyB = source.m_uSnipePhysicalPropertyB;
+    output.m_uSnipePhysicalPropertyC = source.m_uSnipePhysicalPropertyC;
+    output.m_uSnipePhysicalPropertyD = 999;
+    output.m_uSnipePhysicalPropertyE = 0;
+    output.m_iAsuraPhysicalObjectVersion = source.m_iAsuraPhysicalObjectVersion;
+    output.m_xPhysicalObject = source.m_xPhysicalObject;
+    output.m_uNumLinksToBlock = source.m_uNumLinksToBlock;
+    return output;
+}
+
+Snipe_ServerEntity_Pickup_ChunkDataV0
+pc_pickup_body(const Snipe_PS2_ServerEntity_Pickup_ChunkDataV0& source) {
+    Snipe_ServerEntity_Pickup_ChunkDataV0 output{};
+    output.m_iPickupVersion = source.m_iPickupVersion;
+    output.m_uPickupClassID = source.m_uPickupClassID;
+    output.m_uPickupFlags = source.m_uPickupFlags;
+    output.m_iAsuraPickupVersion = source.m_iAsuraPickupVersion;
+    output.m_uItemID = source.m_uItemID;
+    output.m_uPickupPropertyA = source.m_uPickupPropertyA;
+    output.m_uPickupPropertyB = source.m_uPickupPropertyB;
+    const Snipe_ServerEntity_StaticObject_ChunkDataV0 object =
+        pc_static_object_body(source.m_xStaticObject);
+    memcpy(reinterpret_cast<uint8_t*>(&output) +
+               offsetof(Snipe_ServerEntity_Pickup_ChunkDataV0, m_iStaticObjectVersion),
+           &object, sizeof(object));
+    return output;
+}
+
 bool load_pickup_donor(const std::string& path, std::vector<PickupTemplate>* templates,
                        std::vector<PickupModel>* models, std::string* why) {
     Error err{};
@@ -1209,6 +1912,11 @@ bool import_pc_entities(const ChunkList& chunks, Document* document, Error* err)
         const ChunkRef& chunk = chunks.chunks[chunk_index];
         if (chunk.cid != ASURA_CHUNK_PHONONS)
             continue;
+        // The PS2 target serializes PHON v8. Its record predates the v9
+        // layout used by the PC editor, so leave those sounds preserved in
+        // the source chunk instead of interpreting them with the wrong ABI.
+        if (chunk.version == 8)
+            break;
         if (chunk.version != 9 || chunk.size < 20)
             return fail(err, "PHON chunk %u has an unsupported version or size", chunk_index);
         const uint8_t* payload = chunk.data + sizeof(Asura_Chunk_Header);
@@ -1412,6 +2120,139 @@ bool import_pc_entities(const ChunkList& chunks, Document* document, Error* err)
     return true;
 }
 
+bool ps2_passthrough_entity_class(uint16_t classification) {
+    return classification == AsuraEntityClass_CutsceneController;
+}
+
+bool import_ps2_entities(const ChunkList& chunks, Document* document, Error* err) {
+    uint32_t spawn_number = 0, pickup_number = 0, static_number = 0;
+    for (uint32_t chunk_index = 0; chunk_index < chunks.count; ++chunk_index) {
+        const ChunkRef& chunk = chunks.chunks[chunk_index];
+        if (chunk.cid != ASURA_CHUNK_ENTITY)
+            continue;
+        if (chunk.version != 0 || chunk.size < sizeof(Asura_Chunk_Entity))
+            return fail(err, "PS2 ENTI chunk %u has an unsupported version or size", chunk_index);
+
+        const uint8_t* payload = chunk.data + sizeof(Asura_Chunk_Header);
+        const uint32_t guid = read_u32(payload);
+        const uint16_t classification = read_u16(
+            payload + offsetof(Asura_Chunk_Entity_PayloadHeader, Classification));
+        note_document_guid(document, guid);
+
+        if (classification == SnipeEntityClass_SpawnPoint) {
+            if (chunk.size != sizeof(Asura_Chunk_Header) +
+                                  sizeof(Snipe_ServerEntity_SpawnPoint_ChunkDataV0))
+                return fail(err, "PS2 spawnpoint ENTI chunk %u has an unsupported size", chunk_index);
+            Snipe_ServerEntity_SpawnPoint_ChunkDataV0 source{};
+            memcpy(&source, payload, sizeof(source));
+            if (source.m_iVersion != 0)
+                return fail(err, "PS2 spawnpoint ENTI chunk %u has unsupported payload version %d",
+                            chunk_index, source.m_iVersion);
+            Entity entity;
+            entity.kind = EntityKind::SpawnPoint;
+            entity.name = "Spawn " + std::to_string(++spawn_number);
+            entity.guid = source.m_xEntity.Guid;
+            entity.entity_padding = source.m_xEntity.m_usPadding;
+            entity.position = source.m_xPosition;
+            entity.rotation = direction_euler(source.m_xDirection);
+            entity.spawn_direction = source.m_xDirection;
+            entity.value_u32_a = source.m_uTeamMask;
+            entity.value_u32_b = source.m_uGameModeMask;
+            entity.spawn_source_record = true;
+            entity.spawn_index = source.m_iSpawnIndex;
+            entity.spawn_posture = source.m_iPosture;
+            entity.spawn_timer = source.m_fSpawnTimer;
+            document->entities.push_back(std::move(entity));
+        } else if (classification == SnipeEntityClass_StaticObject) {
+            if (chunk.size != sizeof(Asura_Chunk_Entity) +
+                                  sizeof(Snipe_PS2_ServerEntity_StaticObject_ChunkDataV0))
+                return fail(err, "PS2 static-object ENTI chunk %u has an unsupported size", chunk_index);
+            Snipe_PS2_ServerEntity_StaticObject_ChunkDataV0 source{};
+            memcpy(&source, payload + sizeof(Asura_Chunk_Entity_PayloadHeader), sizeof(source));
+            if (!valid_ps2_static_object_body(source))
+                return fail(err, "PS2 static-object ENTI chunk %u has unsupported payload versions",
+                            chunk_index);
+            const Snipe_ServerEntity_StaticObject_ChunkDataV0 body = pc_static_object_body(source);
+            Entity entity;
+            entity.kind = EntityKind::StaticObject;
+            entity.guid = guid;
+            entity.source_entity_record = true;
+            entity.source_entity_classification = classification;
+            entity.entity_padding = read_u16(
+                payload + offsetof(Asura_Chunk_Entity_PayloadHeader, m_usPadding));
+            entity.value_a = body.m_xPhysicalObject.m_fHealth;
+            entity.value_u32_b = body.m_xPhysicalObject.m_uFileID;
+            entity.pickup_skin_id = body.m_xPhysicalObject.m_uSkinID;
+            entity.pickup_anim_id = body.m_xPhysicalObject.m_uAnimID;
+            entity.pickup_anim_file_id = body.m_xPhysicalObject.m_uAnimFileID;
+            entity.static_object_has_template = true;
+            memcpy(entity.static_object_body.data(), &body, sizeof(body));
+            entity.position = body.m_xPhysicalObject.m_xPosition;
+            entity.rotation = quaternion_euler(body.m_xPhysicalObject.m_xOrientation);
+            entity.name = static_object_resource_name(chunks, entity.value_u32_b,
+                                                      entity.pickup_skin_id);
+            if (entity.name.empty()) {
+                char name[96]{};
+                snprintf(name, sizeof(name), "Object %u (%08X)", ++static_number,
+                         entity.value_u32_b);
+                entity.name = name;
+            }
+            note_static_object_template(document, entity);
+            document->entities.push_back(std::move(entity));
+        } else if (classification == SnipeEntityClass_Pickup) {
+            if (chunk.size != sizeof(Asura_Chunk_Entity) +
+                                  sizeof(Snipe_PS2_ServerEntity_Pickup_ChunkDataV0))
+                return fail(err, "PS2 pickup ENTI chunk %u has an unsupported size", chunk_index);
+            Snipe_PS2_ServerEntity_Pickup_ChunkDataV0 source{};
+            memcpy(&source, payload + sizeof(Asura_Chunk_Entity_PayloadHeader), sizeof(source));
+            if (!valid_ps2_pickup_body(source))
+                return fail(err, "PS2 pickup ENTI chunk %u has unsupported payload versions",
+                            chunk_index);
+            const Snipe_ServerEntity_Pickup_ChunkDataV0 body = pc_pickup_body(source);
+            Entity entity;
+            entity.kind = EntityKind::Pickup;
+            entity.guid = guid;
+            entity.source_entity_record = true;
+            entity.source_entity_classification = classification;
+            entity.entity_padding = read_u16(
+                payload + offsetof(Asura_Chunk_Entity_PayloadHeader, m_usPadding));
+            entity.value_u32_a = body.m_uItemID;
+            entity.value_u32_b = body.m_xPhysicalObject.m_uFileID;
+            entity.value_a = body.m_xPhysicalObject.m_fHealth;
+            entity.pickup_skin_id = body.m_xPhysicalObject.m_uSkinID;
+            entity.pickup_anim_id = body.m_xPhysicalObject.m_uAnimID;
+            entity.pickup_anim_file_id = body.m_xPhysicalObject.m_uAnimFileID;
+            memcpy(entity.pickup_body.data(), &body, sizeof(body));
+            entity.pickup_has_template = true;
+            entity.position = body.m_xPhysicalObject.m_xPosition;
+            entity.rotation = quaternion_euler(body.m_xPhysicalObject.m_xOrientation);
+            const char* item_name = snipe_item_name(entity.value_u32_a);
+            ++pickup_number;
+            if (item_name) {
+                entity.name = std::string(item_name) + " " + std::to_string(pickup_number);
+            } else {
+                char name[96]{};
+                snprintf(name, sizeof(name), "Unknown item %u (0x%02X)", pickup_number,
+                         entity.value_u32_a);
+                entity.name = name;
+            }
+            note_pickup_template(document, entity);
+            document->entities.push_back(std::move(entity));
+        } else if (ps2_passthrough_entity_class(classification)) {
+            if (chunk.size < 52)
+                return fail(err, "PS2 ENTI 0x%04X chunk %u has an unsupported size",
+                            classification, chunk_index);
+        } else {
+            // Preserve the editor's explicit entity-class contract: unknown
+            // project classifications are neither interpreted nor exported.
+            continue;
+        }
+    }
+    document->source_pickup_inventory_complete = true;
+    document->source_static_object_inventory_complete = true;
+    return true;
+}
+
 bool decode_pc_static_object_models(const ChunkList& chunks, const Document& document,
                                     std::vector<StaticObjectModel>* models, Error* err) {
     models->clear();
@@ -1482,6 +2323,57 @@ bool pc_skybox_info(const ChunkList& chunks, PcSkyboxInfo* info, Error* err) {
         return true;
     }
     return fail(err, "the .PC contains no SKYB chunk");
+}
+
+bool ps2_skybox_info(const ChunkList& chunks, PcSkyboxInfo* info, Error* err) {
+    for (uint32_t chunk_index = 0; chunk_index < chunks.count; ++chunk_index) {
+        const ChunkRef& chunk = chunks.chunks[chunk_index];
+        if (chunk.cid != ASURA_CHUNK_SKYBOX)
+            continue;
+        // MCP1 Asura_Chunk_SkyBox::Process identifies v4 as seven padded
+        // strings followed by one 32-bit DrawClouds value. Versions before 6
+        // serialize left/back in the opposite order from the canonical slots.
+        if (chunk.version != 4 ||
+            chunk.size < sizeof(Asura_Chunk_Header) +
+                             sizeof(Asura_Chunk_SkyBox_PayloadPrefixV7) +
+                             ASURA_SKYBOX_V3_V4_TEXTURE_PATH_COUNT * 4 + 4)
+            return fail(err, "the .PS2 SKYB chunk has an unsupported version or size");
+        const uint8_t* payload = chunk.data + sizeof(Asura_Chunk_Header);
+        const uint32_t payload_size = chunk.size - sizeof(Asura_Chunk_Header);
+        Asura_Chunk_SkyBox_PayloadPrefixV7 prefix{};
+        memcpy(&prefix, payload, sizeof(prefix));
+        info->chunk_version = 7; // Re-emit the canonicalized paths in the PC ABI.
+        info->red = prefix.m_fRed;
+        info->green = prefix.m_fGreen;
+        info->blue = prefix.m_fBlue;
+        info->orientation = prefix.m_fOrientationAroundYAxis;
+        if (!isfinite(info->red) || !isfinite(info->green) || !isfinite(info->blue) ||
+            !isfinite(info->orientation))
+            return fail(err, "the .PS2 SKYB colour or orientation is invalid");
+
+        uint64_t at = sizeof(prefix);
+        for (uint32_t serialized_slot = 0;
+             serialized_slot < ASURA_SKYBOX_V3_V4_TEXTURE_PATH_COUNT; ++serialized_slot) {
+            if (at > 0xffffffffull)
+                return fail(err, "the .PS2 SKYB texture table is invalid");
+            const Str name = padded_string_at(payload, payload_size, static_cast<uint32_t>(at));
+            if (!name.data)
+                return fail(err, "the .PS2 SKYB texture table is truncated");
+            const uint32_t canonical_slot =
+                serialized_slot == 2 ? 3u : serialized_slot == 3 ? 2u : serialized_slot;
+            info->names[canonical_slot] = name;
+            at = align_up(at + name.size + 1, 4);
+            if (at > payload_size)
+                return fail(err, "the .PS2 SKYB texture table is truncated");
+        }
+        if (at + 4 > payload_size)
+            return fail(err, "the .PS2 SKYB cloud parameter is truncated");
+        info->draw_clouds = read_u32(payload + at) != 0;
+        info->back_texture_is_front_upside_down = false;
+        info->right_texture_is_left_upside_down = false;
+        return true;
+    }
+    return fail(err, "the .PS2 contains no SKYB chunk");
 }
 
 void import_pc_skybox_settings(const PcSkyboxInfo& info, SkyboxSettings* skybox) {
@@ -1567,6 +2459,82 @@ bool load_pc_level(const std::string& path, Document* document, Mesh* mesh, std:
             *object_models = std::move(next_object_models);
     } else if (why) {
         *why = err.set ? err.message : "Could not load the PC level.";
+    }
+    unmap_file(&chunks.file);
+    arena_release(&arena);
+    return ok;
+}
+
+bool load_ps2_level(const std::string& path, Document* document, Mesh* mesh, std::string* why,
+                    std::vector<StaticObjectModel>* object_models) {
+    const size_t dot = path.find_last_of('.');
+    if (dot == std::string::npos || _stricmp(path.c_str() + dot, ".ps2") != 0) {
+        if (why)
+            *why = "The level reader accepts only .PS2 files.";
+        return false;
+    }
+    Error err{};
+    Arena arena{};
+    ChunkList chunks{};
+    Document next_document;
+    Mesh next_mesh;
+    std::vector<StaticObjectModel> next_object_models;
+    bool ok = arena_init(&arena, 64 * MiB, &err) && parse_chunks(path.c_str(), &chunks, &arena, &err);
+    bool source_has_skybox = false;
+    for (uint32_t chunk_index = 0; ok && chunk_index < chunks.count; ++chunk_index)
+        source_has_skybox |= chunks.chunks[chunk_index].cid == ASURA_CHUNK_SKYBOX;
+    PcSkyboxInfo skybox_info{};
+    if (ok && source_has_skybox)
+        ok = ps2_skybox_info(chunks, &skybox_info, &err);
+    if (ok && source_has_skybox)
+        import_pc_skybox_settings(skybox_info, &next_document.skybox);
+    for (uint32_t chunk_index = 0; ok && chunk_index < chunks.count; ++chunk_index) {
+        const ChunkRef& chunk = chunks.chunks[chunk_index];
+        if (chunk.cid == ASURA_CHUNK_WEATHERSYSTEM && chunk.version >= 5 &&
+            chunk.version <= 6 && chunk.size > 21) {
+            next_document.weather_source_record = true;
+            next_document.rain_enabled = chunk.data[21] != 0;
+        } else if (chunk.cid == ASURA_CHUNK_STREAMINGBACKGROUNDSOUND &&
+                   !next_document.ambient_source_record) {
+            std::string stream_path;
+            float volume = 1.0f;
+            if (!source_ambience_info(chunk, &stream_path, &volume, nullptr, &err)) {
+                ok = false;
+            } else {
+                next_document.ambient_source_record = true;
+                next_document.ambient_stream_path = std::move(stream_path);
+                next_document.ambient_volume = volume;
+            }
+        }
+    }
+
+    RscfInfo environment{};
+    if (ok && !find_ps2_environment(chunks, &environment))
+        ok = fail(&err, "the .PS2 contains no PS2StrippedEnv RSCF");
+    if (ok)
+        ok = decode_ps2_environment(environment, &next_mesh, &err) &&
+             import_ps2_entities(chunks, &next_document, &err);
+    // PS2 LITE v4 and PHON v8 still use older target ABIs. ENTI is handled by
+    // the dedicated importer above, which expands the two short physical-object
+    // records and preserves the remaining byte-compatible classifications.
+    if (ok)
+        add_resource_backed_pickup_templates(chunks, &next_document);
+    if (ok && object_models)
+        ok = decode_ps2_static_object_models(chunks, next_document, &next_object_models, &err);
+    if (ok) {
+        for (StaticObjectTemplate& object : next_document.static_object_templates)
+            object.donor_path = path;
+        // Keep the serialized project field for compatibility with existing
+        // .alev files; this path now denotes the source PS2 level.
+        next_document.source_pc_path = path;
+        next_document.output_path.clear();
+        next_document.dirty = false;
+        *document = std::move(next_document);
+        *mesh = std::move(next_mesh);
+        if (object_models)
+            *object_models = std::move(next_object_models);
+    } else if (why) {
+        *why = err.set ? err.message : "Could not load the PS2 level.";
     }
     unmap_file(&chunks.file);
     arena_release(&arena);

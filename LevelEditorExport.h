@@ -24,6 +24,10 @@ bool pc_environment_material_bindings(
     const asura::level::ChunkList& chunks,
     std::vector<PcEnvironmentMaterialBinding>* materials,
     asura::Error* err);
+bool ps2_environment_material_bindings(
+    const asura::level::ChunkList& chunks,
+    std::vector<PcEnvironmentMaterialBinding>* materials,
+    asura::Error* err);
 
 bool pc_environment_collision_flags(
     const asura::level::ChunkList& chunks,
@@ -34,7 +38,8 @@ bool pc_environment_collision_flags(
 DirectX::XMFLOAT4 material_map_color(uint32_t key);
 Asura_Vector_3 oriented_box_dimensions(const Entity& entity);
 
-bool pack_document(Document& document, const char* output_path, std::string* why);
+bool pack_document(Document& document, const Mesh* source_mesh, const char* output_path,
+                   std::string* why);
 bool export_pc_environment_obj(const std::string& source_pc_path, const char* output_path,
                                std::string* why);
 

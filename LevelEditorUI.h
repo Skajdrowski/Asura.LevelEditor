@@ -11,7 +11,7 @@ namespace editor {
 
 enum ControlId : int {
     ID_OPEN_OBJ = 100,
-    ID_OPEN_PC,
+    ID_OPEN_PS2,
     ID_OPEN_PROJECT,
     ID_SAVE_PROJECT,
     ID_EXPORT_PC,
@@ -69,7 +69,7 @@ LRESULT CALLBACK ambience_properties_proc(HWND hwnd, UINT message, WPARAM wparam
 LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
 
 bool open_obj_path(const std::string& path);
-bool open_pc_path(const std::string& path);
+bool open_ps2_path(const std::string& path);
 bool load_document_preview(Document* document, Mesh* mesh, std::string* why,
                            std::vector<PickupModel>* pickup_models,
                            std::vector<StaticObjectModel>* object_models);

@@ -369,5 +369,8 @@ FodyWeavers.xsd
 *.bmp
 *.tga
 *.pc
+*.ps2
+*.wii
 *.json
 *.mtl
+*.exe

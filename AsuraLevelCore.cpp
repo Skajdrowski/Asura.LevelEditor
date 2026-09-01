@@ -632,7 +632,8 @@ bool build_env(const Config& cfg, const ObjData& obj, const MaterialMap& materia
             return false;
         if (m == 0xffffffffu)
             m = 0;
-        work[i] = {i, 0, 0, (a.x + b.x + c.x) / 3.0f, (a.z + b.z + c.z) / 3.0f, m, f.order};
+        work[i] = {i, 0, 0, (a.x + b.x + c.x) / 3.0f,
+                   (a.z + b.z + c.z) / 3.0f, m, f.order};
     }
     if (cfg.auto_block_xz_cell > 0.0f) {
         float minx = work[0].cx, minz = work[0].cz;

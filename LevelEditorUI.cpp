@@ -1233,9 +1233,15 @@ void refresh_inspector() {
         EnableWindow(g.rain_toggle,
                      !g.document.source_pc_path.empty() || !g.document.obj_path.empty());
     }
-    if (g.backface_cull_toggle)
+    if (g.backface_cull_toggle) {
+        const size_t source_dot = g.document.source_pc_path.find_last_of('.');
+        const bool ps2_environment = source_dot != std::string::npos &&
+                                     _stricmp(g.document.source_pc_path.c_str() + source_dot,
+                                              ".ps2") == 0;
         SendMessageA(g.backface_cull_toggle, BM_SETCHECK,
-                     g.backface_culling ? BST_CHECKED : BST_UNCHECKED, 0);
+                     g.backface_culling && !ps2_environment ? BST_CHECKED : BST_UNCHECKED, 0);
+        EnableWindow(g.backface_cull_toggle, !ps2_environment);
+    }
     if (g.ambience_properties)
         EnableWindow(g.ambience_properties,
                      !g.document.source_pc_path.empty() || !g.document.obj_path.empty());
@@ -2274,7 +2280,7 @@ void layout_controls() {
         MoveWindow(g.viewport, vr.left, vr.top, vr.right - vr.left, vr.bottom - vr.top, TRUE);
     const int right = r.right - ui_px(262);
     const struct { int id, x, y, w; } top[] = {
-        {ID_OPEN_OBJ, 8, 6, 78},              {ID_OPEN_PC, 90, 6, 78},
+        {ID_OPEN_OBJ, 8, 6, 78},              {ID_OPEN_PS2, 90, 6, 78},
         {ID_OPEN_PROJECT, 172, 6, 98},         {ID_SAVE_PROJECT, 274, 6, 96},
         {ID_EXPORT_PC, 374, 6, 88},            {ID_EXPORT_OBJ, 466, 6, 88},
         {ID_MATERIAL_MAP, 8, 38, 132},         {ID_EXPORT_MATERIAL_MAP, 144, 38, 132},
@@ -2362,7 +2368,7 @@ void create_controls() {
         g.viewport = nullptr;
     }
     make_control("BUTTON", "Open .OBJ", BS_DEFPUSHBUTTON, ID_OPEN_OBJ);
-    make_control("BUTTON", "Open .PC", BS_PUSHBUTTON, ID_OPEN_PC);
+    make_control("BUTTON", "Open .PS2", BS_PUSHBUTTON, ID_OPEN_PS2);
     make_control("BUTTON", "Open project", BS_PUSHBUTTON, ID_OPEN_PROJECT);
     make_control("BUTTON", "Save project", BS_PUSHBUTTON, ID_SAVE_PROJECT);
     make_control("BUTTON", "Export .PC", BS_PUSHBUTTON, ID_EXPORT_PC);
@@ -2429,7 +2435,7 @@ void create_controls() {
     g.light_properties =
         make_control("BUTTON", "All light properties...", BS_PUSHBUTTON, ID_LIGHT_PROPERTIES);
     make_control("BUTTON", "Apply properties", BS_PUSHBUTTON, ID_APPLY_INSPECTOR);
-    g.status = make_control("STATIC", "Open a Blender OBJ or original .PC level to begin.", SS_LEFT, ID_STATUS);
+    g.status = make_control("STATIC", "Open a Blender OBJ or original .PS2 level to begin.", SS_LEFT, ID_STATUS);
     layout_controls();
     refresh_inspector();
 }
@@ -2546,10 +2552,12 @@ bool load_document_preview(Document* document, Mesh* mesh, std::string* why,
     }
     if (!document->source_pc_path.empty()) {
         Document imported;
-        if (!load_pc_level(document->source_pc_path, &imported, mesh, why, pickup_models, object_models))
+        if (pickup_models)
+            pickup_models->clear();
+        if (object_models)
+            object_models->clear();
+        if (!load_ps2_level(document->source_pc_path, &imported, mesh, why, object_models))
             return false;
-        if (!document->skybox.source_record && imported.skybox.source_record)
-            document->skybox = imported.skybox;
         if (!document->weather_source_record && imported.weather_source_record) {
             document->weather_source_record = true;
             document->rain_enabled = imported.rain_enabled;
@@ -2587,59 +2595,56 @@ bool load_document_preview(Document* document, Mesh* mesh, std::string* why,
     return true;
 }
 
-bool open_pc_path(const std::string& path) {
+bool open_ps2_path(const std::string& path) {
     stop_sound_preview();
-    set_status("Reading PC environment and supported entities...");
+    set_status("Reading PS2StrippedEnv and supported entities...");
     UpdateWindow(g.window);
     SetCursor(LoadCursor(nullptr, IDC_WAIT));
     Document document;
     Mesh mesh;
-    std::string why;
-    std::vector<PickupModel> pickup_models;
     std::vector<StaticObjectModel> object_models;
-    const bool ok = load_pc_level(path, &document, &mesh, &why, &pickup_models, &object_models);
+    std::string why;
+    const bool ok = load_ps2_level(path, &document, &mesh, &why, &object_models);
     SetCursor(LoadCursor(nullptr, IDC_ARROW));
     if (!ok) {
-        set_status("Could not open the .PC level.");
-        MessageBoxA(g.window, why.c_str(), "Could not open .PC", MB_ICONERROR);
+        set_status("Could not open the .PS2 level.");
+        MessageBoxA(g.window, why.c_str(), "Could not open .PS2", MB_ICONERROR);
         return false;
     }
     g.document = std::move(document);
     g.mesh = std::move(mesh);
-    g.pickup_models = std::move(pickup_models);
+    g.pickup_models.clear();
     g.static_object_models = std::move(object_models);
     set_single_selection_state(g.document.entities.empty() ? -1 : 0);
     g.pending_kind = -1;
-    std::string skybox_why;
-    const bool skybox_loaded = gpu_load_pc_skybox(path, g.document.skybox, &skybox_why);
+    const bool skybox_loaded = reload_skybox_preview(false);
     frame_mesh();
+    uint32_t loaded_textures = 0, missing_textures = 0;
+    std::string texture_why;
+    gpu_reload_environment_textures(&texture_why, &loaded_textures, &missing_textures);
     reset_history(true);
     refresh_list();
     refresh_inspector();
     update_title();
-    size_t source_object_count = 0;
-    for (const Entity& entity : g.document.entities)
-        source_object_count += entity.source_entity_record;
-    const size_t authored_entity_count = g.document.entities.size() - source_object_count;
-    char status[420];
+    char status[520];
     snprintf(status, sizeof(status),
-             skybox_loaded
-                 ? "Original .PC loaded with embedded skybox: %zu vertices, %zu triangles, %zu lights/spawns/sounds and %zu source objects/targets/markers."
-                 : "Original .PC loaded: %zu vertices, %zu triangles, %zu lights/spawns/sounds and %zu source objects/targets/markers; embedded skybox unavailable.",
-             g.mesh.positions.size(), g.mesh.faces.size(), authored_entity_count, source_object_count);
+             "Original .PS2 loaded: %zu vertices, %zu triangles, %zu static-object models, %u TIM2 material ranges loaded, %u untextured; SKYB %s; PS2 rendering is two-sided.%s%s",
+             g.mesh.positions.size(), g.mesh.faces.size(), g.static_object_models.size(), loaded_textures, missing_textures,
+             skybox_loaded ? "and its embedded TIM2 textures recovered" : "preview unavailable",
+             texture_why.empty() ? "" : " ", texture_why.c_str());
     set_status(status);
     request_redraw();
     return true;
 }
 
-void command_open_pc() {
+void command_open_ps2() {
     if (!confirm_discard())
         return;
     std::string path = g.document.source_pc_path;
-    if (!choose_path(g.window, false, "Open original Sniper Elite PC level",
-                     "Sniper Elite PC level\0*.PC\0All files\0*.*\0", "PC", &path))
+    if (!choose_path(g.window, false, "Open original Sniper Elite PS2 level",
+                     "Sniper Elite PS2 level\0*.PS2\0All files\0*.*\0", "PS2", &path))
         return;
-    open_pc_path(path);
+    open_ps2_path(path);
 }
 
 void command_save_project() {
@@ -2660,16 +2665,29 @@ void command_save_project() {
 
 bool reload_skybox_preview(bool show_warning) {
     std::string why;
-    const bool use_embedded = g.document.sky_texture_dir.empty() && !g.document.source_pc_path.empty();
-    const bool loaded = use_embedded ? gpu_load_pc_skybox(g.document.source_pc_path, g.document.skybox, &why)
-                                     : gpu_load_skybox(g.document.sky_texture_dir, &why);
+    bool embedded = false;
+    bool loaded = false;
+    if (!g.document.sky_texture_dir.empty()) {
+        loaded = gpu_load_skybox(g.document.sky_texture_dir, &why);
+    } else if (g.document.skybox.source_record && !g.document.source_pc_path.empty()) {
+        embedded = true;
+        const size_t dot = g.document.source_pc_path.find_last_of('.');
+        const char* extension = dot == std::string::npos
+                                    ? ""
+                                    : g.document.source_pc_path.c_str() + dot;
+        loaded = _stricmp(extension, ".ps2") == 0
+                     ? gpu_load_ps2_skybox(g.document.source_pc_path, g.document.skybox, &why)
+                     : gpu_load_pc_skybox(g.document.source_pc_path, g.document.skybox, &why);
+    } else {
+        loaded = gpu_load_skybox({}, &why);
+    }
     if (loaded) {
         gpu_rebuild_skybox_vertices(g.document.skybox.orientation_radians,
                                     g.document.skybox.back_texture_is_front_upside_down,
                                     g.document.skybox.right_texture_is_left_upside_down, nullptr);
         gpu_set_skybox_tint(g.document.skybox);
     }
-    if (!loaded && show_warning && (use_embedded || !g.document.sky_texture_dir.empty()))
+    if (!loaded && show_warning && (!g.document.sky_texture_dir.empty() || embedded))
         MessageBoxA(g.window, why.c_str(), "Skybox preview unavailable", MB_ICONWARNING);
     request_redraw();
     return loaded;
@@ -2904,7 +2922,7 @@ void command_export() {
     UpdateWindow(g.window);
     SetCursor(LoadCursor(nullptr, IDC_WAIT));
     std::string why;
-    const bool ok = pack_document(g.document, path.c_str(), &why);
+    const bool ok = pack_document(g.document, &g.mesh, path.c_str(), &why);
     SetCursor(LoadCursor(nullptr, IDC_ARROW));
     if (!ok) {
         commit_history_transaction();
@@ -2914,9 +2932,14 @@ void command_export() {
     }
     g.document.output_path = path;
     commit_history_transaction();
-    set_status(g.document.source_pc_path.empty()
-                   ? "Export complete: the .PC contains the environment and editor-authored entities."
-                   : "Export complete: source chunks were preserved and editable PC records were updated.");
+    const size_t source_dot = g.document.source_pc_path.find_last_of('.');
+    const bool converted_ps2 = source_dot != std::string::npos &&
+                               _stricmp(g.document.source_pc_path.c_str() + source_dot, ".ps2") == 0;
+    set_status(converted_ps2
+                   ? "Export complete: PS2 geometry was converted to two-sided PC Env, with embedded DDS textures."
+                   : g.document.source_pc_path.empty()
+                         ? "Export complete: the .PC contains the environment and editor-authored entities."
+                         : "Export complete: source chunks were preserved and editable PC records were updated.");
     MessageBoxA(g.window, path.c_str(), "Exported .PC", MB_ICONINFORMATION);
 }
 
@@ -4056,8 +4079,8 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
         record_inspector_edit(id, HIWORD(wparam));
         if (id == ID_OPEN_OBJ)
             command_open_obj();
-        else if (id == ID_OPEN_PC)
-            command_open_pc();
+        else if (id == ID_OPEN_PS2)
+            command_open_ps2();
         else if (id == ID_OPEN_PROJECT)
             command_open_project();
         else if (id == ID_SAVE_PROJECT)
@@ -4256,9 +4279,9 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             if (g.document.source_pc_path.empty() || confirm_discard())
                 open_obj_path(p);
         }
-        else if (_stricmp(ext.c_str(), ".pc") == 0) {
+        else if (_stricmp(ext.c_str(), ".ps2") == 0) {
             if (confirm_discard())
-                open_pc_path(p);
+                open_ps2_path(p);
         }
         else if (_stricmp(ext.c_str(), ".alev") == 0) {
             if (!confirm_discard())

@@ -79,8 +79,8 @@ int APIENTRY WinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE, _In_ LPSTR com
         const std::string extension = dot == std::string::npos ? "" : path.substr(dot);
         if (_stricmp(extension.c_str(), ".obj") == 0) {
             open_obj_path(path);
-        } else if (_stricmp(extension.c_str(), ".pc") == 0) {
-            open_pc_path(path);
+        } else if (_stricmp(extension.c_str(), ".ps2") == 0) {
+            open_ps2_path(path);
         } else if (_stricmp(extension.c_str(), ".alev") == 0) {
             std::string why;
             Document document;

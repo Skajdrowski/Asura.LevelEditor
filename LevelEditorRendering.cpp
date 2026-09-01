@@ -388,6 +388,50 @@ bool gpu_create_dds_view_from_memory(const uint8_t* bytes, size_t byte_count, co
     return true;
 }
 
+bool gpu_create_tim2_view_from_memory(const uint8_t* bytes, uint32_t byte_count,
+                                      const char* label, ID3D11ShaderResourceView** output,
+                                      std::string* why) {
+    *output = nullptr;
+    Error err{};
+    uint32_t width = 0, height = 0;
+    std::vector<uint8_t> rgba;
+    if (!decode_ps2_tim2(bytes, byte_count, &width, &height, &rgba, &err)) {
+        if (why) {
+            const char* source = label ? label : "embedded .PS2 texture";
+            *why = std::string(err.set ? err.message : "Could not decode PS2 TIM2 texture") +
+                   ": " + source;
+        }
+        return false;
+    }
+
+    D3D11_SUBRESOURCE_DATA initial{};
+    initial.pSysMem = rgba.data();
+    initial.SysMemPitch = width * 4u;
+    initial.SysMemSlicePitch = width * height * 4u;
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = width;
+    desc.Height = height;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_IMMUTABLE;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    ID3D11Texture2D* texture = nullptr;
+    const HRESULT texture_result = gpu.device->CreateTexture2D(&desc, &initial, &texture);
+    const HRESULT view_result = SUCCEEDED(texture_result)
+                                    ? gpu.device->CreateShaderResourceView(texture, nullptr, output)
+                                    : texture_result;
+    gpu_release(texture);
+    if (FAILED(view_result)) {
+        if (why)
+            *why = std::string("Direct3D could not create the decoded PS2 texture: ") +
+                   (label ? label : "embedded .PS2 texture");
+        return false;
+    }
+    return true;
+}
+
 ID3D11ShaderResourceView* gpu_model_texture_view(const SpawnPuppetMaterial* material) {
     if (!material || material->texture_bytes.empty())
         return gpu.white_texture;
@@ -400,8 +444,16 @@ ID3D11ShaderResourceView* gpu_model_texture_view(const SpawnPuppetMaterial* mate
     cached.name = material->texture_name;
     cached.fingerprint = material->texture_fingerprint;
     std::string ignored_error;
-    gpu_create_dds_view_from_memory(material->texture_bytes.data(), material->texture_bytes.size(),
-                                    material->texture_name.c_str(), &cached.view, &ignored_error);
+    if (material->texture_bytes.size() >= 4 &&
+        memcmp(material->texture_bytes.data(), "TIM2", 4) == 0) {
+        gpu_create_tim2_view_from_memory(material->texture_bytes.data(),
+                                         static_cast<uint32_t>(material->texture_bytes.size()),
+                                         material->texture_name.c_str(), &cached.view,
+                                         &ignored_error);
+    } else {
+        gpu_create_dds_view_from_memory(material->texture_bytes.data(), material->texture_bytes.size(),
+                                        material->texture_name.c_str(), &cached.view, &ignored_error);
+    }
     gpu.model_textures.push_back(std::move(cached));
     ID3D11ShaderResourceView* view = gpu.model_textures.back().view;
     return view ? view : gpu.white_texture;
@@ -654,6 +706,64 @@ bool gpu_load_pc_environment_textures(const std::string& pc_path, uint32_t* load
     return ok;
 }
 
+bool gpu_load_ps2_environment_textures(const std::string& ps2_path, uint32_t* loaded_count,
+                                       uint32_t* missing_count, std::string* why) {
+    Error err{};
+    Arena arena{};
+    ChunkList chunks{};
+    std::vector<PcEnvironmentMaterialBinding> materials;
+    bool ok = arena_init(&arena, 8 * MiB, &err) &&
+              parse_chunks(ps2_path.c_str(), &chunks, &arena, &err) &&
+              ps2_environment_material_bindings(chunks, &materials, &err);
+    uint32_t loaded = 0, missing = 0;
+    std::string last_texture_error;
+    if (ok) {
+        for (GpuMaterialRange& range : gpu.material_ranges) {
+            if (range.original_material_index < 0 ||
+                static_cast<uint32_t>(range.original_material_index) >= materials.size()) {
+                ++missing;
+                continue;
+            }
+            const PcEnvironmentMaterialBinding& material = materials[range.original_material_index];
+            // PS2 MTRL/TXFL uses the same flag ABI for the environment passes
+            // selected by the target renderer.
+            range.source_pc_material = true;
+            range.material_flags = material.flags;
+            range.texture_flags = material.texture_flags;
+            if (!material.texture_name.size) {
+                ++missing;
+                continue;
+            }
+            RscfInfo resource{};
+            if (!pc_texture_resource(chunks, material.texture_name, &resource)) {
+                ++missing;
+                continue;
+            }
+            const std::string label(material.texture_name.data, material.texture_name.size);
+            std::string texture_error;
+            if (gpu_create_tim2_view_from_memory(resource.payload, resource.payload_size,
+                                                  label.c_str(), &range.texture,
+                                                  &texture_error)) {
+                ++loaded;
+            } else {
+                ++missing;
+                last_texture_error = std::move(texture_error);
+            }
+        }
+    }
+    if (loaded_count)
+        *loaded_count = loaded;
+    if (missing_count)
+        *missing_count = missing;
+    if (!ok && why)
+        *why = err.set ? err.message : "Could not resolve embedded PS2 environment materials.";
+    else if (!last_texture_error.empty() && why)
+        *why = last_texture_error;
+    unmap_file(&chunks.file);
+    arena_release(&arena);
+    return ok;
+}
+
 void gpu_apply_material_map_colors(const MaterialMap& materials) {
     for (GpuMaterialRange& range : gpu.material_ranges) {
         if (range.original_material_index < 0)
@@ -699,25 +809,36 @@ bool gpu_reload_environment_textures(std::string* why, uint32_t* loaded_count,
     const bool use_external_textures =
         !g.document.material_map.empty() && !g.document.texture_dir.empty();
 
-    bool pc_loaded = false;
+    bool embedded_attempted = false;
+    bool embedded_ok = true;
     if (!use_external_textures && !g.document.source_pc_path.empty()) {
-        pc_loaded =
-            gpu_load_pc_environment_textures(g.document.source_pc_path, loaded_count, missing_count, why);
-        if (g.document.material_map.empty()) {
-            refresh_scene_animation_timer();
-            return pc_loaded;
+        const std::string& source = g.document.source_pc_path;
+        const size_t dot = source.find_last_of('.');
+        const char* extension = dot == std::string::npos ? "" : source.c_str() + dot;
+        if (_stricmp(extension, ".ps2") == 0) {
+            embedded_attempted = true;
+            embedded_ok = gpu_load_ps2_environment_textures(source, loaded_count,
+                                                             missing_count, why);
+        } else if (_stricmp(extension, ".pc") == 0) {
+            // Preserve embedded previews in older project documents. The
+            // level-opening UI itself remains PS2-only.
+            embedded_attempted = true;
+            embedded_ok = gpu_load_pc_environment_textures(source, loaded_count,
+                                                            missing_count, why);
         }
-    } else if (g.document.rain_enabled) {
+    }
+
+    if (g.document.rain_enabled) {
         const std::string& level_path = g.document.source_pc_path.empty()
                                             ? g.document.obj_path
                                             : g.document.source_pc_path;
         gpu_load_rain_sprite(nullptr, level_path, why);
     }
     if (g.document.material_map.empty()) {
-        if (missing_count)
+        if (!embedded_attempted && missing_count)
             *missing_count = static_cast<uint32_t>(gpu.material_ranges.size());
         refresh_scene_animation_timer();
-        return true;
+        return embedded_ok;
     }
 
     Error err{};
@@ -797,7 +918,7 @@ bool gpu_reload_environment_textures(std::string* why, uint32_t* loaded_count,
     unmap_file(&materials.file);
     arena_release(&arena);
     refresh_scene_animation_timer();
-    return (!use_external_textures && !g.document.source_pc_path.empty()) ? (ok && pc_loaded) : ok;
+    return ok;
 }
 
 namespace {
@@ -1179,6 +1300,86 @@ bool gpu_load_pc_skybox(const std::string& pc_path, const SkyboxSettings& settin
         gpu_release(next_cloud);
         if (why && why->empty())
             *why = err.set ? err.message : "Could not load embedded .PC skybox textures.";
+    }
+    unmap_file(&chunks.file);
+    arena_release(&arena);
+    return ok;
+}
+
+bool gpu_load_ps2_skybox(const std::string& ps2_path, const SkyboxSettings& settings,
+                         std::string* why) {
+    gpu_release_skybox_textures();
+    refresh_scene_animation_timer();
+    if (!gpu.ready) {
+        if (why)
+            *why = "The Direct3D viewport is unavailable.";
+        return false;
+    }
+    Error err{};
+    Arena arena{};
+    ChunkList chunks{};
+    bool ok = arena_init(&arena, 8 * MiB, &err) &&
+              parse_chunks(ps2_path.c_str(), &chunks, &arena, &err);
+    PcSkyboxInfo source_info{};
+    if (ok)
+        ok = ps2_skybox_info(chunks, &source_info, &err);
+    if (ok)
+        ok = gpu_rebuild_skybox_vertices(settings.orientation_radians,
+                                         settings.back_texture_is_front_upside_down,
+                                         settings.right_texture_is_left_upside_down, why);
+
+    ID3D11ShaderResourceView* next_faces[6]{};
+    ID3D11ShaderResourceView* next_cloud = nullptr;
+    uint32_t loaded = 0;
+    for (uint32_t slot = 0; ok && slot < 6; ++slot) {
+        const std::string& texture_path = settings.texture_paths[slot];
+        if (texture_path.empty())
+            continue;
+        const Str texture_name{texture_path.data(), static_cast<uint32_t>(texture_path.size())};
+        RscfInfo resource{};
+        if (!pc_texture_resource(chunks, texture_name, &resource)) {
+            ok = fail(&err, "the .PS2 SKYB texture resource is absent: %s", texture_path.c_str());
+            break;
+        }
+        ok = gpu_create_tim2_view_from_memory(resource.payload, resource.payload_size,
+                                               texture_path.c_str(), &next_faces[slot], why);
+        loaded += ok;
+    }
+    if (ok && settings.draw_clouds) {
+        for (uint32_t slot = 6;
+             slot < ASURA_SKYBOX_V5_V7_TEXTURE_PATH_COUNT && !next_cloud; ++slot) {
+            const std::string& texture_path = settings.texture_paths[slot];
+            if (texture_path.empty())
+                continue;
+            const Str texture_name{texture_path.data(), static_cast<uint32_t>(texture_path.size())};
+            RscfInfo resource{};
+            if (!pc_texture_resource(chunks, texture_name, &resource)) {
+                ok = fail(&err, "the .PS2 SKYB cloud texture resource is absent: %s",
+                          texture_path.c_str());
+                break;
+            }
+            ok = gpu_create_tim2_view_from_memory(resource.payload, resource.payload_size,
+                                                   texture_path.c_str(), &next_cloud, why);
+            loaded += ok;
+        }
+    }
+    if (ok && !loaded)
+        ok = fail(&err, "the .PS2 SKYB has no resolvable embedded TIM2 resources");
+    if (ok) {
+        for (uint32_t face = 0; face < 6; ++face)
+            gpu.skybox_faces[face] = next_faces[face];
+        gpu.skybox_cloud = next_cloud;
+        gpu.skybox_tint = {std::clamp(settings.red / 255.0f, 0.0f, 1.0f),
+                           std::clamp(settings.green / 255.0f, 0.0f, 1.0f),
+                           std::clamp(settings.blue / 255.0f, 0.0f, 1.0f), 1.0f};
+        gpu.skybox_active = true;
+        refresh_scene_animation_timer();
+    } else {
+        for (ID3D11ShaderResourceView*& face : next_faces)
+            gpu_release(face);
+        gpu_release(next_cloud);
+        if (why && why->empty())
+            *why = err.set ? err.message : "Could not load embedded .PS2 skybox textures.";
     }
     unmap_file(&chunks.file);
     arena_release(&arena);
@@ -2234,8 +2435,18 @@ void gpu_render() {
                     XMMatrixTranspose(XMMatrixLookToLH(XMVectorZero(), view_direction, world_up) * projection));
     gpu_render_skybox(skybox_view_projection);
 
+    bool ps2_environment = false;
+    if (!g.document.source_pc_path.empty()) {
+        const size_t dot = g.document.source_pc_path.find_last_of('.');
+        ps2_environment = dot != std::string::npos &&
+                          _stricmp(g.document.source_pc_path.c_str() + dot, ".ps2") == 0;
+    }
+    // MCP2 submits PS2 environment strips without a hardware cull state. The
+    // source data therefore legitimately mixes both windings; hiding either
+    // side creates holes that do not exist in the PS2 level.
     ID3D11RasterizerState* scene_rasterizer =
-        g.backface_culling ? gpu.rasterizer_cull_back : gpu.rasterizer_no_cull;
+        g.backface_culling && !ps2_environment ? gpu.rasterizer_cull_back
+                                               : gpu.rasterizer_no_cull;
     gpu.context->RSSetState(scene_rasterizer);
 
     XMFLOAT4X4 view_projection{};

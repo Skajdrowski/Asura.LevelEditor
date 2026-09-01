@@ -299,6 +299,26 @@ struct Snipe_ServerEntity_StaticObject_ChunkDataV0 {
 static_assert(sizeof(Snipe_ServerEntity_StaticObject_ChunkDataV0) == 0x78,
               "IDA-recovered static-object layout changed");
 
+// The PS2 target's static-object v2 -> physical-object v6 chain predates the
+// two additional Snipe physical-object properties in the PC v3/v7 chain. The
+// nested Asura physical-object v7 record itself is otherwise byte-compatible.
+struct Snipe_PS2_ServerEntity_StaticObject_ChunkDataV0 {
+    int32_t m_iStaticObjectVersion;
+    uint32_t m_uStaticObjectFlags;
+    int32_t m_iAsuraStaticObjectVersion;
+    int32_t m_iPhysicalObjectVersion;
+    uint32_t m_uTeam;
+    uint32_t m_uSnipePhysicalFlags;
+    uint32_t m_uSnipePhysicalPropertyA;
+    uint32_t m_uSnipePhysicalPropertyB;
+    uint32_t m_uSnipePhysicalPropertyC;
+    int32_t m_iAsuraPhysicalObjectVersion;
+    Asura_ServerEntity_PhysicalObject_ChunkDataV7 m_xPhysicalObject;
+    uint32_t m_uNumLinksToBlock;
+};
+static_assert(sizeof(Snipe_PS2_ServerEntity_StaticObject_ChunkDataV0) == 0x70,
+              "IDA-recovered PS2 static-object layout changed");
+
 // ENTI classification 0x0008 payload, excluding the common eight-byte ENTI
 // GUID/classification header.  Its writer is a chain of Pickup v2, static
 // object v3, Snipe physical object v7, and Asura physical object v7 records.
@@ -325,6 +345,21 @@ struct Snipe_ServerEntity_Pickup_ChunkDataV0 {
     Asura_ServerEntity_PhysicalObject_ChunkDataV7 m_xPhysicalObject;
     uint32_t m_uNumLinksToBlock;
 };
+static_assert(sizeof(Snipe_ServerEntity_Pickup_ChunkDataV0) == 0x94,
+              "IDA-recovered pickup layout changed");
+
+struct Snipe_PS2_ServerEntity_Pickup_ChunkDataV0 {
+    int32_t m_iPickupVersion;
+    uint32_t m_uPickupClassID;
+    uint32_t m_uPickupFlags;
+    int32_t m_iAsuraPickupVersion;
+    uint32_t m_uItemID;
+    uint32_t m_uPickupPropertyA;
+    uint32_t m_uPickupPropertyB;
+    Snipe_PS2_ServerEntity_StaticObject_ChunkDataV0 m_xStaticObject;
+};
+static_assert(sizeof(Snipe_PS2_ServerEntity_Pickup_ChunkDataV0) == 0x8C,
+              "IDA-recovered PS2 pickup layout changed");
 
 struct Asura_ServerEntity_SoundController_ChunkDataV0 {
     Asura_Chunk_Entity_PayloadHeader m_xEntity;
