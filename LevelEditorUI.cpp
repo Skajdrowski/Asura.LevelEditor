@@ -31,6 +31,39 @@ constexpr int kInspectorDirtySpawnGameModeShift = 15;
 
 AppState g;
 
+int ui_px(int logical_pixels) {
+    return MulDiv(logical_pixels, static_cast<int>(g.dpi), 96);
+}
+
+void rebuild_ui_font() {
+    NONCLIENTMETRICSW metrics{sizeof(metrics)};
+    if (!SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0,
+                                    g.dpi)) {
+        if (!SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0))
+            return;
+        const UINT system_dpi = std::max<UINT>(96, GetDpiForSystem());
+        metrics.lfMessageFont.lfHeight =
+            MulDiv(metrics.lfMessageFont.lfHeight, static_cast<int>(g.dpi),
+                   static_cast<int>(system_dpi));
+    }
+    HFONT font = CreateFontIndirectW(&metrics.lfMessageFont);
+    if (!font)
+        return;
+    HFONT previous = g.font;
+    g.font = font;
+    if (g.window) {
+        EnumChildWindows(
+            g.window,
+            [](HWND child, LPARAM value) -> BOOL {
+                SendMessageA(child, WM_SETFONT, static_cast<WPARAM>(value), TRUE);
+                return TRUE;
+            },
+            reinterpret_cast<LPARAM>(g.font));
+    }
+    if (previous)
+        DeleteObject(previous);
+}
+
 bool valid_entity_index(int index) {
     return index >= 0 && index < static_cast<int>(g.document.entities.size());
 }
@@ -283,14 +316,14 @@ void append_light_gizmo(const Entity& entity, std::vector<LightGizmoLine>* lines
 RECT viewport_rect() {
     RECT r{};
     GetClientRect(g.window, &r);
-    r.left = 238;
-    r.top = 44;
-    r.right -= 272;
-    r.bottom -= 25;
-    if (r.right < r.left + 40)
-        r.right = r.left + 40;
-    if (r.bottom < r.top + 40)
-        r.bottom = r.top + 40;
+    r.left = ui_px(238);
+    r.top = ui_px(74);
+    r.right -= ui_px(272);
+    r.bottom -= ui_px(25);
+    if (r.right < r.left + ui_px(40))
+        r.right = r.left + ui_px(40);
+    if (r.bottom < r.top + ui_px(40))
+        r.bottom = r.top + ui_px(40);
     return r;
 }
 
@@ -695,7 +728,8 @@ void update_light_flag_dependent_controls(LightPropertiesState* state, uint32_t 
 
 HWND make_light_control(LightPropertiesState* state, const char* cls, const char* text, DWORD style, int id,
                         int x, int y, int width, int height) {
-    HWND control = CreateWindowExA(0, cls, text, WS_CHILD | WS_VISIBLE | style, x, y, width, height,
+    HWND control = CreateWindowExA(0, cls, text, WS_CHILD | WS_VISIBLE | style,
+                                   ui_px(x), ui_px(y), ui_px(width), ui_px(height),
                                    state->window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
                                    GetModuleHandle(nullptr), nullptr);
     SendMessageA(control, WM_SETFONT, reinterpret_cast<WPARAM>(g.font), TRUE);
@@ -875,7 +909,7 @@ void command_light_properties() {
 
     RECT owner{};
     GetWindowRect(g.window, &owner);
-    constexpr int width = 780, height = 550;
+    const int width = ui_px(780), height = ui_px(550);
     const int x = owner.left + std::max(0L, (owner.right - owner.left - width) / 2);
     const int y = owner.top + std::max(0L, (owner.bottom - owner.top - height) / 2);
     HWND window = CreateWindowExA(WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT, "Asura2005LightProperties",
@@ -1199,6 +1233,9 @@ void refresh_inspector() {
         EnableWindow(g.rain_toggle,
                      !g.document.source_pc_path.empty() || !g.document.obj_path.empty());
     }
+    if (g.backface_cull_toggle)
+        SendMessageA(g.backface_cull_toggle, BM_SETCHECK,
+                     g.backface_culling ? BST_CHECKED : BST_UNCHECKED, 0);
     if (g.ambience_properties)
         EnableWindow(g.ambience_properties,
                      !g.document.source_pc_path.empty() || !g.document.obj_path.empty());
@@ -2232,83 +2269,88 @@ HWND make_control(const char* cls, const char* text, DWORD style, int id) {
 void layout_controls() {
     RECT r{};
     GetClientRect(g.window, &r);
-    if (g.viewport) {
-        const RECT vr = viewport_rect();
+    const RECT vr = viewport_rect();
+    if (g.viewport)
         MoveWindow(g.viewport, vr.left, vr.top, vr.right - vr.left, vr.bottom - vr.top, TRUE);
-    }
-    const int right = r.right - 262;
-    const int top_y = 7;
-    const struct { int id, x, w; } top[] = {{ID_OPEN_OBJ, 8, 68},          {ID_OPEN_PC, 80, 68},
-                                            {ID_OPEN_PROJECT, 152, 92},    {ID_SAVE_PROJECT, 248, 88},
-                                            {ID_EXPORT_PC, 340, 82},       {ID_MATERIAL_MAP, 426, 112},
-                                            {ID_EXPORT_MATERIAL_MAP, 542, 112}, {ID_TEXTURE_DIR, 658, 88},
-                                            {ID_WEAPONS_DONOR, 750, 104},  {ID_OBJECT_DONOR, 858, 96},
-                                            {ID_SKYBOX_TEXTURES, 958, 104}, {ID_TOGGLE_RAIN, 1066, 48}
+    const int right = r.right - ui_px(262);
+    const struct { int id, x, y, w; } top[] = {
+        {ID_OPEN_OBJ, 8, 6, 78},              {ID_OPEN_PC, 90, 6, 78},
+        {ID_OPEN_PROJECT, 172, 6, 98},         {ID_SAVE_PROJECT, 274, 6, 96},
+        {ID_EXPORT_PC, 374, 6, 88},            {ID_EXPORT_OBJ, 466, 6, 88},
+        {ID_MATERIAL_MAP, 8, 38, 132},         {ID_EXPORT_MATERIAL_MAP, 144, 38, 132},
+        {ID_TEXTURE_DIR, 280, 38, 102},        {ID_WEAPONS_DONOR, 386, 38, 112},
+        {ID_OBJECT_DONOR, 502, 38, 104},       {ID_SKYBOX_TEXTURES, 610, 38, 120},
+        {ID_TOGGLE_RAIN, 734, 38, 58}
     };
     for (auto c : top)
-        MoveWindow(GetDlgItem(g.window, c.id), c.x, top_y, c.w, 28, TRUE);
-    MoveWindow(g.ambience_properties, right, top_y, 252, 28, TRUE);
-    MoveWindow(g.list, 8, 48, 220, std::max(80, static_cast<int>(r.bottom) - 301), TRUE);
-    int y = std::max(140, static_cast<int>(r.bottom) - 245);
-    const int bw = 106;
-    MoveWindow(GetDlgItem(g.window, ID_ADD_SPAWN), 8, y, bw, 27, TRUE);
-    MoveWindow(GetDlgItem(g.window, ID_ADD_LIGHT), 120, y, bw, 27, TRUE);
-    y += 31;
-    MoveWindow(GetDlgItem(g.window, ID_ADD_PICKUP), 8, y, bw, 27, TRUE);
-    MoveWindow(GetDlgItem(g.window, ID_ADD_STATIC_OBJECT), 120, y, bw, 27, TRUE);
-    y += 31;
-    MoveWindow(GetDlgItem(g.window, ID_ADD_SOUND), 8, y, bw, 27, TRUE);
-    MoveWindow(GetDlgItem(g.window, ID_ADD_BUILDING_VOLUME), 120, y, bw, 27, TRUE);
-    y += 31;
-    MoveWindow(GetDlgItem(g.window, ID_DELETE_ENTITY), 8, y, 218, 27, TRUE);
-    y += 38;
+        MoveWindow(GetDlgItem(g.window, c.id), ui_px(c.x), ui_px(c.y), ui_px(c.w),
+                   ui_px(28), TRUE);
+    MoveWindow(g.ambience_properties, right, ui_px(6), ui_px(252), ui_px(28), TRUE);
+    const int list_top = ui_px(78);
+    int y = std::max(ui_px(172), static_cast<int>(r.bottom) - ui_px(245));
+    MoveWindow(g.list, ui_px(8), list_top, ui_px(220),
+               std::max(ui_px(80), y - list_top - ui_px(8)), TRUE);
+    const int bw = ui_px(106);
+    MoveWindow(GetDlgItem(g.window, ID_ADD_SPAWN), ui_px(8), y, bw, ui_px(27), TRUE);
+    MoveWindow(GetDlgItem(g.window, ID_ADD_LIGHT), ui_px(120), y, bw, ui_px(27), TRUE);
+    y += ui_px(31);
+    MoveWindow(GetDlgItem(g.window, ID_ADD_PICKUP), ui_px(8), y, bw, ui_px(27), TRUE);
+    MoveWindow(GetDlgItem(g.window, ID_ADD_STATIC_OBJECT), ui_px(120), y, bw, ui_px(27), TRUE);
+    y += ui_px(31);
+    MoveWindow(GetDlgItem(g.window, ID_ADD_SOUND), ui_px(8), y, bw, ui_px(27), TRUE);
+    MoveWindow(GetDlgItem(g.window, ID_ADD_BUILDING_VOLUME), ui_px(120), y, bw, ui_px(27), TRUE);
+    y += ui_px(31);
+    MoveWindow(GetDlgItem(g.window, ID_DELETE_ENTITY), ui_px(8), y, ui_px(218), ui_px(27), TRUE);
+    y += ui_px(38);
     HWND hint = GetDlgItem(g.window, 900);
-    MoveWindow(hint, 8, y, 220, 75, TRUE);
+    MoveWindow(hint, ui_px(8), y, ui_px(220), ui_px(60), TRUE);
+    y += ui_px(64);
+    MoveWindow(g.backface_cull_toggle, ui_px(8), y, ui_px(218), ui_px(22), TRUE);
 
-    const int label_x = right, edit_x = right + 88, ew = 164;
-    const int property_edit_x = right + 116, property_ew = 136;
-    int iy = 52;
-    MoveWindow(GetDlgItem(g.window, 910), label_x, iy + 3, 84, 22, TRUE);
-    MoveWindow(g.name, edit_x, iy, ew, 24, TRUE);
-    iy += 34;
+    const int label_x = right, edit_x = right + ui_px(88), ew = ui_px(164);
+    const int property_edit_x = right + ui_px(116), property_ew = ui_px(136);
+    int iy = ui_px(52);
+    MoveWindow(GetDlgItem(g.window, 910), label_x, iy + ui_px(3), ui_px(84), ui_px(22), TRUE);
+    MoveWindow(g.name, edit_x, iy, ew, ui_px(24), TRUE);
+    iy += ui_px(34);
     const int labels[] = {911, 912, 913, 914, 915, 916};
     HWND edits[] = {g.pos[0], g.pos[1], g.pos[2], g.rot[0], g.rot[1], g.rot[2]};
-    for (int i = 0; i < 6; ++i, iy += 30) {
-        MoveWindow(GetDlgItem(g.window, labels[i]), label_x, iy + 3, 84, 22, TRUE);
-        MoveWindow(edits[i], edit_x, iy, ew, 24, TRUE);
+    for (int i = 0; i < 6; ++i, iy += ui_px(30)) {
+        MoveWindow(GetDlgItem(g.window, labels[i]), label_x, iy + ui_px(3), ui_px(84), ui_px(22), TRUE);
+        MoveWindow(edits[i], edit_x, iy, ew, ui_px(24), TRUE);
     }
-    MoveWindow(g.value_label[0], label_x, iy + 3, 112, 22, TRUE);
-    MoveWindow(g.value[0], property_edit_x, iy, property_ew, 24, TRUE);
-    MoveWindow(g.pickup_item, property_edit_x, iy, property_ew, 240, TRUE);
-    iy += 30;
-    MoveWindow(g.value_label[1], label_x, iy + 3, 112, 22, TRUE);
-    MoveWindow(g.value[1], property_edit_x, iy, property_ew, 24, TRUE);
-    iy += 34;
-    MoveWindow(g.value_label[2], label_x, iy + 3, 112, 22, TRUE);
-    MoveWindow(g.value[2], property_edit_x, iy, property_ew, 24, TRUE);
-    MoveWindow(g.sound_browse, edit_x, iy, 80, 26, TRUE);
-    MoveWindow(g.sound_preview, edit_x + 84, iy, 80, 26, TRUE);
-    MoveWindow(g.sound_loop, label_x, iy, 82, 26, TRUE);
-    MoveWindow(g.light_properties, edit_x, iy, ew, 26, TRUE);
-    MoveWindow(g.spawn_team_label, label_x, iy, 252, 22, TRUE);
+    MoveWindow(g.value_label[0], label_x, iy + ui_px(3), ui_px(112), ui_px(22), TRUE);
+    MoveWindow(g.value[0], property_edit_x, iy, property_ew, ui_px(24), TRUE);
+    MoveWindow(g.pickup_item, property_edit_x, iy, property_ew, ui_px(240), TRUE);
+    iy += ui_px(30);
+    MoveWindow(g.value_label[1], label_x, iy + ui_px(3), ui_px(112), ui_px(22), TRUE);
+    MoveWindow(g.value[1], property_edit_x, iy, property_ew, ui_px(24), TRUE);
+    iy += ui_px(34);
+    MoveWindow(g.value_label[2], label_x, iy + ui_px(3), ui_px(112), ui_px(22), TRUE);
+    MoveWindow(g.value[2], property_edit_x, iy, property_ew, ui_px(24), TRUE);
+    MoveWindow(g.sound_browse, edit_x, iy, ui_px(80), ui_px(26), TRUE);
+    MoveWindow(g.sound_preview, edit_x + ui_px(84), iy, ui_px(80), ui_px(26), TRUE);
+    MoveWindow(g.sound_loop, label_x, iy, ui_px(82), ui_px(26), TRUE);
+    MoveWindow(g.light_properties, edit_x, iy, ew, ui_px(26), TRUE);
+    MoveWindow(g.spawn_team_label, label_x, iy, ui_px(252), ui_px(22), TRUE);
     for (int i = 0; i < static_cast<int>(_countof(kSpawnTeamControls)); ++i) {
         const int column = i % 2, row = i / 2;
-        MoveWindow(g.spawn_team_checks[i], label_x + column * 126, iy + 22 + row * 24, 126, 22, TRUE);
+        MoveWindow(g.spawn_team_checks[i], label_x + ui_px(column * 126),
+                   iy + ui_px(22 + row * 24), ui_px(126), ui_px(22), TRUE);
     }
-    MoveWindow(g.spawn_game_mode_label, label_x, iy + 72, 252, 22, TRUE);
+    MoveWindow(g.spawn_game_mode_label, label_x, iy + ui_px(72), ui_px(252), ui_px(22), TRUE);
     for (int i = 0; i < static_cast<int>(_countof(kSpawnGameModeControls)); ++i) {
         const int column = i % 2, row = i / 2;
-        MoveWindow(g.spawn_game_mode_checks[i], label_x + column * 126, iy + 94 + row * 24, 126, 22, TRUE);
+        MoveWindow(g.spawn_game_mode_checks[i], label_x + ui_px(column * 126),
+                   iy + ui_px(94 + row * 24), ui_px(126), ui_px(22), TRUE);
     }
-    iy += 172;
-    MoveWindow(GetDlgItem(g.window, ID_APPLY_INSPECTOR), label_x, iy, 252, 30, TRUE);
-    MoveWindow(g.status, 8, r.bottom - 21, std::max(20, static_cast<int>(r.right) - 16), 18, TRUE);
+    iy += ui_px(172);
+    MoveWindow(GetDlgItem(g.window, ID_APPLY_INSPECTOR), label_x, iy, ui_px(252), ui_px(30), TRUE);
+    MoveWindow(g.status, ui_px(8), r.bottom - ui_px(21),
+               std::max(ui_px(20), static_cast<int>(r.right) - ui_px(16)), ui_px(18), TRUE);
 }
 
 void create_controls() {
-    NONCLIENTMETRICSA metrics{sizeof(metrics)};
-    SystemParametersInfoA(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0);
-    g.font = CreateFontIndirectA(&metrics.lfMessageFont);
     const RECT vr = viewport_rect();
     g.viewport = CreateWindowExA(0, "Asura2005Viewport", "", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
                                  vr.left, vr.top, vr.right - vr.left, vr.bottom - vr.top, g.window,
@@ -2319,11 +2361,12 @@ void create_controls() {
             DestroyWindow(g.viewport);
         g.viewport = nullptr;
     }
-    make_control("BUTTON", "Open OBJ", BS_PUSHBUTTON, ID_OPEN_OBJ);
+    make_control("BUTTON", "Open .OBJ", BS_DEFPUSHBUTTON, ID_OPEN_OBJ);
     make_control("BUTTON", "Open .PC", BS_PUSHBUTTON, ID_OPEN_PC);
     make_control("BUTTON", "Open project", BS_PUSHBUTTON, ID_OPEN_PROJECT);
     make_control("BUTTON", "Save project", BS_PUSHBUTTON, ID_SAVE_PROJECT);
-    make_control("BUTTON", "Export .PC", BS_DEFPUSHBUTTON, ID_EXPORT_PC);
+    make_control("BUTTON", "Export .PC", BS_PUSHBUTTON, ID_EXPORT_PC);
+    make_control("BUTTON", "Export .OBJ", BS_PUSHBUTTON, ID_EXPORT_OBJ);
     make_control("BUTTON", "Import material map", BS_PUSHBUTTON, ID_MATERIAL_MAP);
     make_control("BUTTON", "Export material map", BS_PUSHBUTTON, ID_EXPORT_MATERIAL_MAP);
     make_control("BUTTON", "Texture folder", BS_PUSHBUTTON, ID_TEXTURE_DIR);
@@ -2331,6 +2374,9 @@ void create_controls() {
     make_control("BUTTON", "Objects donor", BS_PUSHBUTTON, ID_OBJECT_DONOR);
     make_control("BUTTON", "Skybox properties", BS_PUSHBUTTON, ID_SKYBOX_TEXTURES);
     g.rain_toggle = make_control("BUTTON", "Rain", BS_AUTOCHECKBOX, ID_TOGGLE_RAIN);
+    g.backface_cull_toggle =
+        make_control("BUTTON", "Viewport: Cull backfaces", BS_AUTOCHECKBOX,
+                     ID_TOGGLE_BACKFACE_CULLING);
     g.ambience_properties = make_control("BUTTON", "Ambience sound", BS_PUSHBUTTON, ID_AMBIENCE_PROPERTIES);
     g.list = make_control("LISTBOX", "", LBS_NOTIFY | LBS_EXTENDEDSEL | WS_VSCROLL | WS_BORDER,
                           ID_ENTITY_LIST);
@@ -2342,9 +2388,10 @@ void create_controls() {
     make_control("BUTTON", "+ Indoor zone", BS_PUSHBUTTON, ID_ADD_BUILDING_VOLUME);
     make_control("BUTTON", "Delete selected", BS_PUSHBUTTON, ID_DELETE_ENTITY);
     make_control("STATIC",
-                 "Right-drag: orbit; middle-drag: pan; wheel: zoom\r\n"
-                 "Ctrl/Shift list: select same-type entities\r\n"
-                 "Ctrl+Z/Y: undo/redo; Ctrl+C/V: copy/paste; Delete: remove",
+                 "Right: orbit; Middle: pan; Wheel: zoom\r\n"
+                 "Ctrl/Shift: select same-type entities\r\n"
+                 "Ctrl+Z/Y: undo/redo\r\n"
+                 "Ctrl+C/V: copy/paste; Del: remove",
                  SS_LEFT, 900);
     make_control("STATIC", "Name", SS_LEFT, 910);
     make_control("STATIC", "Position X", SS_LEFT, 911);
@@ -2873,6 +2920,37 @@ void command_export() {
     MessageBoxA(g.window, path.c_str(), "Exported .PC", MB_ICONINFORMATION);
 }
 
+void command_export_obj() {
+    if (g.document.source_pc_path.empty()) {
+        MessageBoxA(g.window, "Open an original .PC level before exporting its Env.",
+                    "Could not export OBJ", MB_ICONERROR);
+        return;
+    }
+    std::string path = g.document.source_pc_path;
+    const size_t dot = path.find_last_of('.');
+    const size_t slash = path.find_last_of("\\/");
+    if (dot != std::string::npos && (slash == std::string::npos || dot > slash))
+        path.resize(dot);
+    path += ".obj";
+    if (!choose_path(g.window, true, "Export PC environment as Wavefront OBJ",
+                     "Wavefront OBJ\0*.obj\0All files\0*.*\0", "obj", &path))
+        return;
+
+    set_status("Exporting Env geometry, mat_<index> materials, and embedded textures...");
+    UpdateWindow(g.window);
+    SetCursor(LoadCursor(nullptr, IDC_WAIT));
+    std::string result;
+    const bool ok = export_pc_environment_obj(g.document.source_pc_path, path.c_str(), &result);
+    SetCursor(LoadCursor(nullptr, IDC_ARROW));
+    if (!ok) {
+        set_status("OBJ export failed.");
+        MessageBoxA(g.window, result.c_str(), "Could not export OBJ", MB_ICONERROR);
+        return;
+    }
+    set_status(result.c_str());
+    MessageBoxA(g.window, result.c_str(), "OBJ export complete", MB_ICONINFORMATION);
+}
+
 bool valid_wave_bytes(const std::vector<uint8_t>& bytes) {
     return bytes.size() >= 12 && memcmp(bytes.data(), "RIFF", 4) == 0 &&
            memcmp(bytes.data() + 8, "WAVE", 4) == 0;
@@ -3166,6 +3244,17 @@ void command_toggle_rain() {
         set_status(enabled ? "WTHR rain enabled." : "WTHR rain disabled.");
 }
 
+void command_toggle_backface_culling() {
+    const bool enabled =
+        SendMessageA(g.backface_cull_toggle, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    if (enabled == g.backface_culling)
+        return;
+    g.backface_culling = enabled;
+    invalidate_environment_cache();
+    request_redraw();
+    set_status(enabled ? "Backface culling enabled." : "Backface culling disabled.");
+}
+
 enum AmbiencePropertiesId : int {
     ID_AMBIENCE_STREAM = 3400,
     ID_AMBIENCE_VOLUME,
@@ -3267,7 +3356,8 @@ std::string ambience_stream_label(const std::string& path) {
 
 HWND make_ambience_control(AmbiencePropertiesState* state, const char* cls, const char* text,
                            DWORD style, int id, int x, int y, int width, int height) {
-    HWND control = CreateWindowExA(0, cls, text, WS_CHILD | WS_VISIBLE | style, x, y, width, height,
+    HWND control = CreateWindowExA(0, cls, text, WS_CHILD | WS_VISIBLE | style,
+                                   ui_px(x), ui_px(y), ui_px(width), ui_px(height),
                                    state->window,
                                    reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
                                    GetModuleHandle(nullptr), nullptr);
@@ -3361,7 +3451,7 @@ void command_ambience_properties() {
 
     RECT owner{};
     GetWindowRect(g.window, &owner);
-    constexpr int width = 540, height = 235;
+    const int width = ui_px(540), height = ui_px(235);
     const int x = owner.left + std::max(0L, (owner.right - owner.left - width) / 2);
     const int y = owner.top + std::max(0L, (owner.bottom - owner.top - height) / 2);
     HWND window = CreateWindowExA(WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT,
@@ -3608,7 +3698,8 @@ struct SkyboxPropertiesState {
 
 HWND make_skybox_control(SkyboxPropertiesState* state, const char* cls, const char* text, DWORD style,
                          int id, int x, int y, int width, int height) {
-    HWND control = CreateWindowExA(0, cls, text, WS_CHILD | WS_VISIBLE | style, x, y, width, height,
+    HWND control = CreateWindowExA(0, cls, text, WS_CHILD | WS_VISIBLE | style,
+                                   ui_px(x), ui_px(y), ui_px(width), ui_px(height),
                                    state->window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
                                    GetModuleHandle(nullptr), nullptr);
     SendMessageA(control, WM_SETFONT, reinterpret_cast<WPARAM>(g.font), TRUE);
@@ -3777,7 +3868,7 @@ void command_skybox_textures() {
     state.texture_directory = g.document.sky_texture_dir;
     RECT owner{};
     GetWindowRect(g.window, &owner);
-    constexpr int width = 830, height = 565;
+    const int width = ui_px(830), height = ui_px(565);
     const int x = owner.left + std::max(0L, (owner.right - owner.left - width) / 2);
     const int y = owner.top + std::max(0L, (owner.bottom - owner.top - height) / 2);
     HWND window = CreateWindowExA(WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT,
@@ -3907,14 +3998,35 @@ void paint_window() {
 
 LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
     switch (message) {
+    case WM_GETMINMAXINFO: {
+        MINMAXINFO* limits = reinterpret_cast<MINMAXINFO*>(lparam);
+        const UINT dpi = std::max<UINT>(96, GetDpiForWindow(hwnd));
+        limits->ptMinTrackSize.x = MulDiv(1180, static_cast<int>(dpi), 96);
+        limits->ptMinTrackSize.y = MulDiv(650, static_cast<int>(dpi), 96);
+        return 0;
+    }
     case WM_CREATE:
         g.window = hwnd;
+        g.dpi = std::max<UINT>(96, GetDpiForWindow(hwnd));
+        rebuild_ui_font();
         create_controls();
         reset_history(true);
         if (g.spawn_puppet_source.empty())
             set_status("MPChars.asr was not found or is incompatible; spawnpoints use fallback markers.");
         DragAcceptFiles(hwnd, TRUE);
         return 0;
+    case WM_DPICHANGED: {
+        g.dpi = std::max<UINT>(96, LOWORD(wparam));
+        rebuild_ui_font();
+        const RECT* suggested = reinterpret_cast<const RECT*>(lparam);
+        SetWindowPos(hwnd, nullptr, suggested->left, suggested->top,
+                     suggested->right - suggested->left, suggested->bottom - suggested->top,
+                     SWP_NOACTIVATE | SWP_NOZORDER);
+        layout_controls();
+        release_environment_cache();
+        request_redraw();
+        return 0;
+    }
     case WM_SIZE:
         layout_controls();
         release_environment_cache();
@@ -3952,6 +4064,8 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             command_save_project();
         else if (id == ID_EXPORT_PC)
             command_export();
+        else if (id == ID_EXPORT_OBJ)
+            command_export_obj();
         else if (id == ID_MATERIAL_MAP)
             command_material_map();
         else if (id == ID_EXPORT_MATERIAL_MAP)
@@ -3966,6 +4080,8 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             command_skybox_textures();
         else if (id == ID_TOGGLE_RAIN)
             command_toggle_rain();
+        else if (id == ID_TOGGLE_BACKFACE_CULLING)
+            command_toggle_backface_culling();
         else if (id == ID_AMBIENCE_PROPERTIES)
             command_ambience_properties();
         else if (id == ID_ADD_SPAWN)

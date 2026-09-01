@@ -165,7 +165,8 @@ struct GpuRenderer {
     ID3D11Buffer* puppet_vertices = nullptr;
     ID3D11Buffer* overlay_vertices = nullptr;
     ID3D11Buffer* rain_vertices = nullptr;
-    ID3D11RasterizerState* rasterizer = nullptr;
+    ID3D11RasterizerState* rasterizer_cull_back = nullptr;
+    ID3D11RasterizerState* rasterizer_no_cull = nullptr;
     ID3D11DepthStencilState* depth_enabled = nullptr;
     ID3D11DepthStencilState* depth_disabled = nullptr;
     ID3D11DepthStencilState* depth_equal = nullptr;
@@ -1226,7 +1227,8 @@ void gpu_shutdown() {
     gpu_release(gpu.mesh_vertices);
     gpu_release(gpu.depth_disabled);
     gpu_release(gpu.depth_enabled);
-    gpu_release(gpu.rasterizer);
+    gpu_release(gpu.rasterizer_no_cull);
+    gpu_release(gpu.rasterizer_cull_back);
     gpu_release(gpu.camera_buffer);
     gpu_release(gpu.input_layout);
     gpu_release(gpu.rain_pixel_shader);
@@ -1716,10 +1718,16 @@ float4 SkyCloudPSMain(SkyVSOutput input) : SV_TARGET {
     }
     D3D11_RASTERIZER_DESC raster_desc{};
     raster_desc.FillMode = D3D11_FILL_SOLID;
-    raster_desc.CullMode = D3D11_CULL_NONE;
+    raster_desc.CullMode = D3D11_CULL_BACK;
+    raster_desc.FrontCounterClockwise = FALSE;
     raster_desc.DepthClipEnable = TRUE;
     raster_desc.MultisampleEnable = TRUE;
-    if (FAILED(gpu.device->CreateRasterizerState(&raster_desc, &gpu.rasterizer))) {
+    if (FAILED(gpu.device->CreateRasterizerState(&raster_desc, &gpu.rasterizer_cull_back))) {
+        gpu_shutdown();
+        return false;
+    }
+    raster_desc.CullMode = D3D11_CULL_NONE;
+    if (FAILED(gpu.device->CreateRasterizerState(&raster_desc, &gpu.rasterizer_no_cull))) {
         gpu_shutdown();
         return false;
     }
@@ -2195,7 +2203,7 @@ void gpu_render() {
     gpu.context->OMSetRenderTargets(1, &gpu.render_target, gpu.depth_view);
     D3D11_VIEWPORT viewport{0, 0, static_cast<float>(width), static_cast<float>(height), 0, 1};
     gpu.context->RSSetViewports(1, &viewport);
-    gpu.context->RSSetState(gpu.rasterizer);
+    gpu.context->RSSetState(gpu.rasterizer_no_cull);
     Asura_Vector_3 camera_position, right, up, forward;
     camera_axes(&camera_position, &right, &up, &forward);
     using namespace DirectX;
@@ -2225,6 +2233,10 @@ void gpu_render() {
     XMStoreFloat4x4(&skybox_view_projection,
                     XMMatrixTranspose(XMMatrixLookToLH(XMVectorZero(), view_direction, world_up) * projection));
     gpu_render_skybox(skybox_view_projection);
+
+    ID3D11RasterizerState* scene_rasterizer =
+        g.backface_culling ? gpu.rasterizer_cull_back : gpu.rasterizer_no_cull;
+    gpu.context->RSSetState(scene_rasterizer);
 
     XMFLOAT4X4 view_projection{};
     XMStoreFloat4x4(&view_projection, XMMatrixTranspose(XMMatrixLookAtLH(eye, target, world_up) * projection));
@@ -2377,8 +2389,10 @@ void gpu_render() {
         gpu.context->PSSetShaderResources(2, _countof(no_environment_textures), no_environment_textures);
     }
     const float rain_animation_time = static_cast<float>(fmod(GetTickCount64() * .001, 8192.0));
+    gpu.context->RSSetState(gpu.rasterizer_no_cull);
     gpu_render_rain(camera_position, right, up, forward, fov_y,
                     static_cast<float>(width) / height, rain_animation_time);
+    gpu.context->RSSetState(scene_rasterizer);
     gpu.context->PSSetShader(gpu.pixel_shader, nullptr, 0);
     std::vector<GpuVertex> puppet_vertices;
     std::vector<GpuPuppetRange> puppet_ranges;

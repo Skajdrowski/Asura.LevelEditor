@@ -1,5 +1,6 @@
 #include "LevelEditorInternal.h"
 
+#include <iomanip>
 #include <unordered_map>
 
 using namespace asura;
@@ -1317,6 +1318,298 @@ bool pc_environment_material_bindings(const ChunkList& chunks,
     if (!reached_environment)
         return fail(err, "the PC environment resource is absent from the chunk stream");
     return true;
+}
+
+namespace {
+
+std::string obj_export_folder(const std::string& path) {
+    const size_t slash = path.find_last_of("\\/");
+    return slash == std::string::npos ? std::string{} : path.substr(0, slash);
+}
+
+std::string obj_export_stem(const std::string& path) {
+    const size_t slash = path.find_last_of("\\/");
+    const size_t begin = slash == std::string::npos ? 0 : slash + 1;
+    size_t end = path.find_last_of('.');
+    if (end == std::string::npos || end < begin)
+        end = path.size();
+    std::string stem = path.substr(begin, end - begin);
+    for (char& c : stem) {
+        const bool safe = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                          (c >= '0' && c <= '9') || c == '-' || c == '_';
+        if (!safe)
+            c = '_';
+    }
+    return stem;
+}
+
+std::string obj_export_join(const std::string& folder, const std::string& name) {
+    return folder.empty() ? name : folder + "\\" + name;
+}
+
+std::string obj_texture_identity(Str name) {
+    if (!name.data || !name.size)
+        return {};
+    std::string identity(name.data, name.size);
+    for (char& c : identity) {
+        if (c == '/')
+            c = '\\';
+        else if (c >= 'A' && c <= 'Z')
+            c = static_cast<char>(c - 'A' + 'a');
+    }
+    return identity;
+}
+
+std::string obj_texture_stem(Str name) {
+    if (!name.data || !name.size)
+        return "texture";
+
+    const std::string path(name.data, name.size);
+    const size_t slash = path.find_last_of("\\/");
+    const size_t begin = slash == std::string::npos ? 0 : slash + 1;
+    size_t end = path.find_last_of('.');
+    if (end == std::string::npos || end <= begin)
+        end = path.size();
+    std::string stem = path.substr(begin, end - begin);
+
+    // Preserve the resource stem, replacing only characters Windows cannot use.
+    for (char& c : stem) {
+        const unsigned char byte = static_cast<unsigned char>(c);
+        if (byte < 32 || c == '<' || c == '>' || c == ':' || c == '"' ||
+            c == '/' || c == '\\' || c == '|' || c == '?' || c == '*')
+            c = '_';
+    }
+    while (!stem.empty() && (stem.back() == ' ' || stem.back() == '.'))
+        stem.pop_back();
+    return stem.empty() ? "texture" : stem;
+}
+
+std::string obj_texture_filename_key(std::string filename) {
+    for (char& c : filename) {
+        if (c >= 'A' && c <= 'Z')
+            c = static_cast<char>(c - 'A' + 'a');
+    }
+    return filename;
+}
+
+std::string obj_material_name(int32_t material_index) {
+    return "mat_" + std::to_string(material_index);
+}
+
+bool pc_environment_texture_resource(const ChunkList& chunks, Str texture_name,
+                                     RscfInfo* output) {
+    if (!texture_name.size)
+        return false;
+    for (uint32_t chunk_index = 0; chunk_index < chunks.count; ++chunk_index) {
+        RscfInfo resource{};
+        if (rscf_info(chunks.chunks[chunk_index], &resource) &&
+            resource.type == ASURA_RESOURCEFILE_TYPE_TEXTURE &&
+            text_name_matches_resource(texture_name, resource.name)) {
+            *output = resource;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool write_obj_texture(const std::string& path, const RscfInfo& resource, Error* err) {
+    if (resource.payload_size < 4 || memcmp(resource.payload, "DDS ", 4) != 0)
+        return fail(err, "environment texture resource is not DDS data: %s", path.c_str());
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    if (!file)
+        return fail(err, "could not create OBJ texture: %s", path.c_str());
+    file.write(reinterpret_cast<const char*>(resource.payload), resource.payload_size);
+    if (!file)
+        return fail(err, "could not write OBJ texture: %s", path.c_str());
+    return true;
+}
+
+} // namespace
+
+bool export_pc_environment_obj(const std::string& source_pc_path, const char* output_path,
+                               std::string* why) {
+    if (source_pc_path.empty() || !output_path || !*output_path) {
+        if (why)
+            *why = "Open a source .PC level and choose an OBJ output path first.";
+        return false;
+    }
+
+    Error err{};
+    Arena arena{};
+    ChunkList chunks{};
+    RscfInfo environment{};
+    Mesh mesh;
+    std::vector<PcEnvironmentMaterialBinding> materials;
+    bool ok = arena_init(&arena, 64 * MiB, &err) &&
+              parse_chunks(source_pc_path.c_str(), &chunks, &arena, &err) &&
+              find_pc_environment(chunks, &environment) &&
+              decode_pc_environment(environment, &mesh, &arena, &err) &&
+              pc_environment_material_bindings(chunks, &materials, &err);
+    if (ok && mesh.face_materials.size() != mesh.faces.size())
+        ok = fail(&err, "PC environment face/material tables are inconsistent");
+    if (ok && (mesh.normals.size() != mesh.positions.size() ||
+               mesh.texcoords.size() != mesh.positions.size() ||
+               mesh.diffuse_abgr.size() != mesh.positions.size()))
+        ok = fail(&err, "PC environment vertex attributes are inconsistent");
+
+    std::vector<int32_t> material_indices;
+    if (ok) {
+        material_indices = mesh.face_materials;
+        std::sort(material_indices.begin(), material_indices.end());
+        material_indices.erase(std::unique(material_indices.begin(), material_indices.end()),
+                               material_indices.end());
+    }
+
+    const std::string obj_path = output_path ? output_path : "";
+    const std::string folder = obj_export_folder(obj_path);
+    const std::string stem = obj_export_stem(obj_path);
+    const std::string mtl_name = stem + ".mtl";
+    const std::string texture_folder_name = "textures";
+    const std::string mtl_path = obj_export_join(folder, mtl_name);
+    const std::string texture_folder = obj_export_join(folder, texture_folder_name);
+    if (ok && stem.empty())
+        ok = fail(&err, "the OBJ output path has no file name");
+    if (ok && !CreateDirectoryA(texture_folder.c_str(), nullptr) &&
+        GetLastError() != ERROR_ALREADY_EXISTS)
+        ok = fail(&err, "could not create OBJ texture folder '%s' (win32=%lu)",
+                  texture_folder.c_str(), GetLastError());
+
+    uint32_t texture_count = 0;
+    uint32_t missing_texture_count = 0;
+    std::unordered_map<std::string, std::string> extracted_texture_names;
+    std::unordered_map<std::string, std::string> texture_filename_owners;
+    std::ofstream mtl;
+    if (ok) {
+        mtl.open(mtl_path, std::ios::binary | std::ios::trunc);
+        if (!mtl)
+            ok = fail(&err, "could not create OBJ material library: %s", mtl_path.c_str());
+    }
+    if (ok) {
+        mtl << "# Sniper Elite 2005 Env materials\n";
+        for (int32_t material_index : material_indices) {
+            const std::string material_name = obj_material_name(material_index);
+            mtl << "\nnewmtl " << material_name << "\n"
+                << "Ka 1.000000 1.000000 1.000000\n"
+                << "Kd 1.000000 1.000000 1.000000\n"
+                << "Ks 0.000000 0.000000 0.000000\n"
+                << "d 1.000000\n"
+                << "illum 1\n";
+            if (material_index < 0 || static_cast<uint32_t>(material_index) >= materials.size())
+                continue;
+            const PcEnvironmentMaterialBinding& material = materials[material_index];
+            if (!material.texture_name.size)
+                continue;
+            RscfInfo texture{};
+            if (!pc_environment_texture_resource(chunks, material.texture_name, &texture)) {
+                ++missing_texture_count;
+                continue;
+            }
+
+            std::string source_key = obj_texture_identity(texture.name);
+            if (source_key.empty())
+                source_key = obj_texture_identity(material.texture_name);
+            if (source_key.empty())
+                source_key = material_name;
+
+            std::string texture_name;
+            const auto extracted = extracted_texture_names.find(source_key);
+            if (extracted != extracted_texture_names.end()) {
+                texture_name = extracted->second;
+            } else {
+                const Str original_name = texture.name.size ? texture.name : material.texture_name;
+                const std::string texture_stem = obj_texture_stem(original_name);
+                texture_name = texture_stem + ".dds";
+                uint32_t suffix = 2;
+                while (texture_filename_owners.count(
+                           obj_texture_filename_key(texture_name)) != 0) {
+                    texture_name = texture_stem + "_" + std::to_string(suffix++) + ".dds";
+                }
+
+                const std::string texture_path = obj_export_join(texture_folder, texture_name);
+                if (!write_obj_texture(texture_path, texture, &err)) {
+                    ok = false;
+                    break;
+                }
+                extracted_texture_names.emplace(source_key, texture_name);
+                texture_filename_owners.emplace(obj_texture_filename_key(texture_name),
+                                                source_key);
+                ++texture_count;
+            }
+            const std::string relative_texture_path =
+                texture_folder_name + '/' + texture_name;
+            mtl << "map_Kd " << relative_texture_path << "\n";
+            if ((material.flags & 0x2u) != 0)
+                mtl << "map_d " << relative_texture_path << "\n";
+        }
+        if (ok && !mtl)
+            ok = fail(&err, "could not write OBJ material library: %s", mtl_path.c_str());
+    }
+    mtl.close();
+
+    std::ofstream obj;
+    if (ok) {
+        obj.open(obj_path, std::ios::binary | std::ios::trunc);
+        if (!obj)
+            ok = fail(&err, "could not create Wavefront OBJ: %s", obj_path.c_str());
+    }
+    if (ok) {
+        obj << "# Sniper Elite 2005 PC Env\n"
+            << "mtllib " << mtl_name << "\n"
+            << "o Env\n" << std::setprecision(9);
+        constexpr float inverse_byte = 1.0f / 255.0f;
+        for (size_t vertex_index = 0; vertex_index < mesh.positions.size(); ++vertex_index) {
+            const Asura_Vector_3& position = mesh.positions[vertex_index];
+            const uint32_t diffuse = mesh.diffuse_abgr[vertex_index];
+            const float red = ((diffuse >> 16) & 0xff) * inverse_byte;
+            const float green = ((diffuse >> 8) & 0xff) * inverse_byte;
+            const float blue = (diffuse & 0xff) * inverse_byte;
+            // decode_pc_environment has already corrected the target's negative Y.
+            // Negate Z here to finish the inverse of the Blender-to-game Y/Z flip.
+            obj << "v " << position.x << ' ' << position.y << ' ' << -position.z << ' '
+                << red << ' ' << green << ' ' << blue << '\n';
+        }
+        for (const Asura_Vector_2& texcoord : mesh.texcoords)
+            obj << "vt " << texcoord.x << ' ' << (1.0f - texcoord.y) << '\n';
+        for (const Asura_Vector_3& normal : mesh.normals)
+            obj << "vn " << normal.x << ' ' << normal.y << ' ' << -normal.z << '\n';
+        obj << "s off\n";
+        for (int32_t material_index : material_indices) {
+            const std::string material_name = obj_material_name(material_index);
+            obj << "g " << material_name << "\nusemtl " << material_name << "\n";
+            for (size_t face_index = 0; face_index < mesh.faces.size(); ++face_index) {
+                if (mesh.face_materials[face_index] != material_index)
+                    continue;
+                const std::array<uint32_t, 3>& face = mesh.faces[face_index];
+                obj << 'f';
+                // The Z reflection reverses handedness, so restore the winding.
+                const uint32_t export_order[] = {face[0], face[2], face[1]};
+                for (uint32_t vertex_index : export_order) {
+                    const uint64_t obj_index = static_cast<uint64_t>(vertex_index) + 1;
+                    obj << ' ' << obj_index << '/' << obj_index << '/' << obj_index;
+                }
+                obj << '\n';
+            }
+        }
+        if (!obj)
+            ok = fail(&err, "could not write Wavefront OBJ: %s", obj_path.c_str());
+    }
+    obj.close();
+
+    if (ok && why) {
+        *why = "Exported " + std::to_string(mesh.positions.size()) + " vertices, " +
+               std::to_string(mesh.faces.size()) + " triangles, " +
+               std::to_string(material_indices.size()) + " mat_<index> materials, and " +
+               std::to_string(texture_count) + " DDS textures to " + texture_folder_name + ".";
+        if (missing_texture_count)
+            *why += " " + std::to_string(missing_texture_count) +
+                    " referenced texture resources were not embedded in the source .PC.";
+    } else if (!ok && why) {
+        *why = err.set ? err.message : "Could not export the PC environment as Wavefront OBJ.";
+    }
+
+    unmap_file(&chunks.file);
+    arena_release(&arena);
+    return ok;
 }
 
 bool advance_pc_padded_string(const ChunkRef& chunk, uint64_t* at, Error* err) {

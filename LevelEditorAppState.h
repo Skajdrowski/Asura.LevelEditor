@@ -29,6 +29,7 @@ struct AppState {
     HWND value_label[3]{};
     HWND pickup_item = nullptr;
     HWND rain_toggle = nullptr;
+    HWND backface_cull_toggle = nullptr;
     HWND ambience_properties = nullptr;
     HWND sound_browse = nullptr;
     HWND sound_loop = nullptr;
@@ -41,6 +42,7 @@ struct AppState {
     HWND status = nullptr;
     HWND viewport = nullptr;
     HFONT font = nullptr;
+    UINT dpi = 96;
     Document document;
     LevelEditorHistory history;
     Mesh mesh;
@@ -59,6 +61,7 @@ struct AppState {
     bool panning = false;
     bool moving_entity = false;
     bool refreshing_inspector = false;
+    bool backface_culling = true;
     uint32_t inspector_dirty = 0;
     bool fast_preview = false;
     HBITMAP environment_cache = nullptr;

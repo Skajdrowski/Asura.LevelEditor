@@ -3,6 +3,7 @@
 using namespace editor;
 
 int APIENTRY WinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE, _In_ LPSTR command_line, _In_ int show) {
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     load_spawn_puppets();
 
     WNDCLASSEXA viewport_class{};
@@ -58,9 +59,11 @@ int APIENTRY WinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE, _In_ LPSTR com
     if (!RegisterClassExA(&window_class))
         return 1;
 
+    const UINT initial_dpi = GetDpiForSystem();
     HWND window = CreateWindowExA(
         0, window_class.lpszClassName, "Asura 2005 Level Editor",
-        WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT, 1400, 720,
+        WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
+        MulDiv(1400, initial_dpi, 96), MulDiv(720, initial_dpi, 96),
         nullptr, nullptr, instance, nullptr);
     if (!window)
         return 1;

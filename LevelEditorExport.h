@@ -35,5 +35,7 @@ DirectX::XMFLOAT4 material_map_color(uint32_t key);
 Asura_Vector_3 oriented_box_dimensions(const Entity& entity);
 
 bool pack_document(Document& document, const char* output_path, std::string* why);
+bool export_pc_environment_obj(const std::string& source_pc_path, const char* output_path,
+                               std::string* why);
 
 } // namespace editor

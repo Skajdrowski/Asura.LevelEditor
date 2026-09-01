@@ -31,6 +31,8 @@ uint32_t asura_lower_name_hash(const std::string& name);
 
 const asura::level::RscfInfo* find_pc_environment(const asura::level::ChunkList& chunks,
                                                   asura::level::RscfInfo* storage);
+bool decode_pc_environment(const asura::level::RscfInfo& resource, Mesh* mesh,
+                           asura::Arena* arena, asura::Error* err);
 
 bool load_static_object_donors(const std::vector<std::string>& paths,
                                std::vector<StaticObjectTemplate>* templates,
