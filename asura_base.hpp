@@ -416,6 +416,9 @@ struct MappedFile {
     HANDLE file;
     HANDLE mapping;
     const uint8_t *data;
+    // Non-null when data was materialized in memory instead of mapped from disk.
+    // This is used for transparent decompression of AsuraCmp files.
+    void *owned_data;
     uint64_t size;
     const char *path;
 };
@@ -455,7 +458,8 @@ inline bool map_file(const char *path, MappedFile *out, Error *err) {
 }
 
 inline void unmap_file(MappedFile *f) {
-    if (f->data) UnmapViewOfFile(f->data);
+    if (f->data && !f->owned_data) UnmapViewOfFile(f->data);
+    if (f->owned_data) VirtualFree(f->owned_data, 0, MEM_RELEASE);
     if (f->mapping) CloseHandle(f->mapping);
     if (f->file && f->file != INVALID_HANDLE_VALUE) CloseHandle(f->file);
     memset(f, 0, sizeof(*f));

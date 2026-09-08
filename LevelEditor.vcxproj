@@ -104,6 +104,7 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="AsuraCompression.cpp" />
     <ClCompile Include="AsuraLevelCore.cpp" />
     <ClCompile Include="LevelEditor.cpp" />
     <ClCompile Include="LevelEditorExport.cpp" />
@@ -116,6 +117,7 @@
     <ClCompile Include="LevelEditorUI.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="AsuraCompression.h" />
     <ClInclude Include="AsuraEnums.h" />
     <ClInclude Include="AsuraLevelCore.h" />
     <ClInclude Include="AsuraStructs.h" />
