@@ -1,6 +1,7 @@
 #include "LevelEditorInternal.h"
 
 #include <initializer_list>
+#include <unordered_map>
 
 using namespace asura;
 using namespace asura::level;
@@ -119,6 +120,58 @@ struct GpuModelTexture {
     ID3D11ShaderResourceView* view = nullptr;
 };
 
+struct GpuEntitySnapshot {
+    const SpawnPuppet* model = nullptr;
+    const SpawnPuppetVertex* vertices = nullptr;
+    const std::array<uint16_t, 3>* faces = nullptr;
+    const SpawnPuppetMaterial* materials = nullptr;
+    size_t face_count = 0;
+    EntityKind kind = EntityKind::SpawnPoint;
+    Asura_Vector_3 position{};
+    Asura_Vector_3 rotation{};
+    Asura_Vector_3 spawn_direction{};
+    Asura_Bounding_Box source_bounds{};
+    Asura_Bounding_Box light_bounds{};
+    float sound_range = 0.0f;
+    float light_range = 0.0f;
+    uint32_t value_u32_a = 0;
+    uint32_t light_flags = 0;
+    uint32_t selection_order = 0;
+};
+
+struct GpuModelLookupSnapshot {
+    uint32_t id = 0;
+    const SpawnPuppet* model = nullptr;
+    const std::array<uint16_t, 3>* faces = nullptr;
+    size_t face_count = 0;
+    bool operator==(const GpuModelLookupSnapshot&) const = default;
+};
+
+bool same_vec3(const Asura_Vector_3& a, const Asura_Vector_3& b) {
+    return a.x == b.x && a.y == b.y && a.z == b.z;
+}
+
+bool same_bounds(const Asura_Bounding_Box& a, const Asura_Bounding_Box& b) {
+    return a.MinX == b.MinX && a.MaxX == b.MaxX && a.MinY == b.MinY && a.MaxY == b.MaxY &&
+           a.MinZ == b.MinZ && a.MaxZ == b.MaxZ;
+}
+
+bool same_entity_snapshot(const GpuEntitySnapshot& a, const GpuEntitySnapshot& b) {
+    return a.model == b.model && a.kind == b.kind && same_vec3(a.position, b.position) &&
+           same_vec3(a.rotation, b.rotation) && same_vec3(a.spawn_direction, b.spawn_direction) &&
+           same_bounds(a.source_bounds, b.source_bounds) && same_bounds(a.light_bounds, b.light_bounds) &&
+           a.sound_range == b.sound_range && a.light_range == b.light_range &&
+           a.value_u32_a == b.value_u32_a && a.light_flags == b.light_flags &&
+           a.selection_order == b.selection_order &&
+           a.vertices == b.vertices && a.faces == b.faces && a.materials == b.materials &&
+           a.face_count == b.face_count;
+}
+
+bool same_model_lookup_snapshots(const std::vector<GpuModelLookupSnapshot>& a,
+                                 const std::vector<GpuModelLookupSnapshot>& b) {
+    return a == b;
+}
+
 bool gpu_material_uses_alpha(const GpuMaterialRange& range) {
     return range.texture && (range.material_flags & 0x2u) != 0;
 }
@@ -194,6 +247,28 @@ struct GpuRenderer {
     uint32_t rain_vertex_count = 0;
     std::vector<GpuMaterialRange> material_ranges;
     std::vector<GpuModelTexture> model_textures;
+    std::vector<GpuVertex> rain_scratch;
+    std::vector<GpuVertex> puppet_scratch;
+    std::vector<GpuPuppetRange> puppet_range_scratch;
+    std::vector<GpuVertex> overlay_scratch;
+    std::vector<uint32_t> entity_selection_order_scratch;
+    std::vector<const SpawnPuppet*> entity_models_scratch;
+    std::vector<GpuEntitySnapshot> entity_snapshot;
+    std::vector<GpuEntitySnapshot> entity_snapshot_scratch;
+    std::vector<GpuModelLookupSnapshot> pickup_lookup_snapshot;
+    std::vector<GpuModelLookupSnapshot> pickup_lookup_snapshot_scratch;
+    std::vector<GpuModelLookupSnapshot> static_lookup_snapshot;
+    std::vector<GpuModelLookupSnapshot> static_lookup_snapshot_scratch;
+    std::unordered_map<uint32_t, const SpawnPuppet*> pickup_lookup;
+    std::unordered_map<uint32_t, const SpawnPuppet*> static_lookup;
+    uint32_t cached_unselected_puppet_count = 0;
+    uint32_t cached_selected_puppet_count = 0;
+    uint32_t cached_entity_start = 0;
+    uint32_t cached_selected_entity_start = 0;
+    uint32_t cached_overlay_vertex_count = 0;
+    float cached_overlay_mesh_radius = -1.0f;
+    bool cached_puppets_ready = false;
+    bool cached_overlay_ready = false;
     uint32_t width = 0, height = 0;
     DirectX::XMFLOAT4 skybox_tint{1, 1, 1, 1};
     bool environment_wet_weather = false;
@@ -1889,6 +1964,14 @@ GpuVertex gpu_line_vertex(Asura_Vector_3 position, DirectX::XMFLOAT4 color) {
     return {{position.x, position.y, position.z}, {0, 1, 0}, color};
 }
 
+GpuVertex gpu_model_vertex(const SpawnPuppetVertex& source, const Entity& entity,
+                           DirectX::XMFLOAT4 color) {
+    const Asura_Vector_3 position = spawn_puppet_view_position(source.position, entity);
+    const Asura_Vector_3 normal = normalized(spawn_puppet_view_vector(source.normal, entity));
+    return {{position.x, position.y, position.z}, {normal.x, normal.y, normal.z}, color,
+            {source.texcoord.x, source.texcoord.y}};
+}
+
 bool gpu_update_dynamic_vertices(ID3D11Buffer** buffer, uint32_t* capacity,
                                  const std::vector<GpuVertex>& vertices) {
     if (vertices.empty())
@@ -1918,17 +2001,98 @@ bool gpu_update_dynamic_vertices(ID3D11Buffer** buffer, uint32_t* capacity,
     return true;
 }
 
-std::vector<GpuVertex> build_gpu_rain_vertices(const Asura_Vector_3& camera_position,
-                                               const Asura_Vector_3& right,
-                                               const Asura_Vector_3& up,
-                                               const Asura_Vector_3& forward,
-                                               float vertical_fov, float aspect,
-                                               float animation_seconds) {
+template <typename T, typename IdFn>
+void gpu_refresh_model_lookup(const std::vector<T>& models,
+                              std::vector<GpuModelLookupSnapshot>* cached,
+                              std::vector<GpuModelLookupSnapshot>* scratch,
+                              std::unordered_map<uint32_t, const SpawnPuppet*>* lookup,
+                              IdFn id_of) {
+    scratch->clear();
+    scratch->reserve(models.size());
+    for (const T& entry : models) {
+        const SpawnPuppet* model = &entry.mesh;
+        scratch->push_back({id_of(entry), model, model->faces.data(), model->faces.size()});
+    }
+    if (same_model_lookup_snapshots(*cached, *scratch))
+        return;
+    lookup->clear();
+    lookup->reserve(models.size());
+    for (const GpuModelLookupSnapshot& entry : *scratch)
+        if (entry.face_count)
+            lookup->emplace(entry.id, entry.model);
+    cached->swap(*scratch);
+}
+
+void gpu_refresh_entity_model_lookup() {
+    gpu_refresh_model_lookup(g.pickup_models, &gpu.pickup_lookup_snapshot,
+                             &gpu.pickup_lookup_snapshot_scratch, &gpu.pickup_lookup,
+                             [](const PickupModel& model) { return model.skin_id; });
+    gpu_refresh_model_lookup(g.static_object_models, &gpu.static_lookup_snapshot,
+                             &gpu.static_lookup_snapshot_scratch, &gpu.static_lookup,
+                             [](const StaticObjectModel& model) { return model.file_id; });
+}
+
+const SpawnPuppet* gpu_entity_render_model(const Entity& entity) {
+    if (entity.kind == EntityKind::SpawnPoint)
+        return spawn_puppet_for_team(entity.value_u32_a);
+    if (entity.kind == EntityKind::Pickup) {
+        const auto found = gpu.pickup_lookup.find(entity.pickup_skin_id);
+        return found == gpu.pickup_lookup.end() ? nullptr : found->second;
+    }
+    if (entity.kind == EntityKind::StaticObject) {
+        const auto direct = gpu.static_lookup.find(entity.value_u32_b);
+        if (direct != gpu.static_lookup.end())
+            return direct->second;
+        const auto fallback = gpu.pickup_lookup.find(entity.pickup_skin_id);
+        return fallback == gpu.pickup_lookup.end() ? nullptr : fallback->second;
+    }
+    return nullptr;
+}
+
+GpuEntitySnapshot gpu_entity_snapshot(const Entity& entity, const SpawnPuppet* model,
+                                      uint32_t selection_order) {
+    GpuEntitySnapshot snapshot{};
+    snapshot.model = model;
+    if (model) {
+        snapshot.vertices = model->vertices.data();
+        snapshot.faces = model->faces.data();
+        snapshot.materials = model->materials.data();
+        snapshot.face_count = model->faces.size();
+    }
+    snapshot.kind = entity.kind;
+    snapshot.position = entity.position;
+    snapshot.rotation = entity.rotation;
+    snapshot.spawn_direction = entity.spawn_direction;
+    snapshot.source_bounds = entity.source_bounds;
+    snapshot.sound_range = entity.value_b;
+    snapshot.value_u32_a = entity.value_u32_a;
+    snapshot.selection_order = selection_order;
+    if (entity.kind == EntityKind::Light) {
+        snapshot.light_range = entity.light.Range;
+        snapshot.light_flags = entity.light.m_uFlags;
+        snapshot.light_bounds = entity.light.m_xBoundingBox;
+    }
+    return snapshot;
+}
+
+bool same_entity_snapshots(const std::vector<GpuEntitySnapshot>& a,
+                           const std::vector<GpuEntitySnapshot>& b) {
+    return a.size() == b.size() &&
+           std::equal(a.begin(), a.end(), b.begin(), same_entity_snapshot);
+}
+
+void build_gpu_rain_vertices(const Asura_Vector_3& camera_position,
+                             const Asura_Vector_3& right,
+                             const Asura_Vector_3& up,
+                             const Asura_Vector_3& forward,
+                             float vertical_fov, float aspect,
+                             float animation_seconds,
+                             std::vector<GpuVertex>* vertices) {
     constexpr uint32_t layer_count = 6;
     const float nearest = fmaxf(g.camera.distance * .002f,
                                 std::clamp(g.camera.distance * .055f, 1.5f, 12.0f));
-    std::vector<GpuVertex> vertices;
-    vertices.reserve(layer_count * 6);
+    vertices->clear();
+    vertices->reserve(layer_count * 6);
     for (int layer = layer_count - 1; layer >= 0; --layer) {
         // sub_41D4D0 doubles each camera-centered emitter layer's distance.
         const float distance = nearest * static_cast<float>(1u << layer);
@@ -1955,9 +2119,8 @@ std::vector<GpuVertex> build_gpu_rain_vertices(const Asura_Vector_3& camera_posi
         const GpuVertex b = vertex(top_right, u + tile, v);
         const GpuVertex c = vertex(bottom_right, u + tile, v + tile);
         const GpuVertex d = vertex(bottom_left, u, v + tile);
-        vertices.insert(vertices.end(), {a, b, c, a, c, d});
+        vertices->insert(vertices->end(), {a, b, c, a, c, d});
     }
-    return vertices;
 }
 
 bool gpu_render_rain(const Asura_Vector_3& camera_position, const Asura_Vector_3& right,
@@ -1967,9 +2130,9 @@ bool gpu_render_rain(const Asura_Vector_3& camera_position, const Asura_Vector_3
     gpu.rain_frame_drawn = false;
     if (!g.document.rain_enabled || !gpu.rain_texture || !gpu.rain_pixel_shader)
         return false;
-    const std::vector<GpuVertex> vertices =
-        build_gpu_rain_vertices(camera_position, right, up, forward,
-                                vertical_fov, aspect, animation_seconds);
+    std::vector<GpuVertex>& vertices = gpu.rain_scratch;
+    build_gpu_rain_vertices(camera_position, right, up, forward,
+                            vertical_fov, aspect, animation_seconds, &vertices);
     if (!gpu_update_dynamic_vertices(&gpu.rain_vertices, &gpu.rain_capacity, vertices) ||
         !gpu.rain_vertices)
         return false;
@@ -2016,9 +2179,7 @@ void gpu_render_skybox(const DirectX::XMFLOAT4X4& view_projection) {
     gpu.context->PSSetConstantBuffers(1, 1, &gpu.skybox_animation_buffer);
     for (uint32_t face = 0; face < 6; ++face) {
         ID3D11ShaderResourceView* texture = gpu.skybox_faces[face] ? gpu.skybox_faces[face] : gpu.white_texture;
-        gpu.context->PSSetShader(gpu.skybox_pixel_shader, nullptr, 0);
         gpu.context->PSSetShaderResources(0, 1, &texture);
-        gpu.context->PSSetSamplers(0, 1, &gpu.skybox_sampler);
         gpu.context->Draw(6, face * 6);
     }
     if (g.document.skybox.draw_clouds && gpu.skybox_cloud && gpu.skybox_cloud_pixel_shader && gpu.skybox_cloud_sampler &&
@@ -2035,9 +2196,9 @@ void gpu_render_skybox(const DirectX::XMFLOAT4X4& view_projection) {
     gpu.context->PSSetShaderResources(0, _countof(none), none);
 }
 
-void append_gpu_spawn_puppet(const Entity& entity, bool selected, std::vector<GpuVertex>* output,
+void append_gpu_spawn_puppet(const Entity& entity, const SpawnPuppet* puppet, bool selected,
+                             std::vector<GpuVertex>* output,
                              std::vector<GpuPuppetRange>* ranges = nullptr) {
-    const SpawnPuppet* puppet = spawn_puppet_for_team(entity.value_u32_a);
     if (!puppet)
         return;
 
@@ -2061,22 +2222,17 @@ void append_gpu_spawn_puppet(const Entity& entity, bool selected, std::vector<Gp
     }
 
     for (const auto& face : puppet->faces) {
-        for (uint16_t index : face) {
-            const SpawnPuppetVertex& source = puppet->vertices[index];
-            const Asura_Vector_3 position = spawn_puppet_view_position(source.position, entity);
-            const Asura_Vector_3 normal = normalized(spawn_puppet_view_vector(source.normal, entity));
-            output->push_back({{position.x, position.y, position.z}, {normal.x, normal.y, normal.z}, color,
-                               {source.texcoord.x, source.texcoord.y}});
-        }
+        for (uint16_t index : face)
+            output->push_back(gpu_model_vertex(puppet->vertices[index], entity, color));
     }
     if (ranges && output->size() > start_vertex)
         ranges->push_back(
             {start_vertex, static_cast<uint32_t>(output->size()) - start_vertex, nullptr, selected, true});
 }
 
-void append_gpu_entity_model(const Entity& entity, bool selected, std::vector<GpuVertex>* output,
+void append_gpu_entity_model(const Entity& entity, const SpawnPuppet* model, bool selected,
+                             std::vector<GpuVertex>* output,
                              std::vector<GpuPuppetRange>* ranges = nullptr) {
-    const SpawnPuppet* model = entity_render_model(entity);
     if (!model)
         return;
     const bool two_sided = entity.kind == EntityKind::Pickup;
@@ -2100,13 +2256,8 @@ void append_gpu_entity_model(const Entity& entity, bool selected, std::vector<Gp
             color = entity.kind == EntityKind::StaticObject ? DirectX::XMFLOAT4{.42f, 1.0f, .82f, 0}
                                                              : DirectX::XMFLOAT4{1.0f, .68f, .22f, 0};
         const uint32_t start_vertex = static_cast<uint32_t>(output->size());
-        for (uint16_t index : face) {
-            const SpawnPuppetVertex& source = model->vertices[index];
-            const Asura_Vector_3 position = spawn_puppet_view_position(source.position, entity);
-            const Asura_Vector_3 normal = normalized(spawn_puppet_view_vector(source.normal, entity));
-            output->push_back({{position.x, position.y, position.z}, {normal.x, normal.y, normal.z}, color,
-                               {source.texcoord.x, source.texcoord.y}});
-        }
+        for (uint16_t index : face)
+            output->push_back(gpu_model_vertex(model->vertices[index], entity, color));
         if (ranges) {
             if (!ranges->empty() && ranges->back().material == material &&
                 ranges->back().selected == selected &&
@@ -2120,8 +2271,58 @@ void append_gpu_entity_model(const Entity& entity, bool selected, std::vector<Gp
     }
 }
 
-void append_view_bounding_box(const Asura_Bounding_Box& bounds,
-                              std::vector<LightGizmoLine>* lines) {
+void append_gpu_entity_geometry(const Entity& entity, const SpawnPuppet* model, bool selected,
+                                std::vector<GpuVertex>* vertices,
+                                std::vector<GpuPuppetRange>* ranges) {
+    if (entity.kind == EntityKind::SpawnPoint)
+        append_gpu_spawn_puppet(entity, model, selected, vertices, ranges);
+    else if (entity.kind == EntityKind::Pickup || entity.kind == EntityKind::StaticObject)
+        append_gpu_entity_model(entity, model, selected, vertices, ranges);
+}
+
+DirectX::XMFLOAT4 gpu_overlay_entity_color(EntityKind kind, bool selected) {
+    if (selected)
+        return {1, 1, 1, 1};
+    switch (kind) {
+    case EntityKind::SpawnPoint: return {.25f, .9f, .45f, 1};
+    case EntityKind::Light: return {1, .86f, .2f, 1};
+    case EntityKind::Sound: return {.2f, .7f, 1, 1};
+    case EntityKind::Pickup: return {1, .45f, .18f, 1};
+    case EntityKind::StaticObject: return {.2f, .8f, .65f, 1};
+    case EntityKind::AssassinationTarget: return {1, .15f, .25f, 1};
+    case EntityKind::PositionMarker: return {.75f, .35f, 1, 1};
+    case EntityKind::BuildingVolume: return {.15f, .88f, 1, 1};
+    default: return {1, .45f, .25f, 1};
+    }
+}
+
+void append_gpu_gizmo(std::vector<GpuVertex>* vertices, const std::vector<LightGizmoLine>& lines,
+                      DirectX::XMFLOAT4 color) {
+    for (const LightGizmoLine& line : lines) {
+        vertices->push_back(gpu_line_vertex(line.a, color));
+        vertices->push_back(gpu_line_vertex(line.b, color));
+    }
+}
+
+void append_gpu_marker(std::vector<GpuVertex>* vertices, Asura_Vector_3 position, float size,
+                       DirectX::XMFLOAT4 color) {
+    const Asura_Vector_3 axes[] = {{size, 0, 0}, {0, size, 0}, {0, 0, size}};
+    for (Asura_Vector_3 axis : axes) {
+        vertices->push_back(gpu_line_vertex(sub(position, axis), color));
+        vertices->push_back(gpu_line_vertex(add(position, axis), color));
+    }
+}
+
+void append_box_edges(const Asura_Vector_3 (&corners)[8], std::vector<LightGizmoLine>* lines) {
+    for (int corner = 0; corner < 8; ++corner)
+        for (int axis = 0; axis < 3; ++axis) {
+            const int other = corner ^ (1 << axis);
+            if (corner < other)
+                append_light_gizmo_line(lines, corners[corner], corners[other]);
+        }
+}
+
+void append_view_bounding_box(const Asura_Bounding_Box& bounds, std::vector<LightGizmoLine>* lines) {
     const float values[] = {bounds.MinX, bounds.MaxX, bounds.MinY,
                             bounds.MaxY, bounds.MinZ, bounds.MaxZ};
     for (float value : values)
@@ -2133,13 +2334,7 @@ void append_view_bounding_box(const Asura_Bounding_Box& bounds,
                            corner & 2 ? bounds.MaxY : bounds.MinY,
                            corner & 4 ? bounds.MaxZ : bounds.MinZ};
     }
-    for (int corner = 0; corner < 8; ++corner) {
-        for (int axis = 0; axis < 3; ++axis) {
-            const int other = corner ^ (1 << axis);
-            if (corner < other)
-                append_light_gizmo_line(lines, corners[corner], corners[other]);
-        }
-    }
+    append_box_edges(corners, lines);
 }
 
 void append_oriented_bounds_gizmo(const Entity& entity, std::vector<LightGizmoLine>* lines) {
@@ -2167,28 +2362,47 @@ void append_oriented_bounds_gizmo(const Entity& entity, std::vector<LightGizmoLi
         corners[corner] = entity_view_position(
             add(entity.position, rotate_by_quaternion(local, orientation)));
     }
-    for (int corner = 0; corner < 8; ++corner) {
-        for (int axis = 0; axis < 3; ++axis) {
-            const int other = corner ^ (1 << axis);
-            if (corner < other)
-                append_light_gizmo_line(lines, corners[corner], corners[other]);
-        }
-    }
+    append_box_edges(corners, lines);
 }
 
 void gpu_draw_puppet_ranges(const std::vector<GpuPuppetRange>& ranges, bool selected) {
     gpu.context->PSSetSamplers(0, 1, &gpu.environment_sampler);
+    ID3D11RasterizerState* bound_rasterizer = nullptr;
+    ID3D11ShaderResourceView* bound_texture = nullptr;
+    bool rasterizer_bound = false;
+    bool texture_bound = false;
     for (const GpuPuppetRange& range : ranges) {
         if (range.selected != selected || !range.vertex_count)
             continue;
-        gpu.context->RSSetState(range.two_sided || !g.backface_culling ? gpu.rasterizer_no_cull
-                                                                       : gpu.rasterizer_cull_back);
+        ID3D11RasterizerState* rasterizer = range.two_sided || !g.backface_culling
+                                               ? gpu.rasterizer_no_cull
+                                               : gpu.rasterizer_cull_back;
+        if (!rasterizer_bound || rasterizer != bound_rasterizer) {
+            gpu.context->RSSetState(rasterizer);
+            bound_rasterizer = rasterizer;
+            rasterizer_bound = true;
+        }
         ID3D11ShaderResourceView* texture = gpu_model_texture_view(range.material);
-        gpu.context->PSSetShaderResources(0, 1, &texture);
+        if (!texture_bound || texture != bound_texture) {
+            gpu.context->PSSetShaderResources(0, 1, &texture);
+            bound_texture = texture;
+            texture_bound = true;
+        }
         gpu.context->Draw(range.vertex_count, range.start_vertex);
     }
     ID3D11ShaderResourceView* none = nullptr;
     gpu.context->PSSetShaderResources(0, 1, &none);
+}
+
+void gpu_draw_overlay_range(uint32_t start_vertex, uint32_t vertex_count,
+                            ID3D11DepthStencilState* depth_state) {
+    if (!vertex_count)
+        return;
+    const UINT stride = sizeof(GpuVertex), offset = 0;
+    gpu.context->OMSetDepthStencilState(depth_state, 0);
+    gpu.context->IASetVertexBuffers(0, 1, &gpu.overlay_vertices, &stride, &offset);
+    gpu.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_LINELIST);
+    gpu.context->Draw(vertex_count, start_vertex);
 }
 
 void gpu_render() {
@@ -2270,6 +2484,7 @@ void gpu_render() {
         // Draw all opaque prelighting first. This small staging adjustment to
         // the target's strip walk ensures authored underground mirror geometry
         // is present before a puddle composites over it.
+        gpu.context->OMSetBlendState(nullptr, nullptr, 0xffffffffu);
         for (const GpuMaterialRange& range : gpu.material_ranges) {
             if (gpu_material_uses_alpha(range))
                 continue;
@@ -2279,7 +2494,6 @@ void gpu_render() {
                                                range.has_material_color, 0.0f, false, false);
             gpu.context->UpdateSubresource(gpu.environment_material_buffer, 0, nullptr, &material_constants, 0, 0);
             gpu.context->PSSetShaderResources(2, 1, &texture);
-            gpu.context->OMSetBlendState(nullptr, nullptr, 0xffffffffu);
             gpu.context->DrawIndexed(range.index_count, range.start_index, 0);
         }
         // Plain flag-2/TXFL-bit-clear materials are solid cutouts. MCP2's
@@ -2400,147 +2614,138 @@ void gpu_render() {
                     static_cast<float>(width) / height, rain_animation_time);
     gpu.context->RSSetState(scene_rasterizer);
     gpu.context->PSSetShader(gpu.pixel_shader, nullptr, 0);
-    std::vector<GpuVertex> puppet_vertices;
-    std::vector<GpuPuppetRange> puppet_ranges;
-    size_t puppet_vertex_count = 0;
-    for (const Entity& entity : g.document.entities) {
-        const SpawnPuppet* model = entity_render_model(entity);
-        if (model && model->faces.size() <= (SIZE_MAX - puppet_vertex_count) / 3)
-            puppet_vertex_count += model->faces.size() * 3;
+
+    // Entity geometry is camera-independent. Resolve models and selection once,
+    // then only rebuild the transformed CPU/GPU buffers when entity-visible
+    // state changes. Large retail levels otherwise transform and upload every
+    // ObjectHierarchy triangle again for every orbit/pan redraw.
+    gpu_refresh_entity_model_lookup();
+    const size_t entity_count = g.document.entities.size();
+    std::vector<uint32_t>& selection_order = gpu.entity_selection_order_scratch;
+    selection_order.assign(entity_count, 0);
+    for (size_t order = 0; order < g.selected_entities.size(); ++order) {
+        const int selected_index = g.selected_entities[order];
+        if (valid_entity_index(selected_index))
+            selection_order[static_cast<size_t>(selected_index)] = static_cast<uint32_t>(order + 1);
     }
-    puppet_vertices.reserve(puppet_vertex_count);
-    for (int i = 0; i < static_cast<int>(g.document.entities.size()); ++i) {
-        if (entity_is_selected(i))
-            continue;
-        const Entity& entity = g.document.entities[i];
-        if (entity.kind == EntityKind::SpawnPoint)
-            append_gpu_spawn_puppet(entity, false, &puppet_vertices, &puppet_ranges);
-        else if (entity.kind == EntityKind::Pickup || entity.kind == EntityKind::StaticObject)
-            append_gpu_entity_model(entity, false, &puppet_vertices, &puppet_ranges);
-    }
-    const uint32_t unselected_puppet_count = static_cast<uint32_t>(puppet_vertices.size());
-    for (int selected_index : g.selected_entities) {
-        if (!valid_entity_index(selected_index))
-            continue;
-        const Entity& selected_entity = g.document.entities[selected_index];
-        if (selected_entity.kind == EntityKind::SpawnPoint)
-            append_gpu_spawn_puppet(selected_entity, true, &puppet_vertices, &puppet_ranges);
-        else if (selected_entity.kind == EntityKind::Pickup || selected_entity.kind == EntityKind::StaticObject)
-            append_gpu_entity_model(selected_entity, true, &puppet_vertices, &puppet_ranges);
-    }
-    const uint32_t selected_puppet_count =
-        static_cast<uint32_t>(puppet_vertices.size()) - unselected_puppet_count;
-    const bool puppets_ready =
-        gpu_update_dynamic_vertices(&gpu.puppet_vertices, &gpu.puppet_capacity, puppet_vertices) &&
-        gpu.puppet_vertices && !puppet_vertices.empty();
-    std::vector<GpuVertex> overlay;
-    const float extent = fmaxf(50.0f, g.mesh.radius * 1.5f);
-    float step = fmaxf(1.0f, powf(10.0f, floorf(log10f(extent / 10.0f))));
-    const int lines = static_cast<int>(extent / step);
-    const DirectX::XMFLOAT4 minor{.18f, .22f, .25f, 1}, major{.32f, .38f, .42f, 1};
-    size_t gizmo_line_capacity = 0;
-    if (valid_entity_index(g.selected)) {
-        const EntityKind kind = g.document.entities[g.selected].kind;
-        if (kind == EntityKind::Light)
-            gizmo_line_capacity = kMaximumLightGizmoLines * g.selected_entities.size();
-        else if (kind == EntityKind::Sound)
-            gizmo_line_capacity = kLightRangeSegments * 3 * g.selected_entities.size();
-    }
-    overlay.reserve((lines * 2 + 1) * 4 +
-                    g.document.entities.size() *
-                        (6 + kCameraSpawnArrowLines * 2 + kLightBoundingBoxLines * 2) +
-                    gizmo_line_capacity * 2);
-    for (int i = -lines; i <= lines; ++i) {
-        const auto color = i == 0 ? major : minor;
-        overlay.push_back(gpu_line_vertex({i * step, 0, -extent}, color));
-        overlay.push_back(gpu_line_vertex({i * step, 0, extent}, color));
-        overlay.push_back(gpu_line_vertex({-extent, 0, i * step}, color));
-        overlay.push_back(gpu_line_vertex({extent, 0, i * step}, color));
-    }
-    const uint32_t entity_start = static_cast<uint32_t>(overlay.size());
-    uint32_t selected_entity_start = entity_start;
-    const float marker = fmaxf(.35f, g.mesh.radius * .008f);
-    std::vector<LightGizmoLine> entity_gizmo;
-    entity_gizmo.reserve(kMaximumLightGizmoLines);
-    for (int pass = 0; pass < 2; ++pass) {
-      for (int i = 0; i < static_cast<int>(g.document.entities.size()); ++i) {
-        const bool selected = entity_is_selected(i);
-        if (selected != (pass == 1))
-            continue;
-        const Entity& entity = g.document.entities[i];
-        const Asura_Vector_3 view_position = entity_view_position(entity.position);
-        DirectX::XMFLOAT4 color{1, .45f, .25f, 1};
-        if (entity.kind == EntityKind::SpawnPoint)
-            color = {.25f, .9f, .45f, 1};
-        else if (entity.kind == EntityKind::Light)
-            color = {1, .86f, .2f, 1};
-        else if (entity.kind == EntityKind::Sound)
-            color = {.2f, .7f, 1, 1};
-        else if (entity.kind == EntityKind::Pickup)
-            color = {1, .45f, .18f, 1};
-        else if (entity.kind == EntityKind::StaticObject)
-            color = {.2f, .8f, .65f, 1};
-        else if (entity.kind == EntityKind::AssassinationTarget)
-            color = {1, .15f, .25f, 1};
-        else if (entity.kind == EntityKind::PositionMarker)
-            color = {.75f, .35f, 1, 1};
-        else if (entity.kind == EntityKind::BuildingVolume)
-            color = {.15f, .88f, 1, 1};
-        if (selected)
-            color = {1, 1, 1, 1};
-        if (entity.kind == EntityKind::BuildingVolume) {
-            entity_gizmo.clear();
-            append_oriented_bounds_gizmo(entity, &entity_gizmo);
-            for (const LightGizmoLine& line : entity_gizmo) {
-                overlay.push_back(gpu_line_vertex(line.a, color));
-                overlay.push_back(gpu_line_vertex(line.b, color));
-            }
-            continue;
+
+    std::vector<const SpawnPuppet*>& entity_models = gpu.entity_models_scratch;
+    entity_models.resize(entity_count);
+    for (size_t i = 0; i < entity_count; ++i)
+        entity_models[i] = gpu_entity_render_model(g.document.entities[i]);
+
+    std::vector<GpuEntitySnapshot>& next_snapshot = gpu.entity_snapshot_scratch;
+    next_snapshot.resize(entity_count);
+    for (size_t i = 0; i < entity_count; ++i)
+        next_snapshot[i] = gpu_entity_snapshot(g.document.entities[i], entity_models[i], selection_order[i]);
+
+    if (gpu.cached_overlay_mesh_radius != g.mesh.radius ||
+        !same_entity_snapshots(gpu.entity_snapshot, next_snapshot)) {
+        std::vector<GpuVertex>& puppet_vertices = gpu.puppet_scratch;
+        std::vector<GpuPuppetRange>& puppet_ranges = gpu.puppet_range_scratch;
+        puppet_vertices.clear();
+        puppet_ranges.clear();
+        size_t puppet_vertex_count = 0;
+        for (const GpuEntitySnapshot& snapshot : next_snapshot)
+            if (snapshot.model && snapshot.face_count <= (SIZE_MAX - puppet_vertex_count) / 3)
+                puppet_vertex_count += snapshot.face_count * 3;
+        puppet_vertices.reserve(puppet_vertex_count);
+        for (size_t i = 0; i < entity_count; ++i)
+            if (!selection_order[i] && entity_models[i])
+                append_gpu_entity_geometry(g.document.entities[i], entity_models[i], false,
+                                           &puppet_vertices, &puppet_ranges);
+        gpu.cached_unselected_puppet_count = static_cast<uint32_t>(puppet_vertices.size());
+        for (int selected_index : g.selected_entities)
+            if (valid_entity_index(selected_index) && entity_models[static_cast<size_t>(selected_index)])
+                append_gpu_entity_geometry(g.document.entities[selected_index],
+                                           entity_models[static_cast<size_t>(selected_index)], true,
+                                           &puppet_vertices, &puppet_ranges);
+        gpu.cached_selected_puppet_count =
+            static_cast<uint32_t>(puppet_vertices.size()) - gpu.cached_unselected_puppet_count;
+        gpu.cached_puppets_ready = !puppet_vertices.empty() &&
+                                   gpu_update_dynamic_vertices(&gpu.puppet_vertices, &gpu.puppet_capacity,
+                                                               puppet_vertices) &&
+                                   gpu.puppet_vertices;
+
+        std::vector<GpuVertex>& overlay = gpu.overlay_scratch;
+        overlay.clear();
+        const float extent = fmaxf(50.0f, g.mesh.radius * 1.5f);
+        const float step = fmaxf(1.0f, powf(10.0f, floorf(log10f(extent / 10.0f))));
+        const int lines = static_cast<int>(extent / step);
+        const DirectX::XMFLOAT4 minor{.18f, .22f, .25f, 1}, major{.32f, .38f, .42f, 1};
+        size_t gizmo_line_capacity = 0;
+        if (valid_entity_index(g.selected)) {
+            const EntityKind kind = g.document.entities[g.selected].kind;
+            if (kind == EntityKind::Light)
+                gizmo_line_capacity = kMaximumLightGizmoLines * g.selected_entities.size();
+            else if (kind == EntityKind::Sound)
+                gizmo_line_capacity = kLightRangeSegments * 3 * g.selected_entities.size();
         }
-        if (entity.kind == EntityKind::SpawnPoint &&
-            (entity.value_u32_a & SnipeSpawnTeam_Camera)) {
-            entity_gizmo.clear();
-            append_camera_spawn_arrow(entity, selected ? marker * 1.6f : marker, &entity_gizmo);
-            for (const LightGizmoLine& line : entity_gizmo) {
-                overlay.push_back(gpu_line_vertex(line.a, color));
-                overlay.push_back(gpu_line_vertex(line.b, color));
-            }
+        overlay.reserve((lines * 2 + 1) * 4 +
+                        entity_count * (6 + kCameraSpawnArrowLines * 2 + kLightBoundingBoxLines * 2) +
+                        gizmo_line_capacity * 2);
+        for (int i = -lines; i <= lines; ++i) {
+            const auto color = i == 0 ? major : minor;
+            overlay.push_back(gpu_line_vertex({i * step, 0, -extent}, color));
+            overlay.push_back(gpu_line_vertex({i * step, 0, extent}, color));
+            overlay.push_back(gpu_line_vertex({-extent, 0, i * step}, color));
+            overlay.push_back(gpu_line_vertex({extent, 0, i * step}, color));
         }
-        if (selected && (entity.kind == EntityKind::Light || entity.kind == EntityKind::Sound)) {
-            entity_gizmo.clear();
-            if (entity.kind == EntityKind::Light)
-                append_light_gizmo(entity, &entity_gizmo);
-            else
-                append_sound_gizmo(entity, &entity_gizmo);
-            const DirectX::XMFLOAT4 range_color = entity.kind == EntityKind::Light
-                                                       ? DirectX::XMFLOAT4{1, .92f, .35f, 1}
-                                                       : DirectX::XMFLOAT4{.25f, .8f, 1, 1};
-            for (const LightGizmoLine& line : entity_gizmo) {
-                overlay.push_back(gpu_line_vertex(line.a, range_color));
-                overlay.push_back(gpu_line_vertex(line.b, range_color));
+        gpu.cached_entity_start = static_cast<uint32_t>(overlay.size());
+        gpu.cached_selected_entity_start = gpu.cached_entity_start;
+        const float marker = fmaxf(.35f, g.mesh.radius * .008f);
+        std::vector<LightGizmoLine> entity_gizmo;
+        entity_gizmo.reserve(kMaximumLightGizmoLines);
+        for (int pass = 0; pass < 2; ++pass) {
+            for (size_t i = 0; i < entity_count; ++i) {
+                const bool selected = selection_order[i] != 0;
+                if (selected != (pass == 1))
+                    continue;
+                const Entity& entity = g.document.entities[i];
+                const DirectX::XMFLOAT4 color = gpu_overlay_entity_color(entity.kind, selected);
+                if (entity.kind == EntityKind::BuildingVolume) {
+                    entity_gizmo.clear();
+                    append_oriented_bounds_gizmo(entity, &entity_gizmo);
+                    append_gpu_gizmo(&overlay, entity_gizmo, color);
+                    continue;
+                }
+                if (entity.kind == EntityKind::SpawnPoint && (entity.value_u32_a & SnipeSpawnTeam_Camera)) {
+                    entity_gizmo.clear();
+                    append_camera_spawn_arrow(entity, selected ? marker * 1.6f : marker, &entity_gizmo);
+                    append_gpu_gizmo(&overlay, entity_gizmo, color);
+                }
+                if (selected && (entity.kind == EntityKind::Light || entity.kind == EntityKind::Sound)) {
+                    entity_gizmo.clear();
+                    if (entity.kind == EntityKind::Light)
+                        append_light_gizmo(entity, &entity_gizmo);
+                    else
+                        append_sound_gizmo(entity, &entity_gizmo);
+                    append_gpu_gizmo(&overlay, entity_gizmo,
+                                     entity.kind == EntityKind::Light
+                                         ? DirectX::XMFLOAT4{1, .92f, .35f, 1}
+                                         : DirectX::XMFLOAT4{.25f, .8f, 1, 1});
+                }
+                if (!entity_models[i])
+                    append_gpu_marker(&overlay, entity_view_position(entity.position),
+                                      selected ? marker * 1.6f : marker, color);
             }
+            if (pass == 0)
+                gpu.cached_selected_entity_start = static_cast<uint32_t>(overlay.size());
         }
-        if (entity_render_model(entity))
-            continue;
-        const float size = selected ? marker * 1.6f : marker;
-        overlay.push_back(gpu_line_vertex(add(view_position, {-size, 0, 0}), color));
-        overlay.push_back(gpu_line_vertex(add(view_position, {size, 0, 0}), color));
-        overlay.push_back(gpu_line_vertex(add(view_position, {0, -size, 0}), color));
-        overlay.push_back(gpu_line_vertex(add(view_position, {0, size, 0}), color));
-        overlay.push_back(gpu_line_vertex(add(view_position, {0, 0, -size}), color));
-        overlay.push_back(gpu_line_vertex(add(view_position, {0, 0, size}), color));
-      }
-      if (pass == 0)
-          selected_entity_start = static_cast<uint32_t>(overlay.size());
+        gpu.cached_overlay_vertex_count = static_cast<uint32_t>(overlay.size());
+        gpu.cached_overlay_ready = gpu_update_overlay(overlay) && gpu.overlay_vertices;
+        gpu.cached_overlay_mesh_radius = g.mesh.radius;
+        gpu.entity_snapshot.swap(next_snapshot);
     }
-    const bool overlay_ready = gpu_update_overlay(overlay) && gpu.overlay_vertices;
-    if (overlay_ready) {
-        gpu.context->IASetVertexBuffers(0, 1, &gpu.overlay_vertices, &stride, &offset);
-        gpu.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_LINELIST);
-        gpu.context->OMSetDepthStencilState(gpu.depth_enabled, 0);
-        if (entity_start)
-            gpu.context->Draw(entity_start, 0);
-    }
+    std::vector<GpuPuppetRange>& puppet_ranges = gpu.puppet_range_scratch;
+    const uint32_t unselected_puppet_count = gpu.cached_unselected_puppet_count;
+    const uint32_t selected_puppet_count = gpu.cached_selected_puppet_count;
+    const bool puppets_ready = gpu.cached_puppets_ready;
+    const uint32_t entity_start = gpu.cached_entity_start;
+    const uint32_t selected_entity_start = gpu.cached_selected_entity_start;
+    const bool overlay_ready = gpu.cached_overlay_ready;
+    if (overlay_ready)
+        gpu_draw_overlay_range(0, entity_start, gpu.depth_enabled);
     // Unselected models and markers retain the environment depth buffer and
     // therefore disappear naturally behind walls and terrain.
     if (puppets_ready && unselected_puppet_count) {
@@ -2549,12 +2754,8 @@ void gpu_render() {
         gpu.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         gpu_draw_puppet_ranges(puppet_ranges, false);
     }
-    if (overlay_ready && selected_entity_start > entity_start) {
-        gpu.context->OMSetDepthStencilState(gpu.depth_enabled, 0);
-        gpu.context->IASetVertexBuffers(0, 1, &gpu.overlay_vertices, &stride, &offset);
-        gpu.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_LINELIST);
-        gpu.context->Draw(selected_entity_start - entity_start, entity_start);
-    }
+    if (overlay_ready)
+        gpu_draw_overlay_range(entity_start, selected_entity_start - entity_start, gpu.depth_enabled);
     // Only the selected model discards scene depth. Drawing with depth enabled
     // after the clear preserves the model's own self-occlusion.
     if (puppets_ready && selected_puppet_count) {
@@ -2564,12 +2765,10 @@ void gpu_render() {
         gpu.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         gpu_draw_puppet_ranges(puppet_ranges, true);
     }
-    if (overlay_ready && overlay.size() > selected_entity_start) {
-        gpu.context->OMSetDepthStencilState(gpu.depth_disabled, 0);
-        gpu.context->IASetVertexBuffers(0, 1, &gpu.overlay_vertices, &stride, &offset);
-        gpu.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_LINELIST);
-        gpu.context->Draw(static_cast<UINT>(overlay.size() - selected_entity_start), selected_entity_start);
-    }
+    if (overlay_ready)
+        gpu_draw_overlay_range(selected_entity_start,
+                               gpu.cached_overlay_vertex_count - selected_entity_start,
+                               gpu.depth_disabled);
     gpu.swap_chain->Present(0, 0);
 }
 
