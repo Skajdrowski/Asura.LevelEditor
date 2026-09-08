@@ -1,7 +1,9 @@
-#include "LevelEditorInternal.h"
+#include "LevelEditorExport.h"
+#include "LevelEditorImport.h"
 
+#include <algorithm>
+#include <fstream>
 #include <iomanip>
-#include <unordered_map>
 
 using namespace asura;
 using namespace asura::level;
@@ -698,7 +700,17 @@ bool pc_environment_material_chunk_indices(const ChunkList& source, uint32_t* te
                                            uint32_t* material_chunk_index, Error* err);
 
 bool contains_u32(const std::vector<uint32_t>& values, uint32_t value) {
-    return std::find(values.begin(), values.end(), value) != values.end();
+    for (uint32_t existing : values)
+        if (existing == value)
+            return true;
+    return false;
+}
+
+bool contains_string(const std::vector<std::string>& values, const std::string& value) {
+    for (const std::string& existing : values)
+        if (existing == value)
+            return true;
+    return false;
 }
 
 std::string normalized_resource_path(Str value) {
@@ -869,7 +881,7 @@ bool append_static_object_support(Buffer* out, const Document& document,
             if (!rscf_info(donor.chunks[i], &resource) || resource.type != ASURA_RESOURCEFILE_TYPE_TEXTURE)
                 continue;
             const std::string normalized = normalized_resource_path(resource.name);
-            if (std::find(present_textures.begin(), present_textures.end(), normalized) != present_textures.end())
+            if (contains_string(present_textures, normalized))
                 continue;
             for (uint32_t text_index = 0; text_index < donor.count; ++text_index) {
                 if (wanted[text_index] && static_text_references(donor.chunks[text_index], resource.name)) {
@@ -891,8 +903,7 @@ bool append_static_object_support(Buffer* out, const Document& document,
                     present_objects.push_back(id);
                 } else if (resource.type == ASURA_RESOURCEFILE_TYPE_TEXTURE) {
                     const std::string normalized = normalized_resource_path(resource.name);
-                    if (std::find(present_textures.begin(), present_textures.end(), normalized) !=
-                        present_textures.end())
+                    if (contains_string(present_textures, normalized))
                         continue;
                     present_textures.push_back(normalized);
                 }
@@ -1202,23 +1213,6 @@ bool pack_document(Document& doc, const char* output_path, std::string* why) {
 }
 
 
-DirectX::XMFLOAT4 material_map_color(uint32_t key) {
-    // Stable, high-contrast debug colours. Equal material/surface types keep
-    // equal colours while unrelated types remain distinguishable without a
-    // texture. The shader still multiplies this diagnostic tint by the exact
-    // baked vertex diffuse so authored prelighting remains visible.
-    uint32_t mixed = key + 0x9e3779b9u;
-    mixed ^= mixed >> 16;
-    mixed *= 0x7feb352du;
-    mixed ^= mixed >> 15;
-    mixed *= 0x846ca68bu;
-    mixed ^= mixed >> 16;
-    constexpr float scale = 0.45f / 255.0f;
-    return {.45f + ((mixed >> 16) & 0xff) * scale,
-            .45f + ((mixed >> 8) & 0xff) * scale,
-            .45f + (mixed & 0xff) * scale, 1.0f};
-}
-
 bool pc_environment_material_bindings(const ChunkList& chunks,
                                       std::vector<PcEnvironmentMaterialBinding>* output, Error* err) {
     output->clear();
@@ -1392,6 +1386,23 @@ std::string obj_texture_filename_key(std::string filename) {
     return filename;
 }
 
+const std::string* obj_extracted_texture_name(
+    const std::vector<std::string>& extracted,
+    const std::string& source_key) {
+    for (size_t i = 0; i + 1 < extracted.size(); i += 2)
+        if (extracted[i] == source_key)
+            return &extracted[i + 1];
+    return nullptr;
+}
+
+bool obj_texture_filename_is_used(const std::vector<std::string>& filenames,
+                                  const std::string& filename_key) {
+    for (const std::string& existing : filenames)
+        if (existing == filename_key)
+            return true;
+    return false;
+}
+
 std::string obj_material_name(int32_t material_index) {
     return "mat_" + std::to_string(material_index);
 }
@@ -1476,8 +1487,11 @@ bool export_pc_environment_obj(const std::string& source_pc_path, const char* ou
 
     uint32_t texture_count = 0;
     uint32_t missing_texture_count = 0;
-    std::unordered_map<std::string, std::string> extracted_texture_names;
-    std::unordered_map<std::string, std::string> texture_filename_owners;
+    // Alternating source key / generated filename. Keeping this as the already
+    // ubiquitous vector<string> avoids a one-off vector<pair<string,string>>
+    // allocator/template family for this tiny insertion-ordered cache.
+    std::vector<std::string> extracted_texture_names;
+    std::vector<std::string> used_texture_filenames;
     std::ofstream mtl;
     if (ok) {
         mtl.open(mtl_path, std::ios::binary | std::ios::trunc);
@@ -1512,16 +1526,16 @@ bool export_pc_environment_obj(const std::string& source_pc_path, const char* ou
                 source_key = material_name;
 
             std::string texture_name;
-            const auto extracted = extracted_texture_names.find(source_key);
-            if (extracted != extracted_texture_names.end()) {
-                texture_name = extracted->second;
+            const std::string* extracted = obj_extracted_texture_name(extracted_texture_names, source_key);
+            if (extracted) {
+                texture_name = *extracted;
             } else {
                 const Str original_name = texture.name.size ? texture.name : material.texture_name;
                 const std::string texture_stem = obj_texture_stem(original_name);
                 texture_name = texture_stem + ".dds";
                 uint32_t suffix = 2;
-                while (texture_filename_owners.count(
-                           obj_texture_filename_key(texture_name)) != 0) {
+                while (obj_texture_filename_is_used(
+                    used_texture_filenames, obj_texture_filename_key(texture_name))) {
                     texture_name = texture_stem + "_" + std::to_string(suffix++) + ".dds";
                 }
 
@@ -1530,9 +1544,9 @@ bool export_pc_environment_obj(const std::string& source_pc_path, const char* ou
                     ok = false;
                     break;
                 }
-                extracted_texture_names.emplace(source_key, texture_name);
-                texture_filename_owners.emplace(obj_texture_filename_key(texture_name),
-                                                source_key);
+                extracted_texture_names.push_back(source_key);
+                extracted_texture_names.push_back(texture_name);
+                used_texture_filenames.push_back(obj_texture_filename_key(texture_name));
                 ++texture_count;
             }
             const std::string relative_texture_path =
@@ -1653,7 +1667,11 @@ bool pc_environment_collision_flags(const ChunkList& chunks, uint32_t material_c
     if (!advance_pc_padded_string(*module_list, &at, err))
         return false;
 
-    std::vector<std::unordered_map<uint16_t, uint32_t>> frequencies(material_count);
+    // Pack material/flag observations into one 32-bit value. Sorting groups
+    // identical observations so the exact material-level mode can be recovered
+    // without one hash table allocation per material. The source material is
+    // uint16_t, so the upper/lower 16-bit split is lossless.
+    std::vector<int32_t> frequencies;
     for (uint32_t module_index = 0; module_index < module_count; ++module_index) {
         if (!advance_pc_padded_string(*module_list, &at, err))
             return false;
@@ -1743,8 +1761,10 @@ bool pc_environment_collision_flags(const ChunkList& chunks, uint32_t material_c
             const uint32_t ordinal = material >= 1000
                                          ? static_cast<uint32_t>(material) - 1000
                                          : material;
-            if (ordinal < material_count)
-                ++frequencies[ordinal][flags];
+            if (ordinal < material_count) {
+                const uint32_t packed = (ordinal << 16) | flags;
+                frequencies.push_back(static_cast<int32_t>(packed));
+            }
         }
     }
     if (at != module_list->size)
@@ -1755,17 +1775,34 @@ bool pc_environment_collision_flags(const ChunkList& chunks, uint32_t material_c
     // share a render material. collision_flags is material-level, so choose
     // the mode: it exactly preserves the largest possible number of source
     // polygons. Prefer the lower mask on a tie for deterministic output.
-    for (uint32_t material = 0; material < material_count; ++material) {
-        uint32_t best_count = 0;
-        uint16_t best_flags = 0;
-        for (const auto& [flags, count] : frequencies[material]) {
-            if (count > best_count || (count == best_count && flags < best_flags)) {
-                best_count = count;
-                best_flags = flags;
-            }
+    std::sort(frequencies.begin(), frequencies.end());
+    size_t sample = 0;
+    uint32_t current_material = 0xffffffffu;
+    uint32_t best_count = 0;
+    uint16_t best_flags = 0;
+    while (sample < frequencies.size()) {
+        const uint32_t packed = static_cast<uint32_t>(frequencies[sample]);
+        const uint32_t material = packed >> 16;
+        const uint16_t flags = static_cast<uint16_t>(packed);
+        size_t next = sample + 1;
+        while (next < frequencies.size() && frequencies[next] == frequencies[sample])
+            ++next;
+        const uint32_t count = static_cast<uint32_t>(next - sample);
+        if (material != current_material) {
+            if (current_material != 0xffffffffu)
+                (*output)[current_material] = best_flags;
+            current_material = material;
+            best_count = 0;
+            best_flags = 0;
         }
-        (*output)[material] = best_flags;
+        if (count > best_count || (count == best_count && flags < best_flags)) {
+            best_count = count;
+            best_flags = flags;
+        }
+        sample = next;
     }
+    if (current_material != 0xffffffffu)
+        (*output)[current_material] = best_flags;
     return true;
 }
 

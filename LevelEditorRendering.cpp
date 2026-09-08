@@ -1,6 +1,7 @@
 #include "LevelEditorInternal.h"
 
 #include <initializer_list>
+#include <new>
 #include <unordered_map>
 
 using namespace asura;
@@ -169,7 +170,12 @@ bool same_entity_snapshot(const GpuEntitySnapshot& a, const GpuEntitySnapshot& b
 
 bool same_model_lookup_snapshots(const std::vector<GpuModelLookupSnapshot>& a,
                                  const std::vector<GpuModelLookupSnapshot>& b) {
-    return a == b;
+    if (a.size() != b.size())
+        return false;
+    for (size_t i = 0; i < a.size(); ++i)
+        if (!(a[i] == b[i]))
+            return false;
+    return true;
 }
 
 bool gpu_material_uses_alpha(const GpuMaterialRange& range) {
@@ -294,10 +300,20 @@ void refresh_scene_animation_timer() {
         KillTimer(g.window, 2);
 }
 
-template <typename T> void gpu_release(T*& object) {
+void gpu_release_object(IUnknown* object) {
     if (object)
         object->Release();
-    object = nullptr;
+}
+
+#define gpu_release(object) do { gpu_release_object(object); (object) = nullptr; } while (false)
+
+HRESULT gpu_compile_shader(const char* source, size_t source_size, const char* entry,
+                           const char* target, ID3DBlob** output) {
+    ID3DBlob* errors = nullptr;
+    const HRESULT result = D3DCompile(source, source_size, nullptr, nullptr, nullptr, entry, target,
+                                      D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, output, &errors);
+    gpu_release(errors);
+    return result;
 }
 
 void gpu_release_skybox_textures() {
@@ -510,23 +526,28 @@ bool gpu_create_dds_view(const char* path, ID3D11ShaderResourceView** output, st
 
 
 bool pc_texture_resource(const ChunkList& chunks, Str texture_name, RscfInfo* output);
+bool gpu_has_material_flag(uint32_t mask, bool require_texture);
 
 std::string parent_folder_of(const std::string& path) {
     const size_t slash = path.find_last_of("\\/");
     return slash == std::string::npos ? std::string{} : path.substr(0, slash);
 }
 
+void texture_search_roots(const std::string& level_path, std::string (&roots)[5]) {
+    char module_path[MAX_PATH * 4]{};
+    GetModuleFileNameA(nullptr, module_path, static_cast<DWORD>(sizeof(module_path)));
+    roots[1] = parent_folder_of(module_path);
+    roots[2] = parent_folder_of(parent_folder_of(roots[1]));
+    roots[3] = parent_folder_of(level_path);
+    roots[4] = parent_folder_of(roots[3]);
+}
+
 bool gpu_load_global_texture(const char* relative_path, const std::string& level_path,
                              ID3D11ShaderResourceView** output, std::string* why) {
     if (*output)
         return true;
-    char module_path[MAX_PATH * 4]{};
-    GetModuleFileNameA(nullptr, module_path, static_cast<DWORD>(sizeof(module_path)));
-    const std::string module_folder = parent_folder_of(module_path);
-    const std::string editor_root = parent_folder_of(parent_folder_of(module_folder));
-    const std::string level_folder = parent_folder_of(level_path);
-    const std::string level_parent = parent_folder_of(level_folder);
-    const std::string roots[] = {"", module_folder, editor_root, level_folder, level_parent};
+    std::string roots[5];
+    texture_search_roots(level_path, roots);
     std::string last_error;
     for (const std::string& root : roots) {
         const std::string candidate = root.empty() ? relative_path : root + "\\" + relative_path;
@@ -542,17 +563,17 @@ bool gpu_load_global_texture(const char* relative_path, const std::string& level
 }
 
 bool gpu_load_rain_sprite(const ChunkList* chunks, const std::string& level_path, std::string* why) {
-    const auto parent_folder = [](const std::string& path) {
-        const size_t slash = path.find_last_of("\\/");
-        return slash == std::string::npos ? std::string{} : path.substr(0, slash);
-    };
     const size_t slash = level_path.find_last_of("\\/");
     const std::string basename =
         slash == std::string::npos ? level_path : level_path.substr(slash + 1);
     std::vector<std::string> stems;
     const auto append_stem = [&stems](std::string stem) {
-        if (!stem.empty() && std::find(stems.begin(), stems.end(), stem) == stems.end())
-            stems.push_back(std::move(stem));
+        if (stem.empty())
+            return;
+        for (const std::string& existing : stems)
+            if (existing == stem)
+                return;
+        stems.push_back(std::move(stem));
     };
     for (size_t at = 0; at + 1 < basename.size(); ++at) {
         const char first = basename[at], second = basename[at + 1];
@@ -572,13 +593,8 @@ bool gpu_load_rain_sprite(const ChunkList* chunks, const std::string& level_path
     append_stem("rn_p01a");
     append_stem("droplet1");
 
-    char module_path[MAX_PATH * 4]{};
-    GetModuleFileNameA(nullptr, module_path, static_cast<DWORD>(sizeof(module_path)));
-    const std::string module_folder = parent_folder(module_path);
-    const std::string editor_root = parent_folder(parent_folder(module_folder));
-    const std::string level_folder = parent_folder(level_path);
-    const std::string level_parent = parent_folder(level_folder);
-    const std::string roots[] = {"", module_folder, editor_root, level_folder, level_parent};
+    std::string roots[5];
+    texture_search_roots(level_path, roots);
     std::string last_error;
     for (const std::string& stem : stems) {
         if (chunks) {
@@ -639,23 +655,15 @@ bool gpu_load_pc_environment_textures(const std::string& pc_path, uint32_t* load
             // DDS data, just like target type-2 texture resources, despite the
             // original engine path retaining its .bmp extension.
             if (!gpu.environment_splash) {
-                const auto parent_folder = [](const std::string& path) {
-                    const size_t slash = path.find_last_of("\\/");
-                    return slash == std::string::npos ? std::string{} : path.substr(0, slash);
-                };
-                char module_path[MAX_PATH * 4]{};
-                GetModuleFileNameA(nullptr, module_path, static_cast<DWORD>(sizeof(module_path)));
-                const std::string module_folder = parent_folder(module_path);
-                const std::string editor_root = parent_folder(parent_folder(module_folder));
-                const std::string pc_folder = parent_folder(pc_path);
-                const std::string pc_parent = parent_folder(pc_folder);
+                std::string roots[5];
+                texture_search_roots(pc_path, roots);
                 const std::string candidates[] = {
                     "SpecialFX\\splash.dds",
                     "SpecialFX\\splash.bmp",
-                    module_folder + "\\SpecialFX\\splash.dds",
-                    editor_root + "\\SpecialFX\\splash.dds",
-                    pc_folder + "\\SpecialFX\\splash.dds",
-                    pc_parent + "\\SpecialFX\\splash.dds",
+                    roots[1] + "\\SpecialFX\\splash.dds",
+                    roots[2] + "\\SpecialFX\\splash.dds",
+                    roots[3] + "\\SpecialFX\\splash.dds",
+                    roots[4] + "\\SpecialFX\\splash.dds",
                 };
                 for (const std::string& candidate : candidates) {
                     if (candidate.empty() || !file_exists(candidate.c_str()))
@@ -700,12 +708,8 @@ bool gpu_load_pc_environment_textures(const std::string& pc_path, uint32_t* load
                 last_texture_error = std::move(texture_error);
             }
         }
-        const bool needs_detail = std::any_of(
-            gpu.material_ranges.begin(), gpu.material_ranges.end(),
-            [](const GpuMaterialRange& range) { return range.texture && (range.material_flags & 0x4u) != 0; });
-        const bool needs_spheremap = std::any_of(
-            gpu.material_ranges.begin(), gpu.material_ranges.end(),
-            [](const GpuMaterialRange& range) { return range.texture && (range.material_flags & 0x80u) != 0; });
+        const bool needs_detail = gpu_has_material_flag(0x4u, true);
+        const bool needs_spheremap = gpu_has_material_flag(0x80u, true);
         std::string global_error;
         if (needs_detail &&
             !gpu_load_global_texture("GraphicNovel\\detail.dds", pc_path,
@@ -728,6 +732,31 @@ bool gpu_load_pc_environment_textures(const std::string& pc_path, uint32_t* load
     unmap_file(&chunks.file);
     arena_release(&arena);
     return ok;
+}
+
+DirectX::XMFLOAT4 material_map_color(uint32_t key) {
+    // Stable, high-contrast debug colours. Equal material/surface types keep
+    // equal colours while unrelated types remain distinguishable without a
+    // texture. The shader still multiplies this diagnostic tint by the exact
+    // baked vertex diffuse so authored prelighting remains visible.
+    uint32_t mixed = key + 0x9e3779b9u;
+    mixed ^= mixed >> 16;
+    mixed *= 0x7feb352du;
+    mixed ^= mixed >> 15;
+    mixed *= 0x846ca68bu;
+    mixed ^= mixed >> 16;
+    constexpr float scale = 0.45f / 255.0f;
+    return {.45f + ((mixed >> 16) & 0xff) * scale,
+            .45f + ((mixed >> 8) & 0xff) * scale,
+            .45f + (mixed & 0xff) * scale, 1.0f};
+}
+
+bool gpu_has_material_flag(uint32_t mask, bool require_texture) {
+    for (const GpuMaterialRange& range : gpu.material_ranges) {
+        if ((!require_texture || range.texture) && (range.material_flags & mask) != 0)
+            return true;
+    }
+    return false;
 }
 
 void gpu_apply_material_map_colors(const MaterialMap& materials) {
@@ -808,11 +837,7 @@ bool gpu_reload_environment_textures(std::string* why, uint32_t* loaded_count,
     if (ok)
         gpu_apply_material_map_colors(materials);
     if (ok && g.document.rain_enabled) {
-        const bool needs_splash = std::any_of(
-            gpu.material_ranges.begin(), gpu.material_ranges.end(),
-            [](const GpuMaterialRange& range) {
-                return (range.material_flags & 0x4000u) != 0;
-            });
+        const bool needs_splash = gpu_has_material_flag(0x4000u, false);
         if (needs_splash) {
             const std::string& level_path = g.document.obj_path.empty()
                                                 ? g.document.source_pc_path
@@ -1004,11 +1029,6 @@ bool scan_skybox_texture_folder(const std::string& directory, SkyboxTextureScan*
         candidates.push_back({candidate, target_stem, skybox_semantic_slot(target_stem)});
     } while (FindNextFileA(find, &entry));
     FindClose(find);
-    std::sort(candidates.begin(), candidates.end(), [](const SkyboxTextureCandidate& a,
-                                                       const SkyboxTextureCandidate& b) {
-        const int order = _stricmp(a.target_stem.c_str(), b.target_stem.c_str());
-        return order < 0 || (order == 0 && a.target_stem < b.target_stem);
-    });
     if (candidates.empty()) {
         if (why)
             *why = "The selected folder contains no files with DDS payloads.";
@@ -1018,6 +1038,22 @@ bool scan_skybox_texture_folder(const std::string& directory, SkyboxTextureScan*
         if (why)
             *why = "The selected folder contains more than eight DDS textures; use a folder containing only one skybox.";
         return false;
+    }
+    // There are at most eight candidates from here on. A tiny insertion sort
+    // avoids instantiating the general introsort machinery for this fixed-small
+    // editor list while preserving the exact previous comparator/order.
+    for (size_t i = 1; i < candidates.size(); ++i) {
+        SkyboxTextureCandidate candidate = std::move(candidates[i]);
+        size_t at = i;
+        while (at) {
+            const SkyboxTextureCandidate& previous = candidates[at - 1];
+            const int order = _stricmp(previous.target_stem.c_str(), candidate.target_stem.c_str());
+            if (order < 0 || (order == 0 && previous.target_stem <= candidate.target_stem))
+                break;
+            candidates[at] = std::move(candidates[at - 1]);
+            --at;
+        }
+        candidates[at] = std::move(candidate);
     }
     scan->file_count = static_cast<uint32_t>(candidates.size());
 
@@ -1314,7 +1350,12 @@ void gpu_shutdown() {
     gpu_release(gpu.swap_chain);
     gpu_release(gpu.context);
     gpu_release(gpu.device);
-    gpu = {};
+    // Reconstruct in place instead of move-assigning a temporary renderer.
+    // Every COM pointer above is already null; this only tears down the STL
+    // caches and restores the exact default member state without instantiating
+    // move-assignment for every container member in Release.
+    gpu.~GpuRenderer();
+    new (&gpu) GpuRenderer;
 }
 
 bool gpu_resize(uint32_t width, uint32_t height) {
@@ -1596,27 +1637,20 @@ float4 SkyCloudPSMain(SkyVSOutput input) : SV_TARGET {
 }
 )";
     ID3DBlob *vs_blob = nullptr, *ps_blob = nullptr, *environment_ps_blob = nullptr,
-             *rain_ps_blob = nullptr, *errors = nullptr;
-    result = D3DCompile(shader_source, sizeof(shader_source) - 1, nullptr, nullptr, nullptr, "VSMain", "vs_4_0",
-                        D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vs_blob, &errors);
-    gpu_release(errors);
+             *rain_ps_blob = nullptr;
+    result = gpu_compile_shader(shader_source, sizeof(shader_source) - 1, "VSMain", "vs_4_0", &vs_blob);
     if (FAILED(result)) {
         gpu_release(vs_blob);
         gpu_shutdown();
         return false;
     }
-    result = D3DCompile(shader_source, sizeof(shader_source) - 1, nullptr, nullptr, nullptr, "PSMain", "ps_4_0",
-                        D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &ps_blob, &errors);
-    gpu_release(errors);
+    result = gpu_compile_shader(shader_source, sizeof(shader_source) - 1, "PSMain", "ps_4_0", &ps_blob);
     if (SUCCEEDED(result))
-        result = D3DCompile(shader_source, sizeof(shader_source) - 1, nullptr, nullptr, nullptr, "EnvPSMain", "ps_4_0",
-                            D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &environment_ps_blob, &errors);
-    gpu_release(errors);
+        result = gpu_compile_shader(shader_source, sizeof(shader_source) - 1, "EnvPSMain", "ps_4_0",
+                                    &environment_ps_blob);
     if (SUCCEEDED(result))
-        result = D3DCompile(shader_source, sizeof(shader_source) - 1, nullptr, nullptr, nullptr,
-                            "RainPSMain", "ps_4_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
-                            &rain_ps_blob, &errors);
-    gpu_release(errors);
+        result = gpu_compile_shader(shader_source, sizeof(shader_source) - 1, "RainPSMain", "ps_4_0",
+                                    &rain_ps_blob);
     if (FAILED(result) || FAILED(gpu.device->CreateVertexShader(vs_blob->GetBufferPointer(), vs_blob->GetBufferSize(),
                                                                 nullptr, &gpu.vertex_shader)) ||
         FAILED(gpu.device->CreatePixelShader(ps_blob->GetBufferPointer(), ps_blob->GetBufferSize(), nullptr,
@@ -1651,17 +1685,12 @@ float4 SkyCloudPSMain(SkyVSOutput input) : SV_TARGET {
         return false;
     }
     ID3DBlob *sky_vs_blob = nullptr, *sky_ps_blob = nullptr, *sky_cloud_ps_blob = nullptr;
-    result = D3DCompile(shader_source, sizeof(shader_source) - 1, nullptr, nullptr, nullptr, "SkyVSMain", "vs_4_0",
-                        D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &sky_vs_blob, &errors);
-    gpu_release(errors);
+    result = gpu_compile_shader(shader_source, sizeof(shader_source) - 1, "SkyVSMain", "vs_4_0", &sky_vs_blob);
     if (SUCCEEDED(result))
-        result = D3DCompile(shader_source, sizeof(shader_source) - 1, nullptr, nullptr, nullptr, "SkyPSMain", "ps_4_0",
-                            D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &sky_ps_blob, &errors);
-    gpu_release(errors);
+        result = gpu_compile_shader(shader_source, sizeof(shader_source) - 1, "SkyPSMain", "ps_4_0", &sky_ps_blob);
     if (SUCCEEDED(result))
-        result = D3DCompile(shader_source, sizeof(shader_source) - 1, nullptr, nullptr, nullptr, "SkyCloudPSMain",
-                            "ps_4_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &sky_cloud_ps_blob, &errors);
-    gpu_release(errors);
+        result = gpu_compile_shader(shader_source, sizeof(shader_source) - 1, "SkyCloudPSMain", "ps_4_0",
+                                    &sky_cloud_ps_blob);
     if (FAILED(result) ||
         FAILED(gpu.device->CreateVertexShader(sky_vs_blob->GetBufferPointer(), sky_vs_blob->GetBufferSize(), nullptr,
                                                &gpu.skybox_vertex_shader)) ||
@@ -1893,10 +1922,10 @@ bool gpu_upload_mesh() {
     std::vector<uint32_t> face_order(g.mesh.faces.size());
     for (uint32_t face_index = 0; face_index < face_order.size(); ++face_index)
         face_order[face_index] = face_index;
-    std::stable_sort(face_order.begin(), face_order.end(), [](uint32_t a, uint32_t b) {
+    std::sort(face_order.begin(), face_order.end(), [](uint32_t a, uint32_t b) {
         const int32_t material_a = a < g.mesh.face_materials.size() ? g.mesh.face_materials[a] : -1;
         const int32_t material_b = b < g.mesh.face_materials.size() ? g.mesh.face_materials[b] : -1;
-        return material_a < material_b;
+        return material_a != material_b ? material_a < material_b : a < b;
     });
     std::vector<uint32_t> indices;
     indices.reserve(g.mesh.faces.size() * 3);
@@ -2001,22 +2030,14 @@ bool gpu_update_dynamic_vertices(ID3D11Buffer** buffer, uint32_t* capacity,
     return true;
 }
 
-template <typename T, typename IdFn>
-void gpu_refresh_model_lookup(const std::vector<T>& models,
-                              std::vector<GpuModelLookupSnapshot>* cached,
-                              std::vector<GpuModelLookupSnapshot>* scratch,
-                              std::unordered_map<uint32_t, const SpawnPuppet*>* lookup,
-                              IdFn id_of) {
-    scratch->clear();
-    scratch->reserve(models.size());
-    for (const T& entry : models) {
-        const SpawnPuppet* model = &entry.mesh;
-        scratch->push_back({id_of(entry), model, model->faces.data(), model->faces.size()});
-    }
+void gpu_commit_model_lookup(size_t reserve_count,
+                             std::vector<GpuModelLookupSnapshot>* cached,
+                             std::vector<GpuModelLookupSnapshot>* scratch,
+                             std::unordered_map<uint32_t, const SpawnPuppet*>* lookup) {
     if (same_model_lookup_snapshots(*cached, *scratch))
         return;
     lookup->clear();
-    lookup->reserve(models.size());
+    lookup->reserve(reserve_count);
     for (const GpuModelLookupSnapshot& entry : *scratch)
         if (entry.face_count)
             lookup->emplace(entry.id, entry.model);
@@ -2024,12 +2045,25 @@ void gpu_refresh_model_lookup(const std::vector<T>& models,
 }
 
 void gpu_refresh_entity_model_lookup() {
-    gpu_refresh_model_lookup(g.pickup_models, &gpu.pickup_lookup_snapshot,
-                             &gpu.pickup_lookup_snapshot_scratch, &gpu.pickup_lookup,
-                             [](const PickupModel& model) { return model.skin_id; });
-    gpu_refresh_model_lookup(g.static_object_models, &gpu.static_lookup_snapshot,
-                             &gpu.static_lookup_snapshot_scratch, &gpu.static_lookup,
-                             [](const StaticObjectModel& model) { return model.file_id; });
+    gpu.pickup_lookup_snapshot_scratch.clear();
+    gpu.pickup_lookup_snapshot_scratch.reserve(g.pickup_models.size());
+    for (const PickupModel& entry : g.pickup_models) {
+        const SpawnPuppet* model = &entry.mesh;
+        gpu.pickup_lookup_snapshot_scratch.push_back(
+            {entry.skin_id, model, model->faces.data(), model->faces.size()});
+    }
+    gpu_commit_model_lookup(g.pickup_models.size(), &gpu.pickup_lookup_snapshot,
+                            &gpu.pickup_lookup_snapshot_scratch, &gpu.pickup_lookup);
+
+    gpu.static_lookup_snapshot_scratch.clear();
+    gpu.static_lookup_snapshot_scratch.reserve(g.static_object_models.size());
+    for (const StaticObjectModel& entry : g.static_object_models) {
+        const SpawnPuppet* model = &entry.mesh;
+        gpu.static_lookup_snapshot_scratch.push_back(
+            {entry.file_id, model, model->faces.data(), model->faces.size()});
+    }
+    gpu_commit_model_lookup(g.static_object_models.size(), &gpu.static_lookup_snapshot,
+                            &gpu.static_lookup_snapshot_scratch, &gpu.static_lookup);
 }
 
 const SpawnPuppet* gpu_entity_render_model(const Entity& entity) {
@@ -2077,8 +2111,12 @@ GpuEntitySnapshot gpu_entity_snapshot(const Entity& entity, const SpawnPuppet* m
 
 bool same_entity_snapshots(const std::vector<GpuEntitySnapshot>& a,
                            const std::vector<GpuEntitySnapshot>& b) {
-    return a.size() == b.size() &&
-           std::equal(a.begin(), a.end(), b.begin(), same_entity_snapshot);
+    if (a.size() != b.size())
+        return false;
+    for (size_t i = 0; i < a.size(); ++i)
+        if (!same_entity_snapshot(a[i], b[i]))
+            return false;
+    return true;
 }
 
 void build_gpu_rain_vertices(const Asura_Vector_3& camera_position,

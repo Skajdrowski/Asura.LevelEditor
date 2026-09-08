@@ -68,9 +68,15 @@ bool valid_entity_index(int index) {
     return index >= 0 && index < static_cast<int>(g.document.entities.size());
 }
 
+size_t selection_index_of(const std::vector<int>& selection, int index) {
+    for (size_t position = 0; position < selection.size(); ++position)
+        if (selection[position] == index)
+            return position;
+    return selection.size();
+}
+
 bool entity_is_selected(int index) {
-    return std::find(g.selected_entities.begin(), g.selected_entities.end(), index) !=
-           g.selected_entities.end();
+    return selection_index_of(g.selected_entities, index) != g.selected_entities.size();
 }
 
 void set_single_selection_state(int index) {
@@ -85,7 +91,7 @@ void normalize_selection_state() {
     normalized.reserve(g.selected_entities.size());
     for (int index : g.selected_entities) {
         if (valid_entity_index(index) &&
-            std::find(normalized.begin(), normalized.end(), index) == normalized.end())
+            selection_index_of(normalized, index) == normalized.size())
             normalized.push_back(index);
     }
     g.selected_entities = std::move(normalized);
@@ -726,30 +732,64 @@ void update_light_flag_dependent_controls(LightPropertiesState* state, uint32_t 
         EnableWindow(field, use_bounding_box);
 }
 
-HWND make_light_control(LightPropertiesState* state, const char* cls, const char* text, DWORD style, int id,
-                        int x, int y, int width, int height) {
+HWND make_dialog_control(HWND parent, const char* cls, const char* text, DWORD style, int id,
+                         int x, int y, int width, int height) {
     HWND control = CreateWindowExA(0, cls, text, WS_CHILD | WS_VISIBLE | style,
                                    ui_px(x), ui_px(y), ui_px(width), ui_px(height),
-                                   state->window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
+                                   parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
                                    GetModuleHandle(nullptr), nullptr);
     SendMessageA(control, WM_SETFONT, reinterpret_cast<WPARAM>(g.font), TRUE);
     return control;
 }
 
+bool run_centered_modal(const char* window_class, const char* title,
+                        int width_units, int height_units, void* create_param) {
+    RECT owner{};
+    GetWindowRect(g.window, &owner);
+    const int width = ui_px(width_units), height = ui_px(height_units);
+    const int x = owner.left + std::max(0L, (owner.right - owner.left - width) / 2);
+    const int y = owner.top + std::max(0L, (owner.bottom - owner.top - height) / 2);
+    HWND window = CreateWindowExA(WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT, window_class, title,
+                                  WS_CAPTION | WS_SYSMENU | WS_POPUP | WS_VISIBLE,
+                                  x, y, width, height, g.window, nullptr,
+                                  GetModuleHandle(nullptr), create_param);
+    if (!window)
+        return false;
+    EnableWindow(g.window, FALSE);
+    MSG message{};
+    bool quit = false;
+    while (IsWindow(window)) {
+        const BOOL result = GetMessageA(&message, nullptr, 0, 0);
+        if (result <= 0) {
+            quit = result == 0;
+            break;
+        }
+        if (!IsDialogMessageA(window, &message)) {
+            TranslateMessage(&message);
+            DispatchMessageA(&message);
+        }
+    }
+    EnableWindow(g.window, TRUE);
+    SetActiveWindow(g.window);
+    if (quit)
+        PostQuitMessage(static_cast<int>(message.wParam));
+    return true;
+}
+
 void make_light_vector_row(LightPropertiesState* state, const char* label, int y, int first_id, HWND fields[3]) {
-    make_light_control(state, "STATIC", label, SS_LEFT, 0, 14, y + 3, 94, 22);
+    make_dialog_control(state->window, "STATIC", label, SS_LEFT, 0, 14, y + 3, 94, 22);
     constexpr const char* axes[] = {"X", "Y", "Z"};
     constexpr int xs[] = {130, 334, 538};
     for (int i = 0; i < 3; ++i) {
-        make_light_control(state, "STATIC", axes[i], SS_LEFT, 0, xs[i] - 18, y + 3, 16, 22);
-        fields[i] = make_light_control(state, "EDIT", "", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP,
+        make_dialog_control(state->window, "STATIC", axes[i], SS_LEFT, 0, xs[i] - 18, y + 3, 16, 22);
+        fields[i] = make_dialog_control(state->window, "EDIT", "", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP,
                                        first_id + i, xs[i], y, 142, 24);
     }
 }
 
 void make_light_scalar(LightPropertiesState* state, const char* label, int id, int x, int y, HWND* field) {
-    make_light_control(state, "STATIC", label, SS_LEFT, 0, x, y + 3, 112, 22);
-    *field = make_light_control(state, "EDIT", "", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP, id,
+    make_dialog_control(state->window, "STATIC", label, SS_LEFT, 0, x, y + 3, 112, 22);
+    *field = make_dialog_control(state->window, "EDIT", "", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP, id,
                                 x + 116, y, 104, 24);
 }
 
@@ -757,41 +797,45 @@ void create_light_properties_controls(LightPropertiesState* state) {
     make_light_vector_row(state, "Position", 16, ID_LIGHT_POSITION_X, state->position);
     make_light_vector_row(state, "Colour (RGB255)", 50, ID_LIGHT_R, state->colour);
 
-    make_light_scalar(state, "Brightness", ID_LIGHT_BRIGHTNESS, 14, 88, &state->brightness);
-    make_light_scalar(state, "Range", ID_LIGHT_RANGE, 262, 88, &state->range);
-    make_light_scalar(state, "Inner range", ID_LIGHT_INNER_RANGE, 510, 88, &state->inner_range);
-    make_light_scalar(state, "Shadow strength", ID_LIGHT_SHADOW_STRENGTH, 14, 122,
-                      &state->shadow_strength);
+    constexpr const char* scalar_labels[] = {"Brightness", "Range", "Inner range", "Shadow strength"};
+    constexpr int scalar_ids[] = {ID_LIGHT_BRIGHTNESS, ID_LIGHT_RANGE, ID_LIGHT_INNER_RANGE,
+                                  ID_LIGHT_SHADOW_STRENGTH};
+    constexpr int scalar_x[] = {14, 262, 510, 14};
+    constexpr int scalar_y[] = {88, 88, 88, 122};
+    HWND* scalar_outputs[] = {&state->brightness, &state->range, &state->inner_range,
+                              &state->shadow_strength};
+    for (size_t i = 0; i < _countof(scalar_ids); ++i)
+        make_light_scalar(state, scalar_labels[i], scalar_ids[i], scalar_x[i], scalar_y[i], scalar_outputs[i]);
 
-    make_light_control(state, "STATIC", "World-axis bounding box", SS_LEFT, 0, 14, 164, 150, 22);
+    make_dialog_control(state->window, "STATIC", "World-axis bounding box", SS_LEFT, 0, 14, 164, 150, 22);
     constexpr const char* bound_labels[] = {"Min X", "Max X", "Min Y", "Max Y", "Min Z", "Max Z"};
     constexpr int bound_ids[] = {ID_LIGHT_BOUND_MIN_X, ID_LIGHT_BOUND_MAX_X, ID_LIGHT_BOUND_MIN_Y,
                                  ID_LIGHT_BOUND_MAX_Y, ID_LIGHT_BOUND_MIN_Z, ID_LIGHT_BOUND_MAX_Z};
     for (int i = 0; i < 6; ++i) {
         const int column = i % 3, row = i / 3;
         const int x = 130 + column * 204, y = 160 + row * 34;
-        make_light_control(state, "STATIC", bound_labels[i], SS_LEFT, 0, x, y + 3, 48, 22);
-        state->bounds[i] = make_light_control(state, "EDIT", "", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP,
+        make_dialog_control(state->window, "STATIC", bound_labels[i], SS_LEFT, 0, x, y + 3, 48, 22);
+        state->bounds[i] = make_dialog_control(state->window, "EDIT", "", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP,
                                               bound_ids[i], x + 52, y, 90, 24);
     }
 
-    make_light_control(state, "STATIC", "Raw flags", SS_LEFT, 0, 14, 236, 94, 22);
-    state->flags = make_light_control(state, "EDIT", "", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP,
+    make_dialog_control(state->window, "STATIC", "Raw flags", SS_LEFT, 0, 14, 236, 94, 22);
+    state->flags = make_dialog_control(state->window, "EDIT", "", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP,
                                       ID_LIGHT_FLAGS, 130, 233, 142, 24);
     for (int i = 0; i < static_cast<int>(_countof(kLightFlagControls)); ++i) {
         const int column = i % 4, row = i / 4;
-        state->flag_checks[i] = make_light_control(
-            state, "BUTTON", kLightFlagControls[i].label, BS_AUTOCHECKBOX | WS_TABSTOP,
+        state->flag_checks[i] = make_dialog_control(
+            state->window, "BUTTON", kLightFlagControls[i].label, BS_AUTOCHECKBOX | WS_TABSTOP,
             ID_LIGHT_FLAG_FIRST + i, 14 + column * 185, 270 + row * 30, 178, 24);
     }
 
     make_light_vector_row(state, "Old position", 338, ID_LIGHT_OLD_POSITION_X, state->old_position);
     make_light_scalar(state, "Old range", ID_LIGHT_OLD_RANGE, 14, 376, &state->old_range);
-    state->has_changed = make_light_control(state, "BUTTON", "Has changed", BS_AUTOCHECKBOX | WS_TABSTOP,
+    state->has_changed = make_dialog_control(state->window, "BUTTON", "Has changed", BS_AUTOCHECKBOX | WS_TABSTOP,
                                              ID_LIGHT_HAS_CHANGED, 280, 376, 150, 24);
 
-    make_light_control(state, "BUTTON", "Apply", BS_DEFPUSHBUTTON | WS_TABSTOP, IDOK, 526, 430, 104, 30);
-    make_light_control(state, "BUTTON", "Cancel", BS_PUSHBUTTON | WS_TABSTOP, IDCANCEL, 638, 430, 104, 30);
+    make_dialog_control(state->window, "BUTTON", "Apply", BS_DEFPUSHBUTTON | WS_TABSTOP, IDOK, 526, 430, 104, 30);
+    make_dialog_control(state->window, "BUTTON", "Cancel", BS_PUSHBUTTON | WS_TABSTOP, IDCANCEL, 638, 430, 104, 30);
 
     const Asura_Light& light = state->value;
     const float position[] = {light.Position.x, light.Position.y, light.Position.z};
@@ -907,34 +951,8 @@ void command_light_properties() {
     state.value = entity.light;
     state.value.Position = entity.position;
 
-    RECT owner{};
-    GetWindowRect(g.window, &owner);
-    const int width = ui_px(780), height = ui_px(550);
-    const int x = owner.left + std::max(0L, (owner.right - owner.left - width) / 2);
-    const int y = owner.top + std::max(0L, (owner.bottom - owner.top - height) / 2);
-    HWND window = CreateWindowExA(WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT, "Asura2005LightProperties",
-                                  "Light properties", WS_CAPTION | WS_SYSMENU | WS_POPUP | WS_VISIBLE,
-                                  x, y, width, height, g.window, nullptr, GetModuleHandle(nullptr), &state);
-    if (!window)
+    if (!run_centered_modal("Asura2005LightProperties", "Light properties", 780, 550, &state))
         return;
-    EnableWindow(g.window, FALSE);
-    MSG message{};
-    bool quit = false;
-    while (IsWindow(window)) {
-        const BOOL result = GetMessageA(&message, nullptr, 0, 0);
-        if (result <= 0) {
-            quit = result == 0;
-            break;
-        }
-        if (!IsDialogMessageA(window, &message)) {
-            TranslateMessage(&message);
-            DispatchMessageA(&message);
-        }
-    }
-    EnableWindow(g.window, TRUE);
-    SetActiveWindow(g.window);
-    if (quit)
-        PostQuitMessage(static_cast<int>(message.wParam));
     if (!state.accepted)
         return;
 
@@ -1110,10 +1128,11 @@ void select_entities_from_list() {
                 allowed_kind = g.document.entities[old_selection.front()].kind;
             else if (valid_entity_index(caret_index))
                 allowed_kind = g.document.entities[caret_index].kind;
-            selection.erase(std::remove_if(selection.begin(), selection.end(), [&](int index) {
-                                return g.document.entities[index].kind != allowed_kind;
-                            }),
-                            selection.end());
+            size_t write = 0;
+            for (int index : selection)
+                if (g.document.entities[index].kind == allowed_kind)
+                    selection[write++] = index;
+            selection.resize(write);
             restricted = true;
         }
     }
@@ -1140,7 +1159,7 @@ void refresh_list() {
     std::vector<uint32_t> order(g.document.entities.size());
     for (uint32_t index = 0; index < order.size(); ++index)
         order[index] = index;
-    std::stable_sort(order.begin(), order.end(), [](uint32_t a, uint32_t b) {
+    std::sort(order.begin(), order.end(), [](uint32_t a, uint32_t b) {
         const Entity& first = g.document.entities[a];
         const Entity& second = g.document.entities[b];
         const int names = _stricmp(first.name.c_str(), second.name.c_str());
@@ -1149,7 +1168,7 @@ void refresh_list() {
         const int types = _stricmp(entity_type_label(first.kind), entity_type_label(second.kind));
         if (types != 0)
             return types < 0;
-        return first.guid < second.guid;
+        return first.guid != second.guid ? first.guid < second.guid : a < b;
     });
     for (uint32_t index : order) {
         const Entity& entity = g.document.entities[index];
@@ -1168,11 +1187,13 @@ void refresh_pickup_choices(uint32_t selected_item) {
     choices.reserve(g.document.pickup_templates.size());
     for (const PickupTemplate& item : g.document.pickup_templates)
         choices.push_back(&item);
-    std::stable_sort(choices.begin(), choices.end(), [](const PickupTemplate* a, const PickupTemplate* b) {
+    std::sort(choices.begin(), choices.end(), [](const PickupTemplate* a, const PickupTemplate* b) {
         const std::string first = snipe_item_label(a->item_id);
         const std::string second = snipe_item_label(b->item_id);
         const int names = _stricmp(first.c_str(), second.c_str());
-        return names != 0 ? names < 0 : a->item_id < b->item_id;
+        if (names != 0)
+            return names < 0;
+        return a->item_id != b->item_id ? a->item_id < b->item_id : a < b;
     });
     for (const PickupTemplate* item : choices) {
         const std::string label = snipe_item_label(item->item_id);
@@ -1192,10 +1213,12 @@ void refresh_static_object_choices(uint32_t selected_file) {
     choices.reserve(g.document.static_object_templates.size());
     for (const StaticObjectTemplate& object : g.document.static_object_templates)
         choices.push_back(&object);
-    std::stable_sort(choices.begin(), choices.end(), [](const StaticObjectTemplate* a,
-                                                        const StaticObjectTemplate* b) {
+    std::sort(choices.begin(), choices.end(), [](const StaticObjectTemplate* a,
+                                                 const StaticObjectTemplate* b) {
         const int names = _stricmp(a->resource_name.c_str(), b->resource_name.c_str());
-        return names != 0 ? names < 0 : a->file_id < b->file_id;
+        if (names != 0)
+            return names < 0;
+        return a->file_id != b->file_id ? a->file_id < b->file_id : a < b;
     });
     for (const StaticObjectTemplate* object : choices) {
         char label[640]{};
@@ -1408,12 +1431,12 @@ void toggle_entity_selection(int index) {
         return;
     }
     stop_sound_preview();
-    const auto found = std::find(g.selected_entities.begin(), g.selected_entities.end(), index);
-    if (found == g.selected_entities.end()) {
+    const size_t position = selection_index_of(g.selected_entities, index);
+    if (position == g.selected_entities.size()) {
         g.selected_entities.push_back(index);
         g.selected = index;
     } else {
-        g.selected_entities.erase(found);
+        g.selected_entities.erase(g.selected_entities.begin() + static_cast<ptrdiff_t>(position));
         g.selected = g.selected_entities.empty() ? -1 : g.selected_entities.back();
     }
     sync_entity_list_selection();
@@ -2362,17 +2385,16 @@ void create_controls() {
         g.viewport = nullptr;
     }
     make_control("BUTTON", "Open .OBJ", BS_DEFPUSHBUTTON, ID_OPEN_OBJ);
-    make_control("BUTTON", "Open .PC", BS_PUSHBUTTON, ID_OPEN_PC);
-    make_control("BUTTON", "Open project", BS_PUSHBUTTON, ID_OPEN_PROJECT);
-    make_control("BUTTON", "Save project", BS_PUSHBUTTON, ID_SAVE_PROJECT);
-    make_control("BUTTON", "Export .PC", BS_PUSHBUTTON, ID_EXPORT_PC);
-    make_control("BUTTON", "Export .OBJ", BS_PUSHBUTTON, ID_EXPORT_OBJ);
-    make_control("BUTTON", "Import material map", BS_PUSHBUTTON, ID_MATERIAL_MAP);
-    make_control("BUTTON", "Export material map", BS_PUSHBUTTON, ID_EXPORT_MATERIAL_MAP);
-    make_control("BUTTON", "Texture folder", BS_PUSHBUTTON, ID_TEXTURE_DIR);
-    make_control("BUTTON", "Weapons donor", BS_PUSHBUTTON, ID_WEAPONS_DONOR);
-    make_control("BUTTON", "Objects donor", BS_PUSHBUTTON, ID_OBJECT_DONOR);
-    make_control("BUTTON", "Skybox properties", BS_PUSHBUTTON, ID_SKYBOX_TEXTURES);
+    constexpr const char* file_button_text[] = {
+        "Open .PC", "Open project", "Save project", "Export .PC", "Export .OBJ",
+        "Import material map", "Export material map", "Texture folder", "Weapons donor",
+        "Objects donor", "Skybox properties"};
+    constexpr int file_button_ids[] = {
+        ID_OPEN_PC, ID_OPEN_PROJECT, ID_SAVE_PROJECT, ID_EXPORT_PC, ID_EXPORT_OBJ,
+        ID_MATERIAL_MAP, ID_EXPORT_MATERIAL_MAP, ID_TEXTURE_DIR, ID_WEAPONS_DONOR,
+        ID_OBJECT_DONOR, ID_SKYBOX_TEXTURES};
+    for (size_t i = 0; i < _countof(file_button_ids); ++i)
+        make_control("BUTTON", file_button_text[i], BS_PUSHBUTTON, file_button_ids[i]);
     g.rain_toggle = make_control("BUTTON", "Rain", BS_AUTOCHECKBOX, ID_TOGGLE_RAIN);
     g.backface_cull_toggle =
         make_control("BUTTON", "Viewport: Cull backfaces", BS_AUTOCHECKBOX,
@@ -2380,39 +2402,34 @@ void create_controls() {
     g.ambience_properties = make_control("BUTTON", "Ambience sound", BS_PUSHBUTTON, ID_AMBIENCE_PROPERTIES);
     g.list = make_control("LISTBOX", "", LBS_NOTIFY | LBS_EXTENDEDSEL | WS_VSCROLL | WS_BORDER,
                           ID_ENTITY_LIST);
-    make_control("BUTTON", "+ Spawn", BS_PUSHBUTTON, ID_ADD_SPAWN);
-    make_control("BUTTON", "+ Light", BS_PUSHBUTTON, ID_ADD_LIGHT);
-    make_control("BUTTON", "+ Pickup", BS_PUSHBUTTON, ID_ADD_PICKUP);
-    make_control("BUTTON", "+ Object", BS_PUSHBUTTON, ID_ADD_STATIC_OBJECT);
-    make_control("BUTTON", "+ Sound", BS_PUSHBUTTON, ID_ADD_SOUND);
-    make_control("BUTTON", "+ Indoor zone", BS_PUSHBUTTON, ID_ADD_BUILDING_VOLUME);
-    make_control("BUTTON", "Delete selected", BS_PUSHBUTTON, ID_DELETE_ENTITY);
+    constexpr const char* entity_button_text[] = {
+        "+ Spawn", "+ Light", "+ Pickup", "+ Object", "+ Sound", "+ Indoor zone", "Delete selected"};
+    constexpr int entity_button_ids[] = {
+        ID_ADD_SPAWN, ID_ADD_LIGHT, ID_ADD_PICKUP, ID_ADD_STATIC_OBJECT, ID_ADD_SOUND,
+        ID_ADD_BUILDING_VOLUME, ID_DELETE_ENTITY};
+    for (size_t i = 0; i < _countof(entity_button_ids); ++i)
+        make_control("BUTTON", entity_button_text[i], BS_PUSHBUTTON, entity_button_ids[i]);
     make_control("STATIC",
                  "Right: orbit; Middle: pan; Wheel: zoom\r\n"
                  "Ctrl/Shift: select same-type entities\r\n"
                  "Ctrl+Z/Y: undo/redo\r\n"
                  "Ctrl+C/V: copy/paste; Del: remove",
                  SS_LEFT, 900);
-    make_control("STATIC", "Name", SS_LEFT, 910);
-    make_control("STATIC", "Position X", SS_LEFT, 911);
-    make_control("STATIC", "Position Y (-up)", SS_LEFT, 912);
-    make_control("STATIC", "Position Z", SS_LEFT, 913);
-    make_control("STATIC", "Pitch", SS_LEFT, 914);
-    make_control("STATIC", "Yaw", SS_LEFT, 915);
-    make_control("STATIC", "Roll", SS_LEFT, 916);
-    g.name = make_control("EDIT", "", ES_AUTOHSCROLL | WS_BORDER, ID_NAME);
-    g.pos[0] = make_control("EDIT", "", ES_AUTOHSCROLL | WS_BORDER, ID_POS_X);
-    g.pos[1] = make_control("EDIT", "", ES_AUTOHSCROLL | WS_BORDER, ID_POS_Y);
-    g.pos[2] = make_control("EDIT", "", ES_AUTOHSCROLL | WS_BORDER, ID_POS_Z);
-    g.rot[0] = make_control("EDIT", "", ES_AUTOHSCROLL | WS_BORDER, ID_ROT_X);
-    g.rot[1] = make_control("EDIT", "", ES_AUTOHSCROLL | WS_BORDER, ID_ROT_Y);
-    g.rot[2] = make_control("EDIT", "", ES_AUTOHSCROLL | WS_BORDER, ID_ROT_Z);
-    g.value_label[0] = make_control("STATIC", "Property A", SS_LEFT, 917);
-    g.value_label[1] = make_control("STATIC", "Property B", SS_LEFT, 918);
-    g.value_label[2] = make_control("STATIC", "Property C", SS_LEFT, 921);
-    g.value[0] = make_control("EDIT", "", ES_AUTOHSCROLL | WS_BORDER, ID_VALUE_A);
-    g.value[1] = make_control("EDIT", "", ES_AUTOHSCROLL | WS_BORDER, ID_VALUE_B);
-    g.value[2] = make_control("EDIT", "", ES_AUTOHSCROLL | WS_BORDER, ID_VALUE_C);
+    constexpr const char* transform_label_text[] = {
+        "Name", "Position X", "Position Y (-up)", "Position Z", "Pitch", "Yaw", "Roll"};
+    for (size_t i = 0; i < _countof(transform_label_text); ++i)
+        make_control("STATIC", transform_label_text[i], SS_LEFT, 910 + static_cast<int>(i));
+    HWND* transform_outputs[] = {&g.name, &g.pos[0], &g.pos[1], &g.pos[2], &g.rot[0], &g.rot[1], &g.rot[2]};
+    constexpr int transform_ids[] = {ID_NAME, ID_POS_X, ID_POS_Y, ID_POS_Z, ID_ROT_X, ID_ROT_Y, ID_ROT_Z};
+    for (size_t i = 0; i < _countof(transform_ids); ++i)
+        *transform_outputs[i] = make_control("EDIT", "", ES_AUTOHSCROLL | WS_BORDER, transform_ids[i]);
+    constexpr const char* property_label_text[] = {"Property A", "Property B", "Property C"};
+    constexpr int property_label_ids[] = {917, 918, 921};
+    for (size_t i = 0; i < _countof(property_label_ids); ++i)
+        g.value_label[i] = make_control("STATIC", property_label_text[i], SS_LEFT, property_label_ids[i]);
+    constexpr int property_ids[] = {ID_VALUE_A, ID_VALUE_B, ID_VALUE_C};
+    for (size_t i = 0; i < _countof(property_ids); ++i)
+        g.value[i] = make_control("EDIT", "", ES_AUTOHSCROLL | WS_BORDER, property_ids[i]);
     g.pickup_item = make_control("COMBOBOX", "", CBS_DROPDOWNLIST | CBS_AUTOHSCROLL | WS_VSCROLL,
                                  ID_PICKUP_ITEM);
     g.sound_browse = make_control("BUTTON", "Choose WAV...", BS_PUSHBUTTON, ID_BROWSE_SOUND);
@@ -2723,10 +2740,13 @@ bool refresh_history_derived_resources(const Document& previous, std::string* wh
                                                &donor_models, &preview_why);
             if (preview_loaded) {
                 for (PickupModel& model : donor_models) {
-                    const bool present = std::any_of(
-                        pickup_models.begin(), pickup_models.end(), [&model](const PickupModel& existing) {
-                            return existing.skin_id == model.skin_id;
-                        });
+                    bool present = false;
+                    for (const PickupModel& existing : pickup_models) {
+                        if (existing.skin_id == model.skin_id) {
+                            present = true;
+                            break;
+                        }
+                    }
                     if (!present)
                         pickup_models.push_back(std::move(model));
                 }
@@ -3354,33 +3374,22 @@ std::string ambience_stream_label(const std::string& path) {
     return label;
 }
 
-HWND make_ambience_control(AmbiencePropertiesState* state, const char* cls, const char* text,
-                           DWORD style, int id, int x, int y, int width, int height) {
-    HWND control = CreateWindowExA(0, cls, text, WS_CHILD | WS_VISIBLE | style,
-                                   ui_px(x), ui_px(y), ui_px(width), ui_px(height),
-                                   state->window,
-                                   reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
-                                   GetModuleHandle(nullptr), nullptr);
-    SendMessageA(control, WM_SETFONT, reinterpret_cast<WPARAM>(g.font), TRUE);
-    return control;
-}
-
 void create_ambience_properties_controls(AmbiencePropertiesState* state) {
-    make_ambience_control(state, "STATIC", "Default stream", SS_LEFT, -1, 18, 22, 104, 22);
-    state->stream = make_ambience_control(state, "COMBOBOX", "",
+    make_dialog_control(state->window, "STATIC", "Default stream", SS_LEFT, -1, 18, 22, 104, 22);
+    state->stream = make_dialog_control(state->window, "COMBOBOX", "",
                                           CBS_DROPDOWNLIST | CBS_AUTOHSCROLL | WS_VSCROLL,
                                           ID_AMBIENCE_STREAM, 126, 18, 380, 260);
-    make_ambience_control(state, "STATIC", "Volume (0-1)", SS_LEFT, -1, 18, 62, 104, 22);
-    state->volume = make_ambience_control(state, "EDIT", "",
+    make_dialog_control(state->window, "STATIC", "Volume (0-1)", SS_LEFT, -1, 18, 62, 104, 22);
+    state->volume = make_dialog_control(state->window, "EDIT", "",
                                           ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP,
                                           ID_AMBIENCE_VOLUME, 126, 58, 100, 24);
-    make_ambience_control(
-        state, "STATIC",
+    make_dialog_control(
+        state->window, "STATIC",
         "Ambience sound names come from game's root Sounds\\Streams",
         SS_LEFT, -1, 18, 98, 355, 17);
-    make_ambience_control(state, "BUTTON", "OK", BS_DEFPUSHBUTTON | WS_TABSTOP,
+    make_dialog_control(state->window, "BUTTON", "OK", BS_DEFPUSHBUTTON | WS_TABSTOP,
                           IDOK, 290, 158, 104, 30);
-    make_ambience_control(state, "BUTTON", "Cancel", BS_PUSHBUTTON | WS_TABSTOP,
+    make_dialog_control(state->window, "BUTTON", "Cancel", BS_PUSHBUTTON | WS_TABSTOP,
                           IDCANCEL, 402, 158, 104, 30);
 
     SendMessageA(state->stream, CB_ADDSTRING, 0,
@@ -3449,36 +3458,8 @@ void command_ambience_properties() {
     if (!current_present)
         state.paths.push_back(state.selected_path);
 
-    RECT owner{};
-    GetWindowRect(g.window, &owner);
-    const int width = ui_px(540), height = ui_px(235);
-    const int x = owner.left + std::max(0L, (owner.right - owner.left - width) / 2);
-    const int y = owner.top + std::max(0L, (owner.bottom - owner.top - height) / 2);
-    HWND window = CreateWindowExA(WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT,
-                                  "Asura2005AmbienceProperties", "Streaming ambience",
-                                  WS_CAPTION | WS_SYSMENU | WS_POPUP | WS_VISIBLE,
-                                  x, y, width, height, g.window, nullptr,
-                                  GetModuleHandle(nullptr), &state);
-    if (!window)
+    if (!run_centered_modal("Asura2005AmbienceProperties", "Streaming ambience", 540, 235, &state))
         return;
-    EnableWindow(g.window, FALSE);
-    MSG message{};
-    bool quit = false;
-    while (IsWindow(window)) {
-        const BOOL result = GetMessageA(&message, nullptr, 0, 0);
-        if (result <= 0) {
-            quit = result == 0;
-            break;
-        }
-        if (!IsDialogMessageA(window, &message)) {
-            TranslateMessage(&message);
-            DispatchMessageA(&message);
-        }
-    }
-    EnableWindow(g.window, TRUE);
-    SetActiveWindow(g.window);
-    if (quit)
-        PostQuitMessage(static_cast<int>(message.wParam));
     if (!state.accepted)
         return;
     if (!g.history.begin(g.document, g.selected))
@@ -3696,16 +3677,6 @@ struct SkyboxPropertiesState {
     bool accepted = false;
 };
 
-HWND make_skybox_control(SkyboxPropertiesState* state, const char* cls, const char* text, DWORD style,
-                         int id, int x, int y, int width, int height) {
-    HWND control = CreateWindowExA(0, cls, text, WS_CHILD | WS_VISIBLE | style,
-                                   ui_px(x), ui_px(y), ui_px(width), ui_px(height),
-                                   state->window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
-                                   GetModuleHandle(nullptr), nullptr);
-    SendMessageA(control, WM_SETFONT, reinterpret_cast<WPARAM>(g.font), TRUE);
-    return control;
-}
-
 void refresh_skybox_folder_text(SkyboxPropertiesState* state) {
     SetWindowTextA(state->preview_folder,
                    state->texture_directory.empty() ? "Embedded/source resources" : state->texture_directory.c_str());
@@ -3725,18 +3696,18 @@ void refresh_skybox_version_controls(SkyboxPropertiesState* state) {
 }
 
 void create_skybox_properties_controls(SkyboxPropertiesState* state) {
-    make_skybox_control(state, "STATIC", "RGB tint", SS_LEFT, 0, 14, 19, 82, 22);
+    make_dialog_control(state->window, "STATIC", "RGB tint", SS_LEFT, 0, 14, 19, 82, 22);
     constexpr const char* colour_labels[] = {"R", "G", "B"};
     HWND* colours[] = {&state->red, &state->green, &state->blue};
     constexpr int colour_ids[] = {ID_SKYBOX_RED, ID_SKYBOX_GREEN, ID_SKYBOX_BLUE};
     for (int i = 0; i < 3; ++i) {
         const int x = 100 + i * 150;
-        make_skybox_control(state, "STATIC", colour_labels[i], SS_LEFT, 0, x, 19, 18, 22);
-        *colours[i] = make_skybox_control(state, "EDIT", "", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP,
+        make_dialog_control(state->window, "STATIC", colour_labels[i], SS_LEFT, 0, x, 19, 18, 22);
+        *colours[i] = make_dialog_control(state->window, "EDIT", "", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP,
                                           colour_ids[i], x + 20, 16, 118, 24);
     }
-    make_skybox_control(state, "STATIC", "Orientation (radians)", SS_LEFT, 0, 556, 19, 126, 22);
-    state->orientation = make_skybox_control(state, "EDIT", "", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP,
+    make_dialog_control(state->window, "STATIC", "Orientation (radians)", SS_LEFT, 0, 556, 19, 126, 22);
+    state->orientation = make_dialog_control(state->window, "EDIT", "", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP,
                                              ID_SKYBOX_ORIENTATION, 682, 16, 112, 24);
 
     constexpr const char* path_labels[] = {"Path 0 (lower)", "Path 1 (front)", "Path 2 (left)",
@@ -3744,38 +3715,47 @@ void create_skybox_properties_controls(SkyboxPropertiesState* state) {
                                             "Path 6 (cloud A)", "Path 7 (cloud B)"};
     for (int i = 0; i < static_cast<int>(_countof(path_labels)); ++i) {
         const int y = 58 + i * 36;
-        make_skybox_control(state, "STATIC", path_labels[i], SS_LEFT, 0, 14, y + 3, 112, 22);
-        state->paths[i] = make_skybox_control(state, "EDIT", "", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP,
+        make_dialog_control(state->window, "STATIC", path_labels[i], SS_LEFT, 0, 14, y + 3, 112, 22);
+        state->paths[i] = make_dialog_control(state->window, "EDIT", "", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP,
                                               ID_SKYBOX_PATH_FIRST + i, 130, y, 664, 24);
         SendMessageA(state->paths[i], EM_SETLIMITTEXT, 4096, 0);
     }
 
-    make_skybox_control(state, "STATIC", "Clearing cloud paths disables clouds animation.", SS_LEFT,
+    make_dialog_control(state->window, "STATIC", "Clearing cloud paths disables clouds animation.", SS_LEFT,
                         0, 14, 359, 332, 22);
-    state->version_6 = make_skybox_control(state, "BUTTON", "SKYB format version 6",
-                                            BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP,
-                                            ID_SKYBOX_VERSION_6, 366, 356, 166, 24);
-    state->version_7 = make_skybox_control(state, "BUTTON", "SKYB format version 7",
-                                            BS_AUTORADIOBUTTON | WS_TABSTOP,
-                                            ID_SKYBOX_VERSION_7, 538, 356, 204, 24);
-    state->back_flipped = make_skybox_control(
-        state, "BUTTON", "Back texture is front upside down", BS_AUTOCHECKBOX | WS_TABSTOP,
-        ID_SKYBOX_BACK_FLIPPED, 14, 386, 332, 24);
-    state->right_flipped = make_skybox_control(
-        state, "BUTTON", "Right texture is left upside down", BS_AUTOCHECKBOX | WS_TABSTOP,
-        ID_SKYBOX_RIGHT_FLIPPED, 366, 386, 346, 24);
-    make_skybox_control(state, "STATIC",
+    constexpr const char* option_text[] = {
+        "SKYB format version 6", "SKYB format version 7",
+        "Back texture is front upside down", "Right texture is left upside down"};
+    constexpr DWORD option_style[] = {
+        BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP, BS_AUTORADIOBUTTON | WS_TABSTOP,
+        BS_AUTOCHECKBOX | WS_TABSTOP, BS_AUTOCHECKBOX | WS_TABSTOP};
+    constexpr int option_ids[] = {ID_SKYBOX_VERSION_6, ID_SKYBOX_VERSION_7,
+                                  ID_SKYBOX_BACK_FLIPPED, ID_SKYBOX_RIGHT_FLIPPED};
+    constexpr int option_x[] = {366, 538, 14, 366};
+    constexpr int option_y[] = {356, 356, 386, 386};
+    constexpr int option_width[] = {166, 204, 332, 346};
+    HWND* option_outputs[] = {&state->version_6, &state->version_7, &state->back_flipped,
+                              &state->right_flipped};
+    for (size_t i = 0; i < _countof(option_ids); ++i)
+        *option_outputs[i] = make_dialog_control(state->window, "BUTTON", option_text[i], option_style[i],
+                                                 option_ids[i], option_x[i], option_y[i], option_width[i], 24);
+    make_dialog_control(state->window, "STATIC",
                         "Both target SKYB versions render the same skybox; v7 only adds the right-face mapping flag.",
                         SS_LEFT, 0, 14, 414, 760, 20);
-    make_skybox_control(state, "STATIC", "Preview resources", SS_LEFT, 0, 14, 438, 112, 22);
-    state->preview_folder = make_skybox_control(state, "EDIT", "", ES_AUTOHSCROLL | WS_BORDER | ES_READONLY,
+    make_dialog_control(state->window, "STATIC", "Preview resources", SS_LEFT, 0, 14, 438, 112, 22);
+    state->preview_folder = make_dialog_control(state->window, "EDIT", "", ES_AUTOHSCROLL | WS_BORDER | ES_READONLY,
                                                 0, 130, 435, 414, 24);
-    make_skybox_control(state, "BUTTON", "Choose folder...", BS_PUSHBUTTON | WS_TABSTOP,
-                        ID_SKYBOX_PREVIEW_FOLDER, 552, 434, 116, 27);
-    make_skybox_control(state, "BUTTON", "Use embedded", BS_PUSHBUTTON | WS_TABSTOP,
-                        ID_SKYBOX_USE_EMBEDDED, 676, 434, 118, 27);
-    make_skybox_control(state, "BUTTON", "Apply", BS_DEFPUSHBUTTON | WS_TABSTOP, IDOK, 566, 473, 104, 30);
-    make_skybox_control(state, "BUTTON", "Cancel", BS_PUSHBUTTON | WS_TABSTOP, IDCANCEL, 682, 473, 112, 30);
+    constexpr const char* action_text[] = {"Choose folder...", "Use embedded", "Apply", "Cancel"};
+    constexpr DWORD action_style[] = {BS_PUSHBUTTON | WS_TABSTOP, BS_PUSHBUTTON | WS_TABSTOP,
+                                      BS_DEFPUSHBUTTON | WS_TABSTOP, BS_PUSHBUTTON | WS_TABSTOP};
+    constexpr int action_ids[] = {ID_SKYBOX_PREVIEW_FOLDER, ID_SKYBOX_USE_EMBEDDED, IDOK, IDCANCEL};
+    constexpr int action_x[] = {552, 676, 566, 682};
+    constexpr int action_y[] = {434, 434, 473, 473};
+    constexpr int action_width[] = {116, 118, 104, 112};
+    constexpr int action_height[] = {27, 27, 30, 30};
+    for (size_t i = 0; i < _countof(action_ids); ++i)
+        make_dialog_control(state->window, "BUTTON", action_text[i], action_style[i], action_ids[i],
+                            action_x[i], action_y[i], action_width[i], action_height[i]);
 
     set_float(state->red, state->value.red);
     set_float(state->green, state->value.green);
@@ -3866,35 +3846,8 @@ void command_skybox_textures() {
     SkyboxPropertiesState state{};
     state.value = g.document.skybox;
     state.texture_directory = g.document.sky_texture_dir;
-    RECT owner{};
-    GetWindowRect(g.window, &owner);
-    const int width = ui_px(830), height = ui_px(565);
-    const int x = owner.left + std::max(0L, (owner.right - owner.left - width) / 2);
-    const int y = owner.top + std::max(0L, (owner.bottom - owner.top - height) / 2);
-    HWND window = CreateWindowExA(WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT,
-                                  "Asura2005SkyboxProperties", "SKYB version and properties",
-                                  WS_CAPTION | WS_SYSMENU | WS_POPUP | WS_VISIBLE, x, y, width, height,
-                                  g.window, nullptr, GetModuleHandle(nullptr), &state);
-    if (!window)
+    if (!run_centered_modal("Asura2005SkyboxProperties", "SKYB version and properties", 830, 565, &state))
         return;
-    EnableWindow(g.window, FALSE);
-    MSG message{};
-    bool quit = false;
-    while (IsWindow(window)) {
-        const BOOL result = GetMessageA(&message, nullptr, 0, 0);
-        if (result <= 0) {
-            quit = result == 0;
-            break;
-        }
-        if (!IsDialogMessageA(window, &message)) {
-            TranslateMessage(&message);
-            DispatchMessageA(&message);
-        }
-    }
-    EnableWindow(g.window, TRUE);
-    SetActiveWindow(g.window);
-    if (quit)
-        PostQuitMessage(static_cast<int>(message.wParam));
     if (!state.accepted)
         return;
 

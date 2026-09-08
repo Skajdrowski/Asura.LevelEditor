@@ -1,4 +1,7 @@
-#include "LevelEditorInternal.h"
+#include "LevelEditorImport.h"
+#include "LevelEditorGeometry.h"
+
+#include <algorithm>
 
 using namespace asura;
 using namespace asura::level;
@@ -448,14 +451,10 @@ void note_static_object_template(Document* document, const Entity& entity, const
 
 bool decode_pc_model_materials(const ChunkList& chunks, uint32_t before_chunk,
                                std::vector<SpawnPuppetMaterial>* output, Error* err) {
-    struct MaterialRecord {
-        int32_t texture_index = -1;
-        uint32_t flags = 0;
-        uint32_t texture_flags = 0;
-    };
     std::vector<std::string> texture_names;
     std::vector<uint32_t> texture_flags;
-    std::vector<MaterialRecord> materials;
+    std::vector<int32_t> material_texture_indices;
+    std::vector<uint32_t> material_flags;
     for (uint32_t chunk_index = 0; chunk_index < before_chunk; ++chunk_index) {
         const ChunkRef& chunk = chunks.chunks[chunk_index];
         if (chunk.cid == ASURA_CHUNK_TEXTURENAMES) {
@@ -476,9 +475,10 @@ bool decode_pc_model_materials(const ChunkList& chunks, uint32_t before_chunk,
                 at = align_up(at + name.size + 1, 4);
             }
             if (chunk.version < 3) {
-                materials.assign(count, {});
+                material_texture_indices.assign(count, -1);
+                material_flags.assign(count, 0);
                 for (uint32_t texture_index = 0; texture_index < count; ++texture_index)
-                    materials[texture_index].texture_index = static_cast<int32_t>(texture_index);
+                    material_texture_indices[texture_index] = static_cast<int32_t>(texture_index);
             }
         } else if (chunk.cid == ASURA_CHUNK_TEXTUREFLAGS) {
             if (chunk.version > 1 || chunk.size < sizeof(Asura_Chunk_Header) + sizeof(uint32_t))
@@ -490,8 +490,8 @@ bool decode_pc_model_materials(const ChunkList& chunks, uint32_t before_chunk,
             for (uint32_t texture_index = 0; texture_index < count; ++texture_index) {
                 uint32_t value = read_u32(chunk.data + values_at + texture_index * sizeof(uint32_t));
                 if (!chunk.version) {
-                    if (texture_index < materials.size())
-                        materials[texture_index].flags |= value & 0xDE87u;
+                    if (texture_index < material_flags.size())
+                        material_flags[texture_index] |= value & 0xDE87u;
                     value &= 0xFFFF2178u;
                 }
                 texture_flags[texture_index] |= value;
@@ -504,25 +504,26 @@ bool decode_pc_model_materials(const ChunkList& chunks, uint32_t before_chunk,
             const uint64_t records_at = sizeof(Asura_Chunk_Header) + sizeof(uint32_t);
             if (count > (chunk.size - records_at) / stride)
                 return fail(err, "Object preview MTRL table is truncated");
-            materials.assign(count, {});
+            material_texture_indices.assign(count, -1);
+            material_flags.assign(count, 0);
             for (uint32_t material_index = 0; material_index < count; ++material_index) {
                 const uint8_t* record = chunk.data + records_at + static_cast<uint64_t>(material_index) * stride;
-                materials[material_index].texture_index = static_cast<int32_t>(read_u32(record));
-                materials[material_index].flags = read_u32(record + 4);
+                material_texture_indices[material_index] = static_cast<int32_t>(read_u32(record));
+                material_flags[material_index] = read_u32(record + 4);
             }
         }
     }
 
-    output->assign(materials.size(), {});
-    for (uint32_t material_index = 0; material_index < materials.size(); ++material_index) {
-        const MaterialRecord& source = materials[material_index];
+    output->assign(material_texture_indices.size(), {});
+    for (uint32_t material_index = 0; material_index < material_texture_indices.size(); ++material_index) {
+        const int32_t texture_index = material_texture_indices[material_index];
         SpawnPuppetMaterial& material = (*output)[material_index];
-        material.flags = source.flags;
-        if (source.texture_index < 0 || static_cast<uint32_t>(source.texture_index) >= texture_names.size())
+        material.flags = material_flags[material_index];
+        if (texture_index < 0 || static_cast<uint32_t>(texture_index) >= texture_names.size())
             continue;
-        material.texture_name = texture_names[source.texture_index];
-        if (static_cast<uint32_t>(source.texture_index) < texture_flags.size())
-            material.texture_flags = texture_flags[source.texture_index];
+        material.texture_name = texture_names[texture_index];
+        if (static_cast<uint32_t>(texture_index) < texture_flags.size())
+            material.texture_flags = texture_flags[texture_index];
         const Str wanted{material.texture_name.data(), static_cast<uint32_t>(material.texture_name.size())};
         for (uint32_t resource_index = 0; resource_index < chunks.count; ++resource_index) {
             RscfInfo texture{};
@@ -538,6 +539,27 @@ bool decode_pc_model_materials(const ChunkList& chunks, uint32_t before_chunk,
             }
             break;
         }
+    }
+    return true;
+}
+
+bool decode_pc_preview_vertex(const uint8_t* source, SpawnPuppetVertex* vertex) {
+    vertex->position = {read_f32(source), read_f32(source + 4), read_f32(source + 8)};
+    vertex->normal = {read_f32(source + 12), read_f32(source + 16), read_f32(source + 20)};
+    vertex->texcoord = {read_f32(source + 24), read_f32(source + 28)};
+    if (!isfinite(vertex->position.x) || !isfinite(vertex->position.y) || !isfinite(vertex->position.z) ||
+        !isfinite(vertex->normal.x) || !isfinite(vertex->normal.y) || !isfinite(vertex->normal.z) ||
+        !isfinite(vertex->texcoord.x) || !isfinite(vertex->texcoord.y))
+        return false;
+    const float normal_length = sqrtf(vertex->normal.x * vertex->normal.x +
+                                      vertex->normal.y * vertex->normal.y +
+                                      vertex->normal.z * vertex->normal.z);
+    if (normal_length > 1.0e-5f) {
+        vertex->normal.x /= normal_length;
+        vertex->normal.y /= normal_length;
+        vertex->normal.z /= normal_length;
+    } else {
+        vertex->normal = {0, -1, 0};
     }
     return true;
 }
@@ -571,23 +593,9 @@ bool decode_pc_static_object_model(const ChunkList& chunks, uint32_t chunk_index
     for (uint32_t i = 0; i < vertex_count; ++i) {
         const uint8_t* source = resource.payload + header_size + static_cast<uint64_t>(i) * vertex_stride;
         SpawnPuppetVertex& vertex = next.mesh.vertices[i];
-        vertex.position = {read_f32(source), read_f32(source + 4), read_f32(source + 8)};
-        vertex.normal = {read_f32(source + 12), read_f32(source + 16), read_f32(source + 20)};
-        vertex.texcoord = {read_f32(source + 24), read_f32(source + 28)};
-        if (!isfinite(vertex.position.x) || !isfinite(vertex.position.y) || !isfinite(vertex.position.z) ||
-            !isfinite(vertex.normal.x) || !isfinite(vertex.normal.y) || !isfinite(vertex.normal.z) ||
-            !isfinite(vertex.texcoord.x) || !isfinite(vertex.texcoord.y))
+        if (!decode_pc_preview_vertex(source, &vertex))
             return fail(err, "Object resource '%.*s' contains non-finite vertices", resource.name.size,
                         resource.name.data);
-        const float length = sqrtf(vertex.normal.x * vertex.normal.x + vertex.normal.y * vertex.normal.y +
-                                   vertex.normal.z * vertex.normal.z);
-        if (length > 1.0e-5f) {
-            vertex.normal.x /= length;
-            vertex.normal.y /= length;
-            vertex.normal.z /= length;
-        } else {
-            vertex.normal = {0, -1, 0};
-        }
         if (!i) {
             next.mesh.min = next.mesh.max = vertex.position;
         } else {
@@ -919,23 +927,9 @@ bool decode_pc_pickup_model(const ChunkList& chunks, uint32_t chunk_index, const
     for (uint32_t i = 0; i < vertex_count; ++i) {
         const uint8_t* source = resource.payload + vertices_at + static_cast<uint64_t>(i) * vertex_stride;
         SpawnPuppetVertex& vertex = source_vertices[i];
-        vertex.position = {read_f32(source), read_f32(source + 4), read_f32(source + 8)};
-        vertex.normal = {read_f32(source + 12), read_f32(source + 16), read_f32(source + 20)};
-        vertex.texcoord = {read_f32(source + 24), read_f32(source + 28)};
-        if (!isfinite(vertex.position.x) || !isfinite(vertex.position.y) || !isfinite(vertex.position.z) ||
-            !isfinite(vertex.normal.x) || !isfinite(vertex.normal.y) || !isfinite(vertex.normal.z) ||
-            !isfinite(vertex.texcoord.x) || !isfinite(vertex.texcoord.y))
+        if (!decode_pc_preview_vertex(source, &vertex))
             return fail(err, "pickup ObjectHierarchy '%.*s' contains non-finite vertices",
                         resource.name.size, resource.name.data);
-        const float normal_length = sqrtf(vertex.normal.x * vertex.normal.x + vertex.normal.y * vertex.normal.y +
-                                          vertex.normal.z * vertex.normal.z);
-        if (normal_length > 1.0e-5f) {
-            vertex.normal.x /= normal_length;
-            vertex.normal.y /= normal_length;
-            vertex.normal.z /= normal_length;
-        } else {
-            vertex.normal = {0, -1, 0};
-        }
     }
 
     const uint8_t* indices = resource.payload + indices_at;

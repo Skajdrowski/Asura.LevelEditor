@@ -2,8 +2,6 @@
 
 #include "LevelEditorDocument.h"
 
-#include <DirectXMath.h>
-
 #include <string>
 #include <vector>
 
@@ -31,7 +29,6 @@ bool pc_environment_collision_flags(
     std::vector<uint32_t>* flags,
     asura::Error* err);
 
-DirectX::XMFLOAT4 material_map_color(uint32_t key);
 Asura_Vector_3 oriented_box_dimensions(const Entity& entity);
 
 bool pack_document(Document& document, const char* output_path, std::string* why);

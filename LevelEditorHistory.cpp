@@ -1,7 +1,7 @@
 #include "LevelEditorHistory.h"
 
-#include <algorithm>
 #include <bit>
+#include <cstring>
 #include <iterator>
 #include <utility>
 
@@ -74,37 +74,77 @@ bool equal(const Entity& a, const Entity& b) {
            equal(a.source_bounds, b.source_bounds) &&
            a.pickup_has_template == b.pickup_has_template &&
            a.pickup_skin_id == b.pickup_skin_id && a.pickup_anim_id == b.pickup_anim_id &&
-           a.pickup_anim_file_id == b.pickup_anim_file_id && a.pickup_body == b.pickup_body &&
+           a.pickup_anim_file_id == b.pickup_anim_file_id &&
+           memcmp(a.pickup_body.data(), b.pickup_body.data(), a.pickup_body.size()) == 0 &&
            a.static_object_has_template == b.static_object_has_template &&
-           a.static_object_body == b.static_object_body;
+           memcmp(a.static_object_body.data(), b.static_object_body.data(), a.static_object_body.size()) == 0;
 }
 
 bool equal(const PickupTemplate& a, const PickupTemplate& b) {
     return a.item_id == b.item_id && equal(a.health, b.health) && a.file_id == b.file_id &&
            a.skin_id == b.skin_id && a.anim_id == b.anim_id &&
            a.anim_file_id == b.anim_file_id && a.entity_padding == b.entity_padding &&
-           a.body == b.body;
+           memcmp(a.body.data(), b.body.data(), a.body.size()) == 0;
 }
 
 bool equal(const StaticObjectTemplate& a, const StaticObjectTemplate& b) {
     return a.file_id == b.file_id && a.resource_name == b.resource_name &&
            a.donor_path == b.donor_path && a.entity_padding == b.entity_padding &&
-           a.body == b.body;
+           memcmp(a.body.data(), b.body.data(), a.body.size()) == 0;
+}
+
+bool equal(const std::array<std::string, ASURA_SKYBOX_V5_V7_TEXTURE_PATH_COUNT>& a,
+           const std::array<std::string, ASURA_SKYBOX_V5_V7_TEXTURE_PATH_COUNT>& b) {
+    for (size_t i = 0; i < a.size(); ++i)
+        if (a[i] != b[i])
+            return false;
+    return true;
+}
+
+bool equal(const std::vector<std::string>& a, const std::vector<std::string>& b) {
+    if (a.size() != b.size())
+        return false;
+    for (size_t i = 0; i < a.size(); ++i)
+        if (a[i] != b[i])
+            return false;
+    return true;
 }
 
 bool equal(const SkyboxSettings& a, const SkyboxSettings& b) {
     return a.chunk_version == b.chunk_version && equal(a.red, b.red) &&
            equal(a.green, b.green) && equal(a.blue, b.blue) &&
            equal(a.orientation_radians, b.orientation_radians) &&
-           a.texture_paths == b.texture_paths && a.draw_clouds == b.draw_clouds &&
+           equal(a.texture_paths, b.texture_paths) && a.draw_clouds == b.draw_clouds &&
            a.back_texture_is_front_upside_down == b.back_texture_is_front_upside_down &&
            a.right_texture_is_left_upside_down == b.right_texture_is_left_upside_down &&
            a.source_record == b.source_record;
 }
 
-template <typename T, typename Predicate>
-bool equal_vectors(const std::vector<T>& a, const std::vector<T>& b, Predicate predicate) {
-    return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin(), predicate);
+bool equal(const std::vector<Entity>& a, const std::vector<Entity>& b) {
+    if (a.size() != b.size())
+        return false;
+    for (size_t i = 0; i < a.size(); ++i)
+        if (!equal(a[i], b[i]))
+            return false;
+    return true;
+}
+
+bool equal(const std::vector<PickupTemplate>& a, const std::vector<PickupTemplate>& b) {
+    if (a.size() != b.size())
+        return false;
+    for (size_t i = 0; i < a.size(); ++i)
+        if (!equal(a[i], b[i]))
+            return false;
+    return true;
+}
+
+bool equal(const std::vector<StaticObjectTemplate>& a, const std::vector<StaticObjectTemplate>& b) {
+    if (a.size() != b.size())
+        return false;
+    for (size_t i = 0; i < a.size(); ++i)
+        if (!equal(a[i], b[i]))
+            return false;
+    return true;
 }
 
 // dirty is derived from content revisions and is intentionally excluded.
@@ -112,18 +152,10 @@ bool equal_document_content(const Document& a, const Document& b) {
     return a.project_path == b.project_path && a.obj_path == b.obj_path &&
            a.source_pc_path == b.source_pc_path && a.output_path == b.output_path &&
            a.material_map == b.material_map && a.texture_dir == b.texture_dir &&
-           a.weapons_donor == b.weapons_donor && a.object_donors == b.object_donors &&
+           a.weapons_donor == b.weapons_donor && equal(a.object_donors, b.object_donors) &&
            a.sky_texture_dir == b.sky_texture_dir &&
-           equal_vectors(a.entities, b.entities,
-                         [](const Entity& x, const Entity& y) { return equal(x, y); }) &&
-           equal_vectors(a.pickup_templates, b.pickup_templates,
-                         [](const PickupTemplate& x, const PickupTemplate& y) {
-                             return equal(x, y);
-                         }) &&
-           equal_vectors(a.static_object_templates, b.static_object_templates,
-                         [](const StaticObjectTemplate& x, const StaticObjectTemplate& y) {
-                             return equal(x, y);
-                         }) &&
+           equal(a.entities, b.entities) && equal(a.pickup_templates, b.pickup_templates) &&
+           equal(a.static_object_templates, b.static_object_templates) &&
            a.next_guid == b.next_guid && equal(a.light_header_a, b.light_header_a) &&
            equal(a.light_header_b, b.light_header_b) && equal(a.light_header_c, b.light_header_c) &&
            a.light_header_flag == b.light_header_flag && equal(a.skybox, b.skybox) &&
@@ -163,11 +195,20 @@ bool find_fresh_guids(const Document& document, size_t requested,
     for (size_t wanted = 0; wanted < requested; ++wanted) {
         bool found = false;
         for (uint32_t attempt = 0; attempt < count; ++attempt) {
-            const bool used_by_document = std::any_of(
-                document.entities.begin(), document.entities.end(),
-                [candidate](const Entity& entity) { return entity.guid == candidate; });
-            const bool already_allocated =
-                std::find(guids->begin(), guids->end(), candidate) != guids->end();
+            bool used_by_document = false;
+            for (const Entity& entity : document.entities) {
+                if (entity.guid == candidate) {
+                    used_by_document = true;
+                    break;
+                }
+            }
+            bool already_allocated = false;
+            for (uint32_t guid : *guids) {
+                if (guid == candidate) {
+                    already_allocated = true;
+                    break;
+                }
+            }
             if (!used_by_document && !already_allocated) {
                 guids->push_back(candidate);
                 candidate = candidate == last ? first : candidate + 1;
@@ -398,7 +439,14 @@ bool LevelEditorHistory::copy(const Document& document, const std::vector<int>& 
             set_error(error, "The selection contains an invalid entity.");
             return false;
         }
-        if (std::find(seen.begin(), seen.end(), selected_index) != seen.end())
+        bool duplicate = false;
+        for (int seen_index : seen) {
+            if (seen_index == selected_index) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate)
             continue;
         seen.push_back(selected_index);
         const Entity& entity = document.entities[static_cast<size_t>(selected_index)];
