@@ -198,6 +198,17 @@ struct Asura_Chunk_WeatherSystem_ChunkDataV6 {
     float m_afLegacyParameters[12];
 };
 
+// LITE v4 payload header used by the 2004 PS2 target. Version 5 inserts an
+// additional entity-ambient vector between Ambient and BottomAmbient.
+struct Asura_Chunk_Lights_PayloadHeaderV4 {
+    uint32_t NumberOfLights;
+    Asura_Vector_3 Ambient;
+    Asura_Vector_3 BottomAmbient;
+    uint32_t UseHemisphereAmbient;
+};
+static_assert(sizeof(Asura_Chunk_Lights_PayloadHeaderV4) == 0x20,
+              "IDA-recovered PS2 LITE v4 header changed");
+
 struct Asura_Light {
     Asura_Vector_3 Position;
     // Retained on disk for authoring compatibility.  The 2005 PC static-photon

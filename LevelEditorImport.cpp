@@ -2120,6 +2120,46 @@ bool import_pc_entities(const ChunkList& chunks, Document* document, Error* err)
     return true;
 }
 
+bool import_ps2_lights(const ChunkList& chunks, Document* document, Error* err) {
+    uint32_t light_number = 0;
+    for (uint32_t chunk_index = 0; chunk_index < chunks.count; ++chunk_index) {
+        const ChunkRef& chunk = chunks.chunks[chunk_index];
+        if (chunk.cid != ASURA_CHUNK_LIGHTS)
+            continue;
+        if (chunk.version != 4 ||
+            chunk.size < sizeof(Asura_Chunk_Header) + sizeof(Asura_Chunk_Lights_PayloadHeaderV4))
+            return fail(err, "PS2 LITE chunk %u has an unsupported version or size", chunk_index);
+
+        const uint8_t* payload = chunk.data + sizeof(Asura_Chunk_Header);
+        Asura_Chunk_Lights_PayloadHeaderV4 header{};
+        memcpy(&header, payload, sizeof(header));
+        const uint64_t required = sizeof(Asura_Chunk_Header) + sizeof(header) +
+                                  static_cast<uint64_t>(header.NumberOfLights) * sizeof(Asura_Light);
+        if (required != chunk.size)
+            return fail(err, "PS2 LITE chunk %u is truncated or has an unsupported layout", chunk_index);
+
+        document->light_header_a = header.Ambient;
+        // Entity ambient was introduced by LITE v5. Keep the editor's v5
+        // default rather than treating the v4 bottom-ambient colour as it.
+        document->light_header_c = header.BottomAmbient;
+        document->light_header_flag = header.UseHemisphereAmbient;
+        const uint8_t* records = payload + sizeof(header);
+        for (uint32_t i = 0; i < header.NumberOfLights; ++i) {
+            Entity entity;
+            entity.kind = EntityKind::Light;
+            entity.name = "Light " + std::to_string(++light_number);
+            memcpy(&entity.light, records + static_cast<uint64_t>(i) * sizeof(Asura_Light),
+                   sizeof(entity.light));
+            entity.position = entity.light.Position;
+            entity.value_a = entity.light.Brightness;
+            entity.value_b = entity.light.Range;
+            document->entities.push_back(std::move(entity));
+        }
+        break;
+    }
+    return true;
+}
+
 bool ps2_passthrough_entity_class(uint16_t classification) {
     return classification == AsuraEntityClass_CutsceneController;
 }
@@ -2513,9 +2553,10 @@ bool load_ps2_level(const std::string& path, Document* document, Mesh* mesh, std
         ok = fail(&err, "the .PS2 contains no PS2StrippedEnv RSCF");
     if (ok)
         ok = decode_ps2_environment(environment, &next_mesh, &err) &&
+             import_ps2_lights(chunks, &next_document, &err) &&
              import_ps2_entities(chunks, &next_document, &err);
-    // PS2 LITE v4 and PHON v8 still use older target ABIs. ENTI is handled by
-    // the dedicated importer above, which expands the two short physical-object
+    // PS2 PHON v8 still uses an older target ABI. ENTI is handled by the
+    // dedicated importer above, which expands the two short physical-object
     // records and preserves the remaining byte-compatible classifications.
     if (ok)
         add_resource_backed_pickup_templates(chunks, &next_document);
