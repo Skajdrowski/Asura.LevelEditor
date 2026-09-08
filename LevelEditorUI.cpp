@@ -184,27 +184,27 @@ const SpawnPuppet* spawn_puppet_for_team(uint32_t team_mask) {
     return nullptr;
 }
 
-const SpawnPuppet* pickup_model_for_skin(uint32_t skin_id) {
+const EntityModel* pickup_model_for_skin(uint32_t skin_id) {
     for (const PickupModel& model : g.pickup_models)
         if (model.skin_id == skin_id && !model.mesh.faces.empty())
             return &model.mesh;
     return nullptr;
 }
 
-const SpawnPuppet* static_object_model_for_file(uint32_t file_id) {
+const EntityModel* static_object_model_for_file(uint32_t file_id) {
     for (const StaticObjectModel& model : g.static_object_models)
         if (model.file_id == file_id && !model.mesh.faces.empty())
             return &model.mesh;
     return nullptr;
 }
 
-const SpawnPuppet* entity_render_model(const Entity& entity) {
+const EntityModel* entity_render_model(const Entity& entity) {
     if (entity.kind == EntityKind::SpawnPoint)
         return spawn_puppet_for_team(entity.value_u32_a);
     if (entity.kind == EntityKind::Pickup)
         return pickup_model_for_skin(entity.pickup_skin_id);
     if (entity.kind == EntityKind::StaticObject) {
-        if (const SpawnPuppet* direct = static_object_model_for_file(entity.value_u32_b))
+        if (const EntityModel* direct = static_object_model_for_file(entity.value_u32_b))
             return direct;
         return pickup_model_for_skin(entity.pickup_skin_id);
     }
@@ -217,14 +217,14 @@ Asura_Vector_3 rotate_by_quaternion(Asura_Vector_3 value, const Asura_Quat& rota
     return add(value, add(mul(twice_cross, rotation.w), cross(q, twice_cross)));
 }
 
-Asura_Vector_3 spawn_puppet_view_vector(Asura_Vector_3 value, const Entity& entity) {
+Asura_Vector_3 entity_model_view_vector(Asura_Vector_3 value, const Entity& entity) {
     value = rotate_by_quaternion(value, euler_quaternion(entity.rotation));
     value.y = -value.y;
     return value;
 }
 
-Asura_Vector_3 spawn_puppet_view_position(Asura_Vector_3 local_position, const Entity& entity) {
-    return add(entity_view_position(entity.position), spawn_puppet_view_vector(local_position, entity));
+Asura_Vector_3 entity_model_view_position(Asura_Vector_3 local_position, const Entity& entity) {
+    return add(entity_view_position(entity.position), entity_model_view_vector(local_position, entity));
 }
 
 void append_light_gizmo_line(std::vector<LightGizmoLine>* lines, Asura_Vector_3 a, Asura_Vector_3 b) {
@@ -518,7 +518,7 @@ bool decode_spawn_puppet(const RscfInfo& resource, const char* expected_name, Sp
     next.vertices.resize(vertex_count);
     for (uint32_t i = 0; i < vertex_count; ++i) {
         const uint8_t* source = resource.payload + vertices_at + static_cast<uint64_t>(i) * vertex_stride;
-        SpawnPuppetVertex& vertex = next.vertices[i];
+        EntityModelVertex& vertex = next.vertices[i];
         vertex.position = {read_f32(source), read_f32(source + 4), read_f32(source + 8)};
         vertex.normal = {read_f32(source + 12), read_f32(source + 16), read_f32(source + 20)};
         if (!isfinite(vertex.position.x) || !isfinite(vertex.position.y) || !isfinite(vertex.position.z) ||
@@ -1453,11 +1453,11 @@ void focus_camera_on_entity(int index) {
     // Fit an actual spawn/pickup mesh when one is available. Rotation and the
     // target-to-editor Y conversion preserve the local bounding-sphere radius.
     float radius = fmaxf(.35f, g.mesh.radius * .008f) * 1.6f;
-    if (const SpawnPuppet* model = entity_render_model(entity)) {
+    if (const EntityModel* model = entity_render_model(entity)) {
         const Asura_Vector_3 local_center{(model->min.x + model->max.x) * .5f,
                                           (model->min.y + model->max.y) * .5f,
                                           (model->min.z + model->max.z) * .5f};
-        g.camera.target = spawn_puppet_view_position(local_center, entity);
+        g.camera.target = entity_model_view_position(local_center, entity);
         const float width = model->max.x - model->min.x;
         const float height = model->max.y - model->min.y;
         const float depth = model->max.z - model->min.z;
@@ -1830,18 +1830,18 @@ bool ray_hits_model_triangle(const EnvironmentRay& ray, const Asura_Vector_3& a,
 
 bool entity_model_ray_distance(const Entity& entity, const EnvironmentRay& ray,
                                float* distance) {
-    const SpawnPuppet* puppet = entity_render_model(entity);
-    if (!puppet || !distance)
+    const EntityModel* model = entity_render_model(entity);
+    if (!model || !distance)
         return false;
     float closest = FLT_MAX;
     bool found = false;
-    for (const auto& face : puppet->faces) {
-        if (face[0] >= puppet->vertices.size() || face[1] >= puppet->vertices.size() ||
-            face[2] >= puppet->vertices.size())
+    for (const auto& face : model->faces) {
+        if (face[0] >= model->vertices.size() || face[1] >= model->vertices.size() ||
+            face[2] >= model->vertices.size())
             continue;
-        const Asura_Vector_3 a = spawn_puppet_view_position(puppet->vertices[face[0]].position, entity);
-        const Asura_Vector_3 b = spawn_puppet_view_position(puppet->vertices[face[1]].position, entity);
-        const Asura_Vector_3 c = spawn_puppet_view_position(puppet->vertices[face[2]].position, entity);
+        const Asura_Vector_3 a = entity_model_view_position(model->vertices[face[0]].position, entity);
+        const Asura_Vector_3 b = entity_model_view_position(model->vertices[face[1]].position, entity);
+        const Asura_Vector_3 c = entity_model_view_position(model->vertices[face[2]].position, entity);
         float candidate = 0.0f;
         if (ray_hits_model_triangle(ray, a, b, c, closest, &candidate)) {
             closest = candidate;
@@ -2149,9 +2149,9 @@ void draw_sound_gizmo(HDC dc, const Entity& entity) {
     draw_gizmo_lines(dc, lines, 2, RGB(65, 205, 255));
 }
 
-bool draw_spawn_puppet(HDC dc, const Entity& entity, bool selected) {
-    const SpawnPuppet* puppet = entity_render_model(entity);
-    if (!puppet)
+bool draw_entity_model(HDC dc, const Entity& entity, bool selected) {
+    const EntityModel* model = entity_render_model(entity);
+    if (!model)
         return false;
     COLORREF color = entity.kind == EntityKind::Pickup
                          ? RGB(210, 92, 28)
@@ -2165,12 +2165,12 @@ bool draw_spawn_puppet(HDC dc, const Entity& entity, bool selected) {
     }
     HPEN pen = CreatePen(PS_SOLID, selected ? 2 : 1, color);
     HGDIOBJ old_pen = SelectObject(dc, pen);
-    for (const auto& face : puppet->faces) {
+    for (const auto& face : model->faces) {
         POINT points[4]{};
         bool visible = true;
         for (int corner = 0; corner < 3; ++corner) {
             const Asura_Vector_3 position =
-                spawn_puppet_view_position(puppet->vertices[face[corner]].position, entity);
+                entity_model_view_position(model->vertices[face[corner]].position, entity);
             visible = visible && project_point(position, &points[corner]);
         }
         if (visible) {
@@ -2223,7 +2223,7 @@ void draw_entities(HDC dc) {
         }
         if ((e.kind == EntityKind::SpawnPoint || e.kind == EntityKind::Pickup ||
              e.kind == EntityKind::StaticObject) &&
-            draw_spawn_puppet(dc, e, selected)) {
+            draw_entity_model(dc, e, selected)) {
             if (selected)
                 TextOutA(dc, p.x + 10, p.y - 8, e.name.c_str(), static_cast<int>(e.name.size()));
             continue;

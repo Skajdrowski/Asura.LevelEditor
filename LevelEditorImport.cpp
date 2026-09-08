@@ -450,7 +450,7 @@ void note_static_object_template(Document* document, const Entity& entity, const
 }
 
 bool decode_pc_model_materials(const ChunkList& chunks, uint32_t before_chunk,
-                               std::vector<SpawnPuppetMaterial>* output, Error* err) {
+                               std::vector<EntityModelMaterial>* output, Error* err) {
     std::vector<std::string> texture_names;
     std::vector<uint32_t> texture_flags;
     std::vector<int32_t> material_texture_indices;
@@ -517,7 +517,7 @@ bool decode_pc_model_materials(const ChunkList& chunks, uint32_t before_chunk,
     output->assign(material_texture_indices.size(), {});
     for (uint32_t material_index = 0; material_index < material_texture_indices.size(); ++material_index) {
         const int32_t texture_index = material_texture_indices[material_index];
-        SpawnPuppetMaterial& material = (*output)[material_index];
+        EntityModelMaterial& material = (*output)[material_index];
         material.flags = material_flags[material_index];
         if (texture_index < 0 || static_cast<uint32_t>(texture_index) >= texture_names.size())
             continue;
@@ -543,7 +543,7 @@ bool decode_pc_model_materials(const ChunkList& chunks, uint32_t before_chunk,
     return true;
 }
 
-bool decode_pc_preview_vertex(const uint8_t* source, SpawnPuppetVertex* vertex) {
+bool decode_pc_preview_vertex(const uint8_t* source, EntityModelVertex* vertex) {
     vertex->position = {read_f32(source), read_f32(source + 4), read_f32(source + 8)};
     vertex->normal = {read_f32(source + 12), read_f32(source + 16), read_f32(source + 20)};
     vertex->texcoord = {read_f32(source + 24), read_f32(source + 28)};
@@ -592,7 +592,7 @@ bool decode_pc_static_object_model(const ChunkList& chunks, uint32_t chunk_index
     next.mesh.vertices.resize(vertex_count);
     for (uint32_t i = 0; i < vertex_count; ++i) {
         const uint8_t* source = resource.payload + header_size + static_cast<uint64_t>(i) * vertex_stride;
-        SpawnPuppetVertex& vertex = next.mesh.vertices[i];
+        EntityModelVertex& vertex = next.mesh.vertices[i];
         if (!decode_pc_preview_vertex(source, &vertex))
             return fail(err, "Object resource '%.*s' contains non-finite vertices", resource.name.size,
                         resource.name.data);
@@ -621,7 +621,10 @@ bool decode_pc_static_object_model(const ChunkList& chunks, uint32_t chunk_index
             return fail(err, "Object resource '%.*s' has an out-of-range index", resource.name.size,
                         resource.name.data);
         if (a != b && b != c && a != c) {
-            next.mesh.faces.push_back({a, b, c});
+            // entity_model_view_vector reflects Y for the editor's coordinate
+            // system. Reverse the file winding here so outward-facing object
+            // triangles remain outward-facing after that reflection.
+            next.mesh.faces.push_back({a, c, b});
             next.mesh.face_materials.push_back(static_cast<int32_t>(read_u32(resource.payload + 16)));
         }
     }
@@ -923,10 +926,10 @@ bool decode_pc_pickup_model(const ChunkList& chunks, uint32_t chunk_index, const
     std::vector<HierarchyBindTransform> bind_pose;
     if (!decode_pc_hierarchy_bind_pose(chunks, chunk_index, resource.name, strip_count, &bind_pose, err))
         return false;
-    std::vector<SpawnPuppetVertex> source_vertices(vertex_count);
+    std::vector<EntityModelVertex> source_vertices(vertex_count);
     for (uint32_t i = 0; i < vertex_count; ++i) {
         const uint8_t* source = resource.payload + vertices_at + static_cast<uint64_t>(i) * vertex_stride;
-        SpawnPuppetVertex& vertex = source_vertices[i];
+        EntityModelVertex& vertex = source_vertices[i];
         if (!decode_pc_preview_vertex(source, &vertex))
             return fail(err, "pickup ObjectHierarchy '%.*s' contains non-finite vertices",
                         resource.name.size, resource.name.data);
@@ -978,7 +981,7 @@ bool decode_pc_pickup_model(const ChunkList& chunks, uint32_t chunk_index, const
                         if (next.mesh.vertices.size() >= 65535)
                             return fail(err, "pickup ObjectHierarchy '%.*s' expands beyond preview limits",
                                         resource.name.size, resource.name.data);
-                        SpawnPuppetVertex vertex = source_vertices[source_index];
+                        EntityModelVertex vertex = source_vertices[source_index];
                         const Asura_Vector_3 rotated_position = hierarchy_rotate(vertex.position, bind.orientation);
                         vertex.position = {rotated_position.x + bind.position.x,
                                            rotated_position.y + bind.position.y,
@@ -989,8 +992,10 @@ bool decode_pc_pickup_model(const ChunkList& chunks, uint32_t chunk_index, const
                     }
                     destination_indices[corner] = destination;
                 }
+                // The final viewport transform reflects Y, so preserve the
+                // source triangle's facing by reversing its winding once.
                 next.mesh.faces.push_back(
-                    {destination_indices[0], destination_indices[1], destination_indices[2]});
+                    {destination_indices[0], destination_indices[2], destination_indices[1]});
                 next.mesh.face_materials.push_back(material_index);
             }
         }

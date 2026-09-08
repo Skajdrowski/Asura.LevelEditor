@@ -150,13 +150,13 @@ struct Mesh {
     float radius = 25.0f;
 };
 
-struct SpawnPuppetVertex {
+struct EntityModelVertex {
     Asura_Vector_3 position{};
     Asura_Vector_3 normal{};
     Asura_Vector_2 texcoord{};
 };
 
-struct SpawnPuppetMaterial {
+struct EntityModelMaterial {
     std::string texture_name;
     uint32_t flags = 0;
     uint32_t texture_flags = 0;
@@ -166,23 +166,25 @@ struct SpawnPuppetMaterial {
     std::vector<uint8_t> texture_bytes;
 };
 
-struct SpawnPuppet {
+struct EntityModel {
     std::string resource_name;
-    std::vector<SpawnPuppetVertex> vertices;
+    std::vector<EntityModelVertex> vertices;
     std::vector<std::array<uint16_t, 3>> faces;
     std::vector<int32_t> face_materials;
-    std::vector<SpawnPuppetMaterial> materials;
+    std::vector<EntityModelMaterial> materials;
     Asura_Vector_3 min{}, max{};
 };
 
+struct SpawnPuppet : EntityModel {};
+
 struct PickupModel {
     uint32_t skin_id = 0;
-    SpawnPuppet mesh;
+    EntityModel mesh;
 };
 
 struct StaticObjectModel {
     uint32_t file_id = 0;
-    SpawnPuppet mesh;
+    EntityModel mesh;
 };
 
 } // namespace editor

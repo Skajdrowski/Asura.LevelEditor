@@ -90,7 +90,7 @@ inline constexpr float kMaximumLightGizmoRange = 10000000.0f;
 bool valid_entity_index(int index);
 bool entity_is_selected(int index);
 const SpawnPuppet* spawn_puppet_for_team(uint32_t team_mask);
-const SpawnPuppet* entity_render_model(const Entity& entity);
+const EntityModel* entity_render_model(const Entity& entity);
 Asura_Vector_3 add(Asura_Vector_3 a, Asura_Vector_3 b);
 Asura_Vector_3 sub(Asura_Vector_3 a, Asura_Vector_3 b);
 Asura_Vector_3 mul(Asura_Vector_3 a, float b);
@@ -99,8 +99,8 @@ float dot(Asura_Vector_3 a, Asura_Vector_3 b);
 Asura_Vector_3 cross(Asura_Vector_3 a, Asura_Vector_3 b);
 Asura_Vector_3 normalized(Asura_Vector_3 a);
 Asura_Vector_3 rotate_by_quaternion(Asura_Vector_3 value, const Asura_Quat& rotation);
-Asura_Vector_3 spawn_puppet_view_vector(Asura_Vector_3 value, const Entity& entity);
-Asura_Vector_3 spawn_puppet_view_position(Asura_Vector_3 local_position,
+Asura_Vector_3 entity_model_view_vector(Asura_Vector_3 value, const Entity& entity);
+Asura_Vector_3 entity_model_view_position(Asura_Vector_3 local_position,
                                           const Entity& entity);
 void append_light_gizmo_line(std::vector<LightGizmoLine>* lines, Asura_Vector_3 a,
                              Asura_Vector_3 b);

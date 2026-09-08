@@ -107,12 +107,12 @@ struct GpuMaterialRange {
     bool source_pc_material = false;
 };
 
-struct GpuPuppetRange {
+struct GpuEntityModelRange {
     uint32_t start_vertex = 0;
     uint32_t vertex_count = 0;
-    const SpawnPuppetMaterial* material = nullptr;
+    const EntityModelMaterial* material = nullptr;
     bool selected = false;
-    bool two_sided = false;
+    EntityKind kind;
 };
 
 struct GpuModelTexture {
@@ -122,10 +122,10 @@ struct GpuModelTexture {
 };
 
 struct GpuEntitySnapshot {
-    const SpawnPuppet* model = nullptr;
-    const SpawnPuppetVertex* vertices = nullptr;
+    const EntityModel* model = nullptr;
+    const EntityModelVertex* vertices = nullptr;
     const std::array<uint16_t, 3>* faces = nullptr;
-    const SpawnPuppetMaterial* materials = nullptr;
+    const EntityModelMaterial* materials = nullptr;
     size_t face_count = 0;
     EntityKind kind = EntityKind::SpawnPoint;
     Asura_Vector_3 position{};
@@ -142,7 +142,7 @@ struct GpuEntitySnapshot {
 
 struct GpuModelLookupSnapshot {
     uint32_t id = 0;
-    const SpawnPuppet* model = nullptr;
+    const EntityModel* model = nullptr;
     const std::array<uint16_t, 3>* faces = nullptr;
     size_t face_count = 0;
     bool operator==(const GpuModelLookupSnapshot&) const = default;
@@ -222,7 +222,7 @@ struct GpuRenderer {
     ID3D11Buffer* skybox_cloud_vertices = nullptr;
     ID3D11Buffer* mesh_vertices = nullptr;
     ID3D11Buffer* mesh_indices = nullptr;
-    ID3D11Buffer* puppet_vertices = nullptr;
+    ID3D11Buffer* entity_model_vertices = nullptr;
     ID3D11Buffer* overlay_vertices = nullptr;
     ID3D11Buffer* rain_vertices = nullptr;
     ID3D11RasterizerState* rasterizer_cull_back = nullptr;
@@ -247,33 +247,33 @@ struct GpuRenderer {
     ID3D11ShaderResourceView* rain_texture = nullptr;
     uint32_t mesh_index_count = 0;
     uint32_t skybox_cloud_vertex_count = 0;
-    uint32_t puppet_capacity = 0;
+    uint32_t entity_model_capacity = 0;
     uint32_t overlay_capacity = 0;
     uint32_t rain_capacity = 0;
     uint32_t rain_vertex_count = 0;
     std::vector<GpuMaterialRange> material_ranges;
     std::vector<GpuModelTexture> model_textures;
     std::vector<GpuVertex> rain_scratch;
-    std::vector<GpuVertex> puppet_scratch;
-    std::vector<GpuPuppetRange> puppet_range_scratch;
+    std::vector<GpuVertex> entity_model_scratch;
+    std::vector<GpuEntityModelRange> entity_model_range_scratch;
     std::vector<GpuVertex> overlay_scratch;
     std::vector<uint32_t> entity_selection_order_scratch;
-    std::vector<const SpawnPuppet*> entity_models_scratch;
+    std::vector<const EntityModel*> entity_models_scratch;
     std::vector<GpuEntitySnapshot> entity_snapshot;
     std::vector<GpuEntitySnapshot> entity_snapshot_scratch;
     std::vector<GpuModelLookupSnapshot> pickup_lookup_snapshot;
     std::vector<GpuModelLookupSnapshot> pickup_lookup_snapshot_scratch;
     std::vector<GpuModelLookupSnapshot> static_lookup_snapshot;
     std::vector<GpuModelLookupSnapshot> static_lookup_snapshot_scratch;
-    std::unordered_map<uint32_t, const SpawnPuppet*> pickup_lookup;
-    std::unordered_map<uint32_t, const SpawnPuppet*> static_lookup;
-    uint32_t cached_unselected_puppet_count = 0;
-    uint32_t cached_selected_puppet_count = 0;
+    std::unordered_map<uint32_t, const EntityModel*> pickup_lookup;
+    std::unordered_map<uint32_t, const EntityModel*> static_lookup;
+    uint32_t cached_unselected_model_count = 0;
+    uint32_t cached_selected_model_count = 0;
     uint32_t cached_entity_start = 0;
     uint32_t cached_selected_entity_start = 0;
     uint32_t cached_overlay_vertex_count = 0;
     float cached_overlay_mesh_radius = -1.0f;
-    bool cached_puppets_ready = false;
+    bool cached_entity_models_ready = false;
     bool cached_overlay_ready = false;
     uint32_t width = 0, height = 0;
     DirectX::XMFLOAT4 skybox_tint{1, 1, 1, 1};
@@ -480,7 +480,7 @@ bool gpu_create_dds_view_from_memory(const uint8_t* bytes, size_t byte_count, co
     return true;
 }
 
-ID3D11ShaderResourceView* gpu_model_texture_view(const SpawnPuppetMaterial* material) {
+ID3D11ShaderResourceView* gpu_model_texture_view(const EntityModelMaterial* material) {
     if (!material || material->texture_bytes.empty())
         return gpu.white_texture;
     for (const GpuModelTexture& cached : gpu.model_textures) {
@@ -1334,7 +1334,7 @@ void gpu_shutdown() {
     gpu_release(gpu.skybox_vertex_shader);
     gpu_release(gpu.rain_vertices);
     gpu_release(gpu.overlay_vertices);
-    gpu_release(gpu.puppet_vertices);
+    gpu_release(gpu.entity_model_vertices);
     gpu_release(gpu.mesh_indices);
     gpu_release(gpu.mesh_vertices);
     gpu_release(gpu.depth_disabled);
@@ -1993,10 +1993,10 @@ GpuVertex gpu_line_vertex(Asura_Vector_3 position, DirectX::XMFLOAT4 color) {
     return {{position.x, position.y, position.z}, {0, 1, 0}, color};
 }
 
-GpuVertex gpu_model_vertex(const SpawnPuppetVertex& source, const Entity& entity,
+GpuVertex gpu_model_vertex(const EntityModelVertex& source, const Entity& entity,
                            DirectX::XMFLOAT4 color) {
-    const Asura_Vector_3 position = spawn_puppet_view_position(source.position, entity);
-    const Asura_Vector_3 normal = normalized(spawn_puppet_view_vector(source.normal, entity));
+    const Asura_Vector_3 position = entity_model_view_position(source.position, entity);
+    const Asura_Vector_3 normal = normalized(entity_model_view_vector(source.normal, entity));
     return {{position.x, position.y, position.z}, {normal.x, normal.y, normal.z}, color,
             {source.texcoord.x, source.texcoord.y}};
 }
@@ -2033,7 +2033,7 @@ bool gpu_update_dynamic_vertices(ID3D11Buffer** buffer, uint32_t* capacity,
 void gpu_commit_model_lookup(size_t reserve_count,
                              std::vector<GpuModelLookupSnapshot>* cached,
                              std::vector<GpuModelLookupSnapshot>* scratch,
-                             std::unordered_map<uint32_t, const SpawnPuppet*>* lookup) {
+                             std::unordered_map<uint32_t, const EntityModel*>* lookup) {
     if (same_model_lookup_snapshots(*cached, *scratch))
         return;
     lookup->clear();
@@ -2048,7 +2048,7 @@ void gpu_refresh_entity_model_lookup() {
     gpu.pickup_lookup_snapshot_scratch.clear();
     gpu.pickup_lookup_snapshot_scratch.reserve(g.pickup_models.size());
     for (const PickupModel& entry : g.pickup_models) {
-        const SpawnPuppet* model = &entry.mesh;
+        const EntityModel* model = &entry.mesh;
         gpu.pickup_lookup_snapshot_scratch.push_back(
             {entry.skin_id, model, model->faces.data(), model->faces.size()});
     }
@@ -2058,7 +2058,7 @@ void gpu_refresh_entity_model_lookup() {
     gpu.static_lookup_snapshot_scratch.clear();
     gpu.static_lookup_snapshot_scratch.reserve(g.static_object_models.size());
     for (const StaticObjectModel& entry : g.static_object_models) {
-        const SpawnPuppet* model = &entry.mesh;
+        const EntityModel* model = &entry.mesh;
         gpu.static_lookup_snapshot_scratch.push_back(
             {entry.file_id, model, model->faces.data(), model->faces.size()});
     }
@@ -2066,7 +2066,7 @@ void gpu_refresh_entity_model_lookup() {
                             &gpu.static_lookup_snapshot_scratch, &gpu.static_lookup);
 }
 
-const SpawnPuppet* gpu_entity_render_model(const Entity& entity) {
+const EntityModel* gpu_entity_render_model(const Entity& entity) {
     if (entity.kind == EntityKind::SpawnPoint)
         return spawn_puppet_for_team(entity.value_u32_a);
     if (entity.kind == EntityKind::Pickup) {
@@ -2083,7 +2083,7 @@ const SpawnPuppet* gpu_entity_render_model(const Entity& entity) {
     return nullptr;
 }
 
-GpuEntitySnapshot gpu_entity_snapshot(const Entity& entity, const SpawnPuppet* model,
+GpuEntitySnapshot gpu_entity_snapshot(const Entity& entity, const EntityModel* model,
                                       uint32_t selection_order) {
     GpuEntitySnapshot snapshot{};
     snapshot.model = model;
@@ -2234,9 +2234,23 @@ void gpu_render_skybox(const DirectX::XMFLOAT4X4& view_projection) {
     gpu.context->PSSetShaderResources(0, _countof(none), none);
 }
 
-void append_gpu_spawn_puppet(const Entity& entity, const SpawnPuppet* puppet, bool selected,
-                             std::vector<GpuVertex>* output,
-                             std::vector<GpuPuppetRange>* ranges = nullptr) {
+void append_gpu_entity_model_range(std::vector<GpuEntityModelRange>* ranges, uint32_t start_vertex,
+                                   uint32_t vertex_count, const EntityModelMaterial* material,
+                                   bool selected, EntityKind kind) {
+    if (!ranges || !vertex_count)
+        return;
+    if (!ranges->empty() && ranges->back().material == material &&
+        ranges->back().selected == selected && ranges->back().kind == kind &&
+        ranges->back().start_vertex + ranges->back().vertex_count == start_vertex) {
+        ranges->back().vertex_count += vertex_count;
+        return;
+    }
+    ranges->push_back({start_vertex, vertex_count, material, selected, kind});
+}
+
+void append_gpu_spawn_puppet(const Entity& entity, bool selected, std::vector<GpuVertex>* output,
+                             std::vector<GpuEntityModelRange>* ranges = nullptr) {
+    const SpawnPuppet* puppet = spawn_puppet_for_team(entity.value_u32_a);
     if (!puppet)
         return;
 
@@ -2263,23 +2277,22 @@ void append_gpu_spawn_puppet(const Entity& entity, const SpawnPuppet* puppet, bo
         for (uint16_t index : face)
             output->push_back(gpu_model_vertex(puppet->vertices[index], entity, color));
     }
-    if (ranges && output->size() > start_vertex)
-        ranges->push_back(
-            {start_vertex, static_cast<uint32_t>(output->size()) - start_vertex, nullptr, selected, true});
+    append_gpu_entity_model_range(ranges, start_vertex,
+                                  static_cast<uint32_t>(output->size()) - start_vertex, nullptr, selected,
+                                  EntityKind::SpawnPoint);
 }
 
-void append_gpu_entity_model(const Entity& entity, const SpawnPuppet* model, bool selected,
+void append_gpu_entity_model(const Entity& entity, const EntityModel* model, bool selected,
                              std::vector<GpuVertex>* output,
-                             std::vector<GpuPuppetRange>* ranges = nullptr) {
+                             std::vector<GpuEntityModelRange>* ranges = nullptr) {
     if (!model)
         return;
-    const bool two_sided = entity.kind == EntityKind::Pickup;
     for (uint32_t face_index = 0; face_index < model->faces.size(); ++face_index) {
         const auto& face = model->faces[face_index];
         const int32_t material_index = face_index < model->face_materials.size()
                                            ? model->face_materials[face_index]
                                            : -1;
-        const SpawnPuppetMaterial* material = material_index >= 0 &&
+        const EntityModelMaterial* material = material_index >= 0 &&
                                                        static_cast<uint32_t>(material_index) < model->materials.size()
                                                    ? &model->materials[material_index]
                                                    : nullptr;
@@ -2296,24 +2309,15 @@ void append_gpu_entity_model(const Entity& entity, const SpawnPuppet* model, boo
         const uint32_t start_vertex = static_cast<uint32_t>(output->size());
         for (uint16_t index : face)
             output->push_back(gpu_model_vertex(model->vertices[index], entity, color));
-        if (ranges) {
-            if (!ranges->empty() && ranges->back().material == material &&
-                ranges->back().selected == selected &&
-                ranges->back().two_sided == two_sided &&
-                ranges->back().start_vertex + ranges->back().vertex_count == start_vertex) {
-                ranges->back().vertex_count += 3;
-            } else {
-                ranges->push_back({start_vertex, 3, material, selected, two_sided});
-            }
-        }
+        append_gpu_entity_model_range(ranges, start_vertex, 3, material, selected, entity.kind);
     }
 }
 
-void append_gpu_entity_geometry(const Entity& entity, const SpawnPuppet* model, bool selected,
+void append_gpu_entity_geometry(const Entity& entity, const EntityModel* model, bool selected,
                                 std::vector<GpuVertex>* vertices,
-                                std::vector<GpuPuppetRange>* ranges) {
+                                std::vector<GpuEntityModelRange>* ranges) {
     if (entity.kind == EntityKind::SpawnPoint)
-        append_gpu_spawn_puppet(entity, model, selected, vertices, ranges);
+        append_gpu_spawn_puppet(entity, selected, vertices, ranges);
     else if (entity.kind == EntityKind::Pickup || entity.kind == EntityKind::StaticObject)
         append_gpu_entity_model(entity, model, selected, vertices, ranges);
 }
@@ -2403,16 +2407,16 @@ void append_oriented_bounds_gizmo(const Entity& entity, std::vector<LightGizmoLi
     append_box_edges(corners, lines);
 }
 
-void gpu_draw_puppet_ranges(const std::vector<GpuPuppetRange>& ranges, bool selected) {
+void gpu_draw_entity_model_ranges(const std::vector<GpuEntityModelRange>& ranges, bool selected) {
     gpu.context->PSSetSamplers(0, 1, &gpu.environment_sampler);
     ID3D11RasterizerState* bound_rasterizer = nullptr;
     ID3D11ShaderResourceView* bound_texture = nullptr;
     bool rasterizer_bound = false;
     bool texture_bound = false;
-    for (const GpuPuppetRange& range : ranges) {
+    for (const GpuEntityModelRange& range : ranges) {
         if (range.selected != selected || !range.vertex_count)
             continue;
-        ID3D11RasterizerState* rasterizer = range.two_sided || !g.backface_culling
+        ID3D11RasterizerState* rasterizer = range.kind == EntityKind::SpawnPoint || !g.backface_culling
                                                ? gpu.rasterizer_no_cull
                                                : gpu.rasterizer_cull_back;
         if (!rasterizer_bound || rasterizer != bound_rasterizer) {
@@ -2667,7 +2671,7 @@ void gpu_render() {
             selection_order[static_cast<size_t>(selected_index)] = static_cast<uint32_t>(order + 1);
     }
 
-    std::vector<const SpawnPuppet*>& entity_models = gpu.entity_models_scratch;
+    std::vector<const EntityModel*>& entity_models = gpu.entity_models_scratch;
     entity_models.resize(entity_count);
     for (size_t i = 0; i < entity_count; ++i)
         entity_models[i] = gpu_entity_render_model(g.document.entities[i]);
@@ -2679,31 +2683,32 @@ void gpu_render() {
 
     if (gpu.cached_overlay_mesh_radius != g.mesh.radius ||
         !same_entity_snapshots(gpu.entity_snapshot, next_snapshot)) {
-        std::vector<GpuVertex>& puppet_vertices = gpu.puppet_scratch;
-        std::vector<GpuPuppetRange>& puppet_ranges = gpu.puppet_range_scratch;
-        puppet_vertices.clear();
-        puppet_ranges.clear();
-        size_t puppet_vertex_count = 0;
+        std::vector<GpuVertex>& entity_model_vertices = gpu.entity_model_scratch;
+        std::vector<GpuEntityModelRange>& entity_model_ranges = gpu.entity_model_range_scratch;
+        entity_model_vertices.clear();
+        entity_model_ranges.clear();
+        size_t entity_model_vertex_count = 0;
         for (const GpuEntitySnapshot& snapshot : next_snapshot)
-            if (snapshot.model && snapshot.face_count <= (SIZE_MAX - puppet_vertex_count) / 3)
-                puppet_vertex_count += snapshot.face_count * 3;
-        puppet_vertices.reserve(puppet_vertex_count);
+            if (snapshot.model && snapshot.face_count <= (SIZE_MAX - entity_model_vertex_count) / 3)
+                entity_model_vertex_count += snapshot.face_count * 3;
+        entity_model_vertices.reserve(entity_model_vertex_count);
         for (size_t i = 0; i < entity_count; ++i)
             if (!selection_order[i] && entity_models[i])
                 append_gpu_entity_geometry(g.document.entities[i], entity_models[i], false,
-                                           &puppet_vertices, &puppet_ranges);
-        gpu.cached_unselected_puppet_count = static_cast<uint32_t>(puppet_vertices.size());
+                                           &entity_model_vertices, &entity_model_ranges);
+        gpu.cached_unselected_model_count = static_cast<uint32_t>(entity_model_vertices.size());
         for (int selected_index : g.selected_entities)
             if (valid_entity_index(selected_index) && entity_models[static_cast<size_t>(selected_index)])
                 append_gpu_entity_geometry(g.document.entities[selected_index],
                                            entity_models[static_cast<size_t>(selected_index)], true,
-                                           &puppet_vertices, &puppet_ranges);
-        gpu.cached_selected_puppet_count =
-            static_cast<uint32_t>(puppet_vertices.size()) - gpu.cached_unselected_puppet_count;
-        gpu.cached_puppets_ready = !puppet_vertices.empty() &&
-                                   gpu_update_dynamic_vertices(&gpu.puppet_vertices, &gpu.puppet_capacity,
-                                                               puppet_vertices) &&
-                                   gpu.puppet_vertices;
+                                           &entity_model_vertices, &entity_model_ranges);
+        gpu.cached_selected_model_count =
+            static_cast<uint32_t>(entity_model_vertices.size()) - gpu.cached_unselected_model_count;
+        gpu.cached_entity_models_ready = !entity_model_vertices.empty() &&
+                                         gpu_update_dynamic_vertices(&gpu.entity_model_vertices,
+                                                                     &gpu.entity_model_capacity,
+                                                                     entity_model_vertices) &&
+                                         gpu.entity_model_vertices;
 
         std::vector<GpuVertex>& overlay = gpu.overlay_scratch;
         overlay.clear();
@@ -2775,10 +2780,10 @@ void gpu_render() {
         gpu.cached_overlay_mesh_radius = g.mesh.radius;
         gpu.entity_snapshot.swap(next_snapshot);
     }
-    std::vector<GpuPuppetRange>& puppet_ranges = gpu.puppet_range_scratch;
-    const uint32_t unselected_puppet_count = gpu.cached_unselected_puppet_count;
-    const uint32_t selected_puppet_count = gpu.cached_selected_puppet_count;
-    const bool puppets_ready = gpu.cached_puppets_ready;
+    std::vector<GpuEntityModelRange>& entity_model_ranges = gpu.entity_model_range_scratch;
+    const uint32_t unselected_model_count = gpu.cached_unselected_model_count;
+    const uint32_t selected_model_count = gpu.cached_selected_model_count;
+    const bool entity_models_ready = gpu.cached_entity_models_ready;
     const uint32_t entity_start = gpu.cached_entity_start;
     const uint32_t selected_entity_start = gpu.cached_selected_entity_start;
     const bool overlay_ready = gpu.cached_overlay_ready;
@@ -2786,22 +2791,22 @@ void gpu_render() {
         gpu_draw_overlay_range(0, entity_start, gpu.depth_enabled);
     // Unselected models and markers retain the environment depth buffer and
     // therefore disappear naturally behind walls and terrain.
-    if (puppets_ready && unselected_puppet_count) {
+    if (entity_models_ready && unselected_model_count) {
         gpu.context->OMSetDepthStencilState(gpu.depth_enabled, 0);
-        gpu.context->IASetVertexBuffers(0, 1, &gpu.puppet_vertices, &stride, &offset);
+        gpu.context->IASetVertexBuffers(0, 1, &gpu.entity_model_vertices, &stride, &offset);
         gpu.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        gpu_draw_puppet_ranges(puppet_ranges, false);
+        gpu_draw_entity_model_ranges(entity_model_ranges, false);
     }
     if (overlay_ready)
         gpu_draw_overlay_range(entity_start, selected_entity_start - entity_start, gpu.depth_enabled);
     // Only the selected model discards scene depth. Drawing with depth enabled
     // after the clear preserves the model's own self-occlusion.
-    if (puppets_ready && selected_puppet_count) {
+    if (entity_models_ready && selected_model_count) {
         gpu.context->ClearDepthStencilView(gpu.depth_view, D3D11_CLEAR_DEPTH, 1, 0);
         gpu.context->OMSetDepthStencilState(gpu.depth_enabled, 0);
-        gpu.context->IASetVertexBuffers(0, 1, &gpu.puppet_vertices, &stride, &offset);
+        gpu.context->IASetVertexBuffers(0, 1, &gpu.entity_model_vertices, &stride, &offset);
         gpu.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        gpu_draw_puppet_ranges(puppet_ranges, true);
+        gpu_draw_entity_model_ranges(entity_model_ranges, true);
     }
     if (overlay_ready)
         gpu_draw_overlay_range(selected_entity_start,
