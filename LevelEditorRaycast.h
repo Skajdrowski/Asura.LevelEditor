@@ -42,10 +42,18 @@ public:
         uint32_t right = 0;
     };
 
+    struct Triangle {
+        Asura_Vector_3 origin{};
+        Asura_Vector_3 edge_a{};
+        Asura_Vector_3 edge_b{};
+        uint32_t face_index = 0;
+    };
+
 private:
-    uint32_t build_node(const Mesh& mesh, uint32_t first, uint32_t count);
+    uint32_t build_node(uint32_t first, uint32_t count);
 
     std::vector<uint32_t> faces_;
+    std::vector<Triangle> triangles_;
     std::vector<Node> nodes_;
 };
 

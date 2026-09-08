@@ -4165,7 +4165,15 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
                 e.position = p;
                 if (e.kind == EntityKind::Light)
                     e.light.Position = e.position;
-                refresh_inspector();
+                // Dragging only changes position. A full inspector refresh is
+                // surprisingly expensive here (it rebuilds pickup/object combo
+                // contents and toggles many controls on every mouse event).
+                const bool was_refreshing_inspector = g.refreshing_inspector;
+                g.refreshing_inspector = true;
+                set_float(g.pos[0], e.position.x);
+                set_float(g.pos[1], e.position.y);
+                set_float(g.pos[2], e.position.z);
+                g.refreshing_inspector = was_refreshing_inspector;
                 request_redraw();
             }
         } else if (g.orbiting) {
