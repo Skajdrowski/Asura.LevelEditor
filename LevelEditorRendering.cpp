@@ -533,39 +533,37 @@ std::string parent_folder_of(const std::string& path) {
     return slash == std::string::npos ? std::string{} : path.substr(0, slash);
 }
 
-void texture_search_roots(const std::string& level_path, std::string (&roots)[5]) {
-    char module_path[MAX_PATH * 4]{};
-    GetModuleFileNameA(nullptr, module_path, static_cast<DWORD>(sizeof(module_path)));
-    roots[1] = parent_folder_of(module_path);
-    roots[2] = parent_folder_of(parent_folder_of(roots[1]));
-    roots[3] = parent_folder_of(level_path);
-    roots[4] = parent_folder_of(roots[3]);
-}
-
-bool gpu_load_global_texture(const char* relative_path, const std::string& level_path,
-                             ID3D11ShaderResourceView** output, std::string* why) {
+bool gpu_load_graphics_texture(const std::string& relative_path, ID3D11ShaderResourceView** output,
+                               std::string* why) {
     if (*output)
         return true;
-    std::string roots[5];
-    texture_search_roots(level_path, roots);
-    std::string last_error;
-    for (const std::string& root : roots) {
-        const std::string candidate = root.empty() ? relative_path : root + "\\" + relative_path;
-        if (!file_exists(candidate.c_str()))
-            continue;
-        if (gpu_create_dds_view(candidate.c_str(), output, &last_error))
-            return true;
+    char module_path[MAX_PATH * 4]{};
+    const DWORD module_path_length =
+        GetModuleFileNameA(nullptr, module_path, static_cast<DWORD>(sizeof(module_path)));
+    if (!module_path_length || module_path_length >= sizeof(module_path)) {
+        if (why)
+            *why = "Could not resolve the running executable path.";
+        return false;
     }
-    if (why)
-        *why = last_error.empty() ? std::string("Required target texture was not found: ") + relative_path
-                                  : last_error;
-    return false;
+    const std::string exe_dir = parent_folder_of(module_path);
+    if (exe_dir.empty()) {
+        if (why)
+            *why = "Could not resolve the running executable folder.";
+        return false;
+    }
+    const std::string path = exe_dir + "\\Graphics\\" + relative_path;
+    if (!file_exists(path.c_str())) {
+        if (why)
+            *why = "Required target texture was not found: " + path;
+        return false;
+    }
+    return gpu_create_dds_view(path.c_str(), output, why);
 }
 
-bool gpu_load_rain_sprite(const ChunkList* chunks, const std::string& level_path, std::string* why) {
-    const size_t slash = level_path.find_last_of("\\/");
+bool gpu_load_rain_sprite(const ChunkList* chunks, const std::string& source_path, std::string* why) {
+    const size_t slash = source_path.find_last_of("\\/");
     const std::string basename =
-        slash == std::string::npos ? level_path : level_path.substr(slash + 1);
+        slash == std::string::npos ? source_path : source_path.substr(slash + 1);
     std::vector<std::string> stems;
     const auto append_stem = [&stems](std::string stem) {
         if (stem.empty())
@@ -593,8 +591,6 @@ bool gpu_load_rain_sprite(const ChunkList* chunks, const std::string& level_path
     append_stem("rn_p01a");
     append_stem("droplet1");
 
-    std::string roots[5];
-    texture_search_roots(level_path, roots);
     std::string last_error;
     for (const std::string& stem : stems) {
         if (chunks) {
@@ -609,17 +605,11 @@ bool gpu_load_rain_sprite(const ChunkList* chunks, const std::string& level_path
                     return true;
             }
         }
-        for (const std::string& root : roots) {
-            const std::string candidate =
-                root.empty() ? "SpecialFX\\" + stem + ".dds"
-                             : root + "\\SpecialFX\\" + stem + ".dds";
-            if (file_exists(candidate.c_str()) &&
-                gpu_create_dds_view(candidate.c_str(), &gpu.rain_texture, &last_error))
-                return true;
-        }
+        if (gpu_load_graphics_texture("SpecialFX\\" + stem + ".dds", &gpu.rain_texture, &last_error))
+            return true;
     }
     if (why && why->empty())
-        *why = last_error.empty() ? "Rain is enabled, but no SpecialFX\\rn_p*.dds sprite was found."
+        *why = last_error.empty() ? "Rain is enabled, but no Graphics\\SpecialFX\\rn_p*.dds sprite was found."
                                   : last_error;
     return false;
 }
@@ -655,29 +645,14 @@ bool gpu_load_pc_environment_textures(const std::string& pc_path, uint32_t* load
             // DDS data, just like target type-2 texture resources, despite the
             // original engine path retaining its .bmp extension.
             if (!gpu.environment_splash) {
-                std::string roots[5];
-                texture_search_roots(pc_path, roots);
-                const std::string candidates[] = {
-                    "SpecialFX\\splash.dds",
-                    "SpecialFX\\splash.bmp",
-                    roots[1] + "\\SpecialFX\\splash.dds",
-                    roots[2] + "\\SpecialFX\\splash.dds",
-                    roots[3] + "\\SpecialFX\\splash.dds",
-                    roots[4] + "\\SpecialFX\\splash.dds",
-                };
-                for (const std::string& candidate : candidates) {
-                    if (candidate.empty() || !file_exists(candidate.c_str()))
-                        continue;
-                    std::string texture_error;
-                    if (gpu_create_dds_view(candidate.c_str(), &gpu.environment_splash, &texture_error)) {
-                        last_texture_error.clear();
-                        break;
-                    }
+                std::string texture_error;
+                if (gpu_load_graphics_texture("SpecialFX\\splash.dds", &gpu.environment_splash, &texture_error))
+                    last_texture_error.clear();
+                else
                     last_texture_error = std::move(texture_error);
-                }
             }
             if (!gpu.environment_splash && last_texture_error.empty())
-                last_texture_error = "Wet WTHR is enabled, but SpecialFX\\splash.dds was not found.";
+                last_texture_error = "Wet WTHR is enabled, but Graphics\\SpecialFX\\splash.dds was not found.";
         }
         for (GpuMaterialRange& range : gpu.material_ranges) {
             if (range.original_material_index < 0 ||
@@ -712,13 +687,11 @@ bool gpu_load_pc_environment_textures(const std::string& pc_path, uint32_t* load
         const bool needs_spheremap = gpu_has_material_flag(0x80u, true);
         std::string global_error;
         if (needs_detail &&
-            !gpu_load_global_texture("GraphicNovel\\detail.dds", pc_path,
-                                     &gpu.environment_detail, &global_error))
+            !gpu_load_graphics_texture("GraphicNovel\\detail.dds", &gpu.environment_detail, &global_error))
             last_texture_error = global_error;
         global_error.clear();
         if (needs_spheremap &&
-            !gpu_load_global_texture("SpecialFX\\spheremap1.dds", pc_path,
-                                     &gpu.environment_spheremap, &global_error))
+            !gpu_load_graphics_texture("SpecialFX\\spheremap1.dds", &gpu.environment_spheremap, &global_error))
             last_texture_error = global_error;
     }
     if (loaded_count)
@@ -839,12 +812,8 @@ bool gpu_reload_environment_textures(std::string* why, uint32_t* loaded_count,
     if (ok && g.document.rain_enabled) {
         const bool needs_splash = gpu_has_material_flag(0x4000u, false);
         if (needs_splash) {
-            const std::string& level_path = g.document.obj_path.empty()
-                                                ? g.document.source_pc_path
-                                                : g.document.obj_path;
             std::string splash_error;
-            if (!gpu_load_global_texture("SpecialFX\\splash.dds", level_path,
-                                         &gpu.environment_splash, &splash_error))
+            if (!gpu_load_graphics_texture("SpecialFX\\splash.dds", &gpu.environment_splash, &splash_error))
                 last_texture_error = std::move(splash_error);
         }
     }

@@ -563,8 +563,8 @@ bool load_spawn_puppets() {
     GetModuleFileNameA(nullptr, module_path, static_cast<DWORD>(sizeof(module_path)));
     const std::string module_folder = folder_from_path(module_path);
     std::vector<std::string> candidates = {
-        "MPChars.asr", module_folder + "\\MPChars.asr",
-        folder_from_path(folder_from_path(module_folder)) + "\\MPChars.asr"};
+        module_folder + "\\MPChars.asr",
+        module_folder + "\\Misc\\MPChars\\MPChars.asr"};
     for (const std::string& path : candidates) {
         if (path.empty() || !file_exists(path.c_str()))
             continue;
