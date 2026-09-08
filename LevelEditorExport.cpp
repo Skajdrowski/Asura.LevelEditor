@@ -1430,23 +1430,22 @@ bool make_pc_object_payload(const StaticObjectModel& model, Buffer* payload, Err
     const SpawnPuppet& mesh = model.mesh;
     if (mesh.vertices.empty() || mesh.faces.empty() || mesh.vertices.size() > 65535)
         return fail(err, "PS2 object %08X has no PC-compatible geometry", model.file_id);
-    if (mesh.faces.size() > (UINT32_MAX - 3u) / 6u + 1u)
+    if (mesh.faces.size() > ((UINT32_MAX - 3u) / 6u + 1u) / 2u)
         return fail(err, "PS2 object %08X has too many faces", model.file_id);
 
+    // PS2 static objects are submitted without backface culling. PC Object
+    // resources are culled by the target renderer, so preserve the PS2 result
+    // explicitly by emitting each decoded face in both winding directions.
+    const size_t output_face_count = mesh.faces.size() * 2u;
     std::vector<uint16_t> indices;
-    indices.reserve(3 + (mesh.faces.size() - 1) * 6);
-    for (size_t face_index = 0; face_index < mesh.faces.size(); ++face_index) {
-        const std::array<uint16_t, 3>& face = mesh.faces[face_index];
-        if (face[0] >= mesh.vertices.size() || face[1] >= mesh.vertices.size() ||
-            face[2] >= mesh.vertices.size())
-            return fail(err, "PS2 object %08X has an out-of-range face", model.file_id);
-        if (!face_index) {
+    indices.reserve(3 + (output_face_count - 1) * 6);
+    auto append_face = [&indices](const std::array<uint16_t, 3>& face) {
+        if (indices.empty()) {
             indices.insert(indices.end(), face.begin(), face.end());
-            continue;
+            return;
         }
         // Reset a single PC triangle strip with six degenerate indices. The
-        // even-sized bridge keeps every real source face on the same strip
-        // parity, so its winding is preserved exactly.
+        // even-sized bridge keeps every real face on the same strip parity.
         const uint16_t previous = indices.back();
         indices.push_back(previous);
         indices.push_back(previous);
@@ -1454,6 +1453,14 @@ bool make_pc_object_payload(const StaticObjectModel& model, Buffer* payload, Err
         indices.push_back(face[0]);
         indices.push_back(face[1]);
         indices.push_back(face[2]);
+    };
+    for (size_t face_index = 0; face_index < mesh.faces.size(); ++face_index) {
+        const std::array<uint16_t, 3>& face = mesh.faces[face_index];
+        if (face[0] >= mesh.vertices.size() || face[1] >= mesh.vertices.size() ||
+            face[2] >= mesh.vertices.size())
+            return fail(err, "PS2 object %08X has an out-of-range face", model.file_id);
+        append_face(face);
+        append_face({face[0], face[2], face[1]});
     }
     if (indices.size() > UINT32_MAX)
         return fail(err, "PS2 object %08X has too many strip indices", model.file_id);
@@ -1827,20 +1834,20 @@ bool pack_ps2_document(const Document& doc, const Mesh& mesh, const char* output
               ps2_environment_material_bindings(source, &materials, &err) &&
               obj_data_from_ps2_mesh(mesh, true, &render_obj, &render_material_names,
                                      &arena, &err) &&
-              obj_data_from_ps2_mesh(mesh, false, &collision_obj,
+              obj_data_from_ps2_mesh(mesh, true, &collision_obj,
                                      &collision_material_names, &arena, &err) &&
               validate_spawn_clearance(doc, collision_obj, cfg, &err) &&
               buffer_init(&output, cfg.output_reserve, &err);
     if (ok) {
-        // PS2 GS rendering is two-sided. Each source face contributes two
-        // render faces but one collision face, so scale the per-module limit
-        // by the same factor and retain identical spatial module boundaries.
-        Config render_cfg = cfg;
-        render_cfg.max_collision_polys =
-            cfg.max_collision_polys <= UINT32_MAX / 2u
-                ? cfg.max_collision_polys * 2u
-                : UINT32_MAX;
-        ok = build_env(render_cfg, render_obj, material_map, &arena, &scratch, &env, &err);
+        // PS2 environment packets are effectively two-sided. Their source
+        // winding is therefore not a reliable indication of which side must
+        // collide on PC either: keeping collision single-sided leaves the
+        // oppositely-wound source triangles as walk-through holes. Duplicate
+        // both render and collision faces, and keep the normal per-module cap
+        // so the collision AABB query never sees twice its intended polygon
+        // budget. Building both views with the same cap also preserves the
+        // one-to-one renderer/EMOD module layout.
+        ok = build_env(cfg, render_obj, material_map, &arena, &scratch, &env, &err);
         if (ok) {
             env_payload = env.payload;
             ok = build_env(cfg, collision_obj, material_map, &arena, &scratch,
@@ -1855,7 +1862,7 @@ bool pack_ps2_document(const Document& doc, const Mesh& mesh, const char* output
              env_view(collision_payload, &collision_view, &arena, &err) &&
              collision_view.module_count == view.module_count;
         if (!ok && !err.set)
-            fail(&err, "two-sided render and single-sided collision module counts disagree");
+            fail(&err, "two-sided render and collision module counts disagree");
     }
     if (ok) {
         metrics = arena_array<ModuleMetric>(&arena, view.module_count, &err);
