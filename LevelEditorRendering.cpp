@@ -110,6 +110,7 @@ struct GpuPuppetRange {
     uint32_t vertex_count = 0;
     const SpawnPuppetMaterial* material = nullptr;
     bool selected = false;
+    bool two_sided = false;
 };
 
 struct GpuModelTexture {
@@ -2069,7 +2070,8 @@ void append_gpu_spawn_puppet(const Entity& entity, bool selected, std::vector<Gp
         }
     }
     if (ranges && output->size() > start_vertex)
-        ranges->push_back({start_vertex, static_cast<uint32_t>(output->size()) - start_vertex, nullptr, selected});
+        ranges->push_back(
+            {start_vertex, static_cast<uint32_t>(output->size()) - start_vertex, nullptr, selected, true});
 }
 
 void append_gpu_entity_model(const Entity& entity, bool selected, std::vector<GpuVertex>* output,
@@ -2077,6 +2079,7 @@ void append_gpu_entity_model(const Entity& entity, bool selected, std::vector<Gp
     const SpawnPuppet* model = entity_render_model(entity);
     if (!model)
         return;
+    const bool two_sided = entity.kind == EntityKind::Pickup;
     for (uint32_t face_index = 0; face_index < model->faces.size(); ++face_index) {
         const auto& face = model->faces[face_index];
         const int32_t material_index = face_index < model->face_materials.size()
@@ -2107,10 +2110,11 @@ void append_gpu_entity_model(const Entity& entity, bool selected, std::vector<Gp
         if (ranges) {
             if (!ranges->empty() && ranges->back().material == material &&
                 ranges->back().selected == selected &&
+                ranges->back().two_sided == two_sided &&
                 ranges->back().start_vertex + ranges->back().vertex_count == start_vertex) {
                 ranges->back().vertex_count += 3;
             } else {
-                ranges->push_back({start_vertex, 3, material, selected});
+                ranges->push_back({start_vertex, 3, material, selected, two_sided});
             }
         }
     }
@@ -2177,6 +2181,8 @@ void gpu_draw_puppet_ranges(const std::vector<GpuPuppetRange>& ranges, bool sele
     for (const GpuPuppetRange& range : ranges) {
         if (range.selected != selected || !range.vertex_count)
             continue;
+        gpu.context->RSSetState(range.two_sided || !g.backface_culling ? gpu.rasterizer_no_cull
+                                                                       : gpu.rasterizer_cull_back);
         ID3D11ShaderResourceView* texture = gpu_model_texture_view(range.material);
         gpu.context->PSSetShaderResources(0, 1, &texture);
         gpu.context->Draw(range.vertex_count, range.start_vertex);
