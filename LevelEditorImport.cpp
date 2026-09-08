@@ -2370,9 +2370,9 @@ bool ps2_skybox_info(const ChunkList& chunks, PcSkyboxInfo* info, Error* err) {
         const ChunkRef& chunk = chunks.chunks[chunk_index];
         if (chunk.cid != ASURA_CHUNK_SKYBOX)
             continue;
-        // MCP1 Asura_Chunk_SkyBox::Process identifies v4 as seven padded
-        // strings followed by one 32-bit DrawClouds value. Versions before 6
-        // serialize left/back in the opposite order from the canonical slots.
+        // MCP2 sub_115FD0 identifies v4 as seven padded strings followed by
+        // one 32-bit DrawClouds value. The first six paths are passed straight
+        // to target renderer slots 0..5: lower, front, left, back, right, upper.
         if (chunk.version != 4 ||
             chunk.size < sizeof(Asura_Chunk_Header) +
                              sizeof(Asura_Chunk_SkyBox_PayloadPrefixV7) +
@@ -2399,9 +2399,7 @@ bool ps2_skybox_info(const ChunkList& chunks, PcSkyboxInfo* info, Error* err) {
             const Str name = padded_string_at(payload, payload_size, static_cast<uint32_t>(at));
             if (!name.data)
                 return fail(err, "the .PS2 SKYB texture table is truncated");
-            const uint32_t canonical_slot =
-                serialized_slot == 2 ? 3u : serialized_slot == 3 ? 2u : serialized_slot;
-            info->names[canonical_slot] = name;
+            info->names[serialized_slot] = name;
             at = align_up(at + name.size + 1, 4);
             if (at > payload_size)
                 return fail(err, "the .PS2 SKYB texture table is truncated");
