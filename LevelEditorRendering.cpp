@@ -1759,7 +1759,8 @@ float4 SkyCloudPSMain(SkyVSOutput input) : SV_TARGET {
         result = gpu.device->CreateShaderResourceView(white_texture, nullptr, &gpu.white_texture);
     gpu_release(white_texture);
     D3D11_SAMPLER_DESC sampler_desc{};
-    sampler_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    sampler_desc.Filter = D3D11_FILTER_ANISOTROPIC;
+    sampler_desc.MaxAnisotropy = 16;
     sampler_desc.AddressU = sampler_desc.AddressV = sampler_desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
     sampler_desc.MaxLOD = D3D11_FLOAT32_MAX;
     if (FAILED(result) || FAILED(gpu.device->CreateSamplerState(&sampler_desc, &gpu.skybox_sampler))) {
