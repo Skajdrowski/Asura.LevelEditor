@@ -27,3 +27,26 @@
 #include <string>
 #include <vector>
 
+namespace editor {
+
+inline DWORD executable_folder(wchar_t* folder, DWORD capacity) {
+    if (!folder || !capacity)
+        return 0;
+    const DWORD length = GetModuleFileNameW(nullptr, folder, capacity);
+    if (!length || length >= capacity) {
+        folder[0] = 0;
+        return 0;
+    }
+    wchar_t* slash = nullptr;
+    for (wchar_t* at = folder; *at; ++at)
+        if (*at == L'\\' || *at == L'/')
+            slash = at;
+    if (!slash) {
+        folder[0] = 0;
+        return 0;
+    }
+    *slash = 0;
+    return static_cast<DWORD>(slash - folder);
+}
+
+} // namespace editor

@@ -2,8 +2,36 @@
 
 using namespace editor;
 
+namespace {
+
+bool check_game_root() {
+    wchar_t module_path[MAX_PATH]{};
+    const DWORD length = GetModuleFileNameW(nullptr, module_path,
+                                            static_cast<DWORD>(_countof(module_path)));
+    if (length == 0 || length >= _countof(module_path))
+        return false;
+
+    std::wstring sniper_path(module_path, length);
+    const size_t slash = sniper_path.find_last_of(L"\\/");
+    sniper_path.resize(slash == std::wstring::npos ? 0 : slash + 1);
+    sniper_path += L"SniperElite.exe";
+
+    const DWORD attributes = GetFileAttributesW(sniper_path.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+} // namespace
+
 int APIENTRY WinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE, _In_ LPSTR command_line, _In_ int show) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+    if (!check_game_root()) {
+        MessageBoxW(nullptr,
+                    L"Editor won't be able to show spawnpoint puppets or material shading in it's viewport. Place the Editor's executable in "
+                    L"Sniper Elite directory and restart for a fix.",
+                    L"Level Editor isn't running in game's folder", MB_OK | MB_ICONWARNING);
+    }
+
     load_spawn_puppets();
 
     WNDCLASSEXA viewport_class{};

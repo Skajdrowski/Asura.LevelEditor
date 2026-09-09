@@ -12,12 +12,9 @@ namespace asura::level {
 // Keep a complete module query comfortably below that workspace limit.
 constexpr uint32_t kDefaultMaxCollisionPolys = 3000;
 
-bool parse_chunks(const char* path, ChunkList* out, Arena* arena, Error* err) {
-    memset(out, 0, sizeof(*out));
-    if (!map_asura_file(path, &out->file, err))
-        return false;
+bool parse_chunks_impl(const char* display_path, ChunkList* out, Arena* arena, Error* err) {
     if (out->file.size < 8 || memcmp(out->file.data, kAsuraMagic, 8) != 0)
-        return fail(err, "'%s' is not an Asura file", path);
+        return fail(err, "'%s' is not an Asura file", display_path);
 
     uint64_t off = 8;
     uint32_t count = 0;
@@ -28,7 +25,8 @@ bool parse_chunks(const char* path, ChunkList* out, Arena* arena, Error* err) {
         if (!cid || !size)
             break;
         if (size < sizeof(Asura_Chunk_Header) || size > out->file.size - off)
-            return fail(err, "'%s' has an invalid chunk at 0x%llx", path, static_cast<unsigned long long>(off));
+            return fail(err, "'%s' has an invalid chunk at 0x%llx", display_path,
+                        static_cast<unsigned long long>(off));
         ++count;
         off += size;
     }
@@ -44,6 +42,20 @@ bool parse_chunks(const char* path, ChunkList* out, Arena* arena, Error* err) {
         off += size;
     }
     return true;
+}
+
+bool parse_chunks(const char* path, ChunkList* out, Arena* arena, Error* err) {
+    memset(out, 0, sizeof(*out));
+    if (!map_asura_file(path, &out->file, err))
+        return false;
+    return parse_chunks_impl(path, out, arena, err);
+}
+
+bool parse_chunks(const wchar_t* path, ChunkList* out, Arena* arena, Error* err) {
+    memset(out, 0, sizeof(*out));
+    if (!map_asura_file(path, &out->file, err))
+        return false;
+    return parse_chunks_impl("<Unicode path>", out, arena, err);
 }
 
 Str padded_string_at(const uint8_t* data, uint32_t size, uint32_t at) {

@@ -199,22 +199,20 @@ private:
 
 } // namespace
 
-bool map_asura_file(const char* path, MappedFile* out, Error* err) {
+bool map_asura_file_impl(MappedFile* source, const char* display_path, MappedFile* out, Error* err) {
     memset(out, 0, sizeof(*out));
     out->file = INVALID_HANDLE_VALUE;
-    MappedFile source{};
-    if (!map_file(path, &source, err))
-        return false;
-    if (source.size < sizeof(kCompressedMagic) ||
-        memcmp(source.data, kCompressedMagic, sizeof(kCompressedMagic)) != 0) {
-        *out = source;
+    if (source->size < sizeof(kCompressedMagic) ||
+        memcmp(source->data, kCompressedMagic, sizeof(kCompressedMagic)) != 0) {
+        *out = *source;
+        memset(source, 0, sizeof(*source));
         return true;
     }
 
     HuffmanPackage package{};
     DecodeEntry table[kDecodeTableSize]{};
-    if (!read_package(source, &package, err) || !make_decode_table(package, table, err)) {
-        unmap_file(&source);
+    if (!read_package(*source, &package, err) || !make_decode_table(package, table, err)) {
+        unmap_file(source);
         return false;
     }
 
@@ -223,34 +221,48 @@ bool map_asura_file(const char* path, MappedFile* out, Error* err) {
         PAGE_READWRITE));
     if (!expanded) {
         const DWORD code = GetLastError();
-        unmap_file(&source);
+        unmap_file(source);
         return fail(err, "cannot allocate %u bytes to decompress '%s' (win32=%lu)",
-                    package.uncompressed_size, path, code);
+                    package.uncompressed_size, display_path, code);
     }
 
-    HuffmanDecoder decoder(package, source.data + kCompressedHeaderSize, table);
+    HuffmanDecoder decoder(package, source->data + kCompressedHeaderSize, table);
     uint32_t produced = 0;
     const bool decoded = decoder.decompress(expanded, package.uncompressed_size, &produced, err);
     if (!decoded || produced != package.uncompressed_size ||
         package.uncompressed_size < sizeof(kPlainMagic) ||
         memcmp(expanded, kPlainMagic, sizeof(kPlainMagic)) != 0) {
         if (decoded && produced != package.uncompressed_size)
-            fail(err, "'%s' decompressed to %u bytes, expected %u", path, produced,
+            fail(err, "'%s' decompressed to %u bytes, expected %u", display_path, produced,
                  package.uncompressed_size);
         else if (decoded && !err->set)
-            fail(err, "'%s' did not decompress to an Asura file", path);
+            fail(err, "'%s' did not decompress to an Asura file", display_path);
         VirtualFree(expanded, 0, MEM_RELEASE);
-        unmap_file(&source);
+        unmap_file(source);
         return false;
     }
 
-    unmap_file(&source);
+    unmap_file(source);
     out->file = INVALID_HANDLE_VALUE;
     out->data = expanded;
     out->owned_data = expanded;
     out->size = package.uncompressed_size;
-    out->path = path;
+    out->path = display_path;
     return true;
+}
+
+bool map_asura_file(const char* path, MappedFile* out, Error* err) {
+    MappedFile source{};
+    if (!map_file(path, &source, err))
+        return false;
+    return map_asura_file_impl(&source, path, out, err);
+}
+
+bool map_asura_file(const wchar_t* path, MappedFile* out, Error* err) {
+    MappedFile source{};
+    if (!map_file(path, &source, err))
+        return false;
+    return map_asura_file_impl(&source, "<Unicode path>", out, err);
 }
 
 } // namespace asura

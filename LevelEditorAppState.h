@@ -48,7 +48,7 @@ struct AppState {
     Mesh mesh;
     EnvironmentRaycast environment_raycast;
     std::array<SpawnPuppet, 3> spawn_puppets;
-    std::string spawn_puppet_source;
+    bool spawn_puppets_loaded = false;
     std::vector<PickupModel> pickup_models;
     std::vector<StaticObjectModel> static_object_models;
     std::vector<uint8_t> sound_preview_bytes;

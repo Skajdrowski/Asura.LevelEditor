@@ -559,20 +559,29 @@ bool decode_spawn_puppet(const RscfInfo& resource, const char* expected_name, Sp
 }
 
 bool load_spawn_puppets() {
-    char module_path[MAX_PATH * 4]{};
-    GetModuleFileNameA(nullptr, module_path, static_cast<DWORD>(sizeof(module_path)));
-    const std::string module_folder = folder_from_path(module_path);
-    std::vector<std::string> candidates = {
-        module_folder + "\\MPChars.asr",
-        module_folder + "\\Misc\\MPChars\\MPChars.asr"};
-    for (const std::string& path : candidates) {
-        if (path.empty() || !file_exists(path.c_str()))
+    wchar_t path[MAX_PATH]{};
+    const DWORD folder_length = executable_folder(path, static_cast<DWORD>(_countof(path)));
+    if (!folder_length) {
+        g.spawn_puppets = {};
+        g.spawn_puppets_loaded = false;
+        return false;
+    }
+    constexpr wchar_t suffixes[][32] = {
+        L"\\MPChars.asr", L"\\Misc\\MPChars\\MPChars.asr"};
+    for (const auto& suffix : suffixes) {
+        size_t suffix_length = 0;
+        while (suffix[suffix_length])
+            ++suffix_length;
+        if (folder_length + suffix_length >= _countof(path))
+            continue;
+        memcpy(path + folder_length, suffix, (suffix_length + 1) * sizeof(wchar_t));
+        if (!file_exists(path))
             continue;
         Arena arena{};
         Error error{};
         ChunkList chunks{};
         std::array<SpawnPuppet, 3> puppets;
-        bool parsed = arena_init(&arena, 16 * MiB, &error) && parse_chunks(path.c_str(), &chunks, &arena, &error);
+        bool parsed = arena_init(&arena, 16 * MiB, &error) && parse_chunks(path, &chunks, &arena, &error);
         if (parsed) {
             for (uint32_t i = 0; i < chunks.count; ++i) {
                 RscfInfo resource{};
@@ -590,12 +599,12 @@ bool load_spawn_puppets() {
         arena_release(&arena);
         if (parsed && !puppets[0].faces.empty() && !puppets[1].faces.empty() && !puppets[2].faces.empty()) {
             g.spawn_puppets = std::move(puppets);
-            g.spawn_puppet_source = path;
+            g.spawn_puppets_loaded = true;
             return true;
         }
     }
     g.spawn_puppets = {};
-    g.spawn_puppet_source.clear();
+    g.spawn_puppets_loaded = false;
     return false;
 }
 
@@ -4031,7 +4040,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
         rebuild_ui_font();
         create_controls();
         reset_history(true);
-        if (g.spawn_puppet_source.empty())
+        if (!g.spawn_puppets_loaded)
             set_status("MPChars.asr was not found or is incompatible; spawnpoints use fallback markers.");
         DragAcceptFiles(hwnd, TRUE);
         return 0;

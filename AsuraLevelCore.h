@@ -165,6 +165,7 @@ struct Sounds {
 };
 
 bool parse_chunks(const char* path, ChunkList* out, Arena* arena, Error* err);
+bool parse_chunks(const wchar_t* path, ChunkList* out, Arena* arena, Error* err);
 Str padded_string_at(const uint8_t* data, uint32_t size, uint32_t at);
 bool rscf_info(const ChunkRef& chunk, RscfInfo* out);
 ChunkMark begin_chunk(Buffer* out, ASURA_CHUNKID cid, uint32_t version, uint32_t flags, Error* err);

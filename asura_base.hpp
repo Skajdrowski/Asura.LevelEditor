@@ -423,38 +423,48 @@ struct MappedFile {
     const char *path;
 };
 
-inline bool map_file(const char *path, MappedFile *out, Error *err) {
+inline bool map_file_handle(HANDLE f, const char *display_path, MappedFile *out, Error *err) {
     memset(out, 0, sizeof(*out));
     out->file = INVALID_HANDLE_VALUE;
-    out->path = path;
-    HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                           FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    out->path = display_path;
     if (f == INVALID_HANDLE_VALUE)
-        return fail(err, "cannot open '%s' (win32=%lu)", path, GetLastError());
+        return fail(err, "cannot open '%s' (win32=%lu)", display_path, GetLastError());
     LARGE_INTEGER size{};
     if (!GetFileSizeEx(f, &size) || size.QuadPart < 0) {
         CloseHandle(f);
-        return fail(err, "cannot stat '%s' (win32=%lu)", path, GetLastError());
+        return fail(err, "cannot stat '%s' (win32=%lu)", display_path, GetLastError());
     }
     out->file = f;
     out->size = static_cast<uint64_t>(size.QuadPart);
     if (!out->size)
         return true;
-    HANDLE mapping = CreateFileMappingA(f, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    HANDLE mapping = CreateFileMappingW(f, nullptr, PAGE_READONLY, 0, 0, nullptr);
     if (!mapping) {
         CloseHandle(f);
         out->file = INVALID_HANDLE_VALUE;
-        return fail(err, "cannot map '%s' (win32=%lu)", path, GetLastError());
+        return fail(err, "cannot map '%s' (win32=%lu)", display_path, GetLastError());
     }
     const void *data = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
     if (!data) {
         CloseHandle(mapping); CloseHandle(f);
         out->file = INVALID_HANDLE_VALUE;
-        return fail(err, "cannot view '%s' (win32=%lu)", path, GetLastError());
+        return fail(err, "cannot view '%s' (win32=%lu)", display_path, GetLastError());
     }
     out->mapping = mapping;
     out->data = static_cast<const uint8_t *>(data);
     return true;
+}
+
+inline bool map_file(const char *path, MappedFile *out, Error *err) {
+    HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    return map_file_handle(f, path, out, err);
+}
+
+inline bool map_file(const wchar_t *path, MappedFile *out, Error *err) {
+    HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    return map_file_handle(f, "<Unicode path>", out, err);
 }
 
 inline void unmap_file(MappedFile *f) {
@@ -491,6 +501,10 @@ inline bool write_entire_file(const char *path, const void *data, uint64_t size,
 
 inline bool file_exists(const char *path) {
     const DWORD a = GetFileAttributesA(path);
+    return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
+}
+inline bool file_exists(const wchar_t *path) {
+    const DWORD a = GetFileAttributesW(path);
     return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
 }
 inline bool dir_exists(const char *path) {

@@ -524,40 +524,49 @@ bool gpu_create_dds_view(const char* path, ID3D11ShaderResourceView** output, st
     return gpu_create_dds_view_from_memory(bytes.data(), bytes.size(), path, output, why);
 }
 
-
 bool pc_texture_resource(const ChunkList& chunks, Str texture_name, RscfInfo* output);
 bool gpu_has_material_flag(uint32_t mask, bool require_texture);
-
-std::string parent_folder_of(const std::string& path) {
-    const size_t slash = path.find_last_of("\\/");
-    return slash == std::string::npos ? std::string{} : path.substr(0, slash);
-}
 
 bool gpu_load_graphics_texture(const std::string& relative_path, ID3D11ShaderResourceView** output,
                                std::string* why) {
     if (*output)
         return true;
-    char module_path[MAX_PATH * 4]{};
-    const DWORD module_path_length =
-        GetModuleFileNameA(nullptr, module_path, static_cast<DWORD>(sizeof(module_path)));
-    if (!module_path_length || module_path_length >= sizeof(module_path)) {
-        if (why)
-            *why = "Could not resolve the running executable path.";
-        return false;
-    }
-    const std::string exe_dir = parent_folder_of(module_path);
-    if (exe_dir.empty()) {
+    wchar_t path[MAX_PATH]{};
+    const DWORD folder_length = executable_folder(path, static_cast<DWORD>(_countof(path)));
+    if (!folder_length) {
         if (why)
             *why = "Could not resolve the running executable folder.";
         return false;
     }
-    const std::string path = exe_dir + "\\Graphics\\" + relative_path;
-    if (!file_exists(path.c_str())) {
+    constexpr wchar_t graphics_folder[] = L"\\Graphics\\";
+    constexpr size_t graphics_length = _countof(graphics_folder) - 1;
+    const size_t prefix_length = folder_length + graphics_length;
+    if (relative_path.size() >= _countof(path) - prefix_length) {
         if (why)
-            *why = "Required target texture was not found: " + path;
+            *why = "Required target texture path is too long.";
         return false;
     }
-    return gpu_create_dds_view(path.c_str(), output, why);
+    memcpy(path + folder_length, graphics_folder, graphics_length * sizeof(wchar_t));
+    for (size_t i = 0; i < relative_path.size(); ++i)
+        path[prefix_length + i] = static_cast<unsigned char>(relative_path[i]);
+    path[prefix_length + relative_path.size()] = 0;
+    MappedFile file{};
+    Error error{};
+    if (!map_file(path, &file, &error)) {
+        if (why)
+            *why = "Required target texture was not found: Graphics\\" + relative_path;
+        return false;
+    }
+    if (file.size > 512 * MiB || file.size > static_cast<uint64_t>(SIZE_MAX)) {
+        if (why)
+            *why = "Texture is not a valid DDS file: " + relative_path;
+        unmap_file(&file);
+        return false;
+    }
+    const bool ok = gpu_create_dds_view_from_memory(file.data, static_cast<size_t>(file.size),
+                                                    relative_path.c_str(), output, why);
+    unmap_file(&file);
+    return ok;
 }
 
 bool gpu_load_rain_sprite(const ChunkList* chunks, const std::string& source_path, std::string* why) {
@@ -594,16 +603,15 @@ bool gpu_load_rain_sprite(const ChunkList* chunks, const std::string& source_pat
     std::string last_error;
     for (const std::string& stem : stems) {
         if (chunks) {
-            for (const char* extension : {".tga", ".dds"}) {
-                const std::string resource_name = "\\specialfx\\" + stem + extension;
-                RscfInfo resource{};
-                if (!pc_texture_resource(*chunks, str_from_c(resource_name.c_str()), &resource))
-                    continue;
-                if (gpu_create_dds_view_from_memory(resource.payload, resource.payload_size,
-                                                    resource_name.c_str(), &gpu.rain_texture,
-                                                    &last_error))
-                    return true;
-            }
+            const std::string resource_name = "\\SpecialFX\\" + stem + ".dds";
+            RscfInfo resource{};
+
+            if (!pc_texture_resource(*chunks, str_from_c(resource_name.c_str()), &resource))
+                continue;
+            if (gpu_create_dds_view_from_memory(resource.payload, resource.payload_size,
+                resource_name.c_str(), &gpu.rain_texture,
+                &last_error))
+                return true;
         }
         if (gpu_load_graphics_texture("SpecialFX\\" + stem + ".dds", &gpu.rain_texture, &last_error))
             return true;
