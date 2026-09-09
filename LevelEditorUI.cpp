@@ -2941,8 +2941,75 @@ void command_export() {
 }
 
 void command_export_obj() {
+    normalize_selection_state();
+    const bool selected_static_object =
+        g.selected_entities.size() == 1 && valid_entity_index(g.selected_entities.front()) &&
+        g.document.entities[g.selected_entities.front()].kind == EntityKind::StaticObject;
+    if (selected_static_object) {
+        const Entity& entity = g.document.entities[g.selected_entities.front()];
+        const EntityModel* model = entity_render_model(entity);
+        if (!model) {
+            MessageBoxA(g.window, "The selected static Object has no loaded model geometry.",
+                        "Could not export OBJ", MB_ICONERROR);
+            return;
+        }
+
+        std::string folder_source = !g.document.source_pc_path.empty() ? g.document.source_pc_path
+                                                                       : g.document.obj_path;
+        const size_t folder_slash = folder_source.find_last_of("\\/");
+        const std::string folder = folder_slash == std::string::npos
+                                       ? std::string{}
+                                       : folder_source.substr(0, folder_slash + 1);
+
+        std::string object_type;
+        if (const StaticObjectTemplate* object =
+                find_static_object_template(g.document, entity.value_u32_b, true))
+            object_type = object->resource_name;
+        if (object_type.empty())
+            object_type = model->resource_name;
+        if (object_type.empty())
+            object_type = entity.name;
+
+        const size_t type_slash = object_type.find_last_of("\\/");
+        if (type_slash != std::string::npos)
+            object_type.erase(0, type_slash + 1);
+        const size_t type_dot = object_type.find_last_of('.');
+        if (type_dot != std::string::npos)
+            object_type.resize(type_dot);
+        for (char& c : object_type) {
+            const unsigned char byte = static_cast<unsigned char>(c);
+            if (byte < 32 || c == '<' || c == '>' || c == ':' || c == '"' ||
+                c == '/' || c == '\\' || c == '|' || c == '?' || c == '*')
+                c = '_';
+        }
+        while (!object_type.empty() && (object_type.back() == ' ' || object_type.back() == '.'))
+            object_type.pop_back();
+        if (object_type.empty())
+            object_type = "object";
+
+        std::string path = folder + object_type + ".obj";
+        if (!choose_path(g.window, true, "Export selected static Object as Wavefront OBJ",
+                         "Wavefront OBJ\0*.obj\0All files\0*.*\0", "obj", &path))
+            return;
+
+        set_status("Exporting selected Object geometry, materials, and embedded textures...");
+        UpdateWindow(g.window);
+        SetCursor(LoadCursor(nullptr, IDC_WAIT));
+        std::string result;
+        const bool ok = export_static_object_obj(entity, *model, path.c_str(), &result);
+        SetCursor(LoadCursor(nullptr, IDC_ARROW));
+        if (!ok) {
+            set_status("OBJ export failed.");
+            MessageBoxA(g.window, result.c_str(), "Could not export OBJ", MB_ICONERROR);
+            return;
+        }
+        set_status(result.c_str());
+        MessageBoxA(g.window, result.c_str(), "OBJ export complete", MB_ICONINFORMATION);
+        return;
+    }
+
     if (g.document.source_pc_path.empty()) {
-        MessageBoxA(g.window, "Open an original .PC level before exporting its Env.",
+        MessageBoxA(g.window, "Open an original .PC level before exporting its geometry.\nOr select a static object to export it's model.",
                     "Could not export OBJ", MB_ICONERROR);
         return;
     }

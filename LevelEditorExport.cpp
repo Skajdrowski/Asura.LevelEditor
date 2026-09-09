@@ -1435,7 +1435,251 @@ bool write_obj_texture(const std::string& path, const RscfInfo& resource, Error*
     return true;
 }
 
+bool write_obj_texture(const std::string& path, const std::vector<uint8_t>& bytes, Error* err) {
+    if (bytes.size() < 4 || memcmp(bytes.data(), "DDS ", 4) != 0)
+        return fail(err, "object texture resource is not DDS data: %s", path.c_str());
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    if (!file)
+        return fail(err, "could not create OBJ texture: %s", path.c_str());
+    file.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    if (!file)
+        return fail(err, "could not write OBJ texture: %s", path.c_str());
+    return true;
+}
+
+Asura_Vector_3 obj_rotate_by_quaternion(Asura_Vector_3 value, const Asura_Quat& rotation) {
+    const Asura_Vector_3 q{rotation.x, rotation.y, rotation.z};
+    const Asura_Vector_3 twice_cross{
+        2.0f * (q.y * value.z - q.z * value.y),
+        2.0f * (q.z * value.x - q.x * value.z),
+        2.0f * (q.x * value.y - q.y * value.x)};
+    const Asura_Vector_3 q_cross_twice{
+        q.y * twice_cross.z - q.z * twice_cross.y,
+        q.z * twice_cross.x - q.x * twice_cross.z,
+        q.x * twice_cross.y - q.y * twice_cross.x};
+    return {value.x + rotation.w * twice_cross.x + q_cross_twice.x,
+            value.y + rotation.w * twice_cross.y + q_cross_twice.y,
+            value.z + rotation.w * twice_cross.z + q_cross_twice.z};
+}
+
+Asura_Vector_3 obj_static_object_vector(Asura_Vector_3 value, const Asura_Quat& rotation) {
+    value = obj_rotate_by_quaternion(value, rotation);
+    // PC object geometry and entity transforms are in game coordinates. OBJ
+    // authoring uses the same inverse Y/Z conversion as the environment export.
+    value.y = -value.y;
+    value.z = -value.z;
+    return value;
+}
+
+Asura_Vector_3 obj_static_object_position(Asura_Vector_3 value, const Entity& entity,
+                                          const Asura_Quat& rotation) {
+    value = obj_rotate_by_quaternion(value, rotation);
+    value.x += entity.position.x;
+    value.y += entity.position.y;
+    value.z += entity.position.z;
+    value.y = -value.y;
+    value.z = -value.z;
+    return value;
+}
+
+Asura_Vector_3 obj_normalized(Asura_Vector_3 value) {
+    const float length = sqrtf(value.x * value.x + value.y * value.y + value.z * value.z);
+    if (length <= 1.0e-5f)
+        return {0, 1, 0};
+    const float inverse = 1.0f / length;
+    return {value.x * inverse, value.y * inverse, value.z * inverse};
+}
+
 } // namespace
+
+bool export_static_object_obj(const Entity& entity, const EntityModel& model,
+                              const char* output_path, std::string* why) {
+    if (entity.kind != EntityKind::StaticObject || !output_path || !*output_path) {
+        if (why)
+            *why = "Select one static Object and choose an OBJ output path first.";
+        return false;
+    }
+    if (model.vertices.empty() || model.faces.empty()) {
+        if (why)
+            *why = "The selected static Object has no loaded model geometry.";
+        return false;
+    }
+
+    Error err{};
+    bool ok = true;
+    for (const auto& face : model.faces) {
+        for (uint16_t index : face) {
+            if (index >= model.vertices.size()) {
+                ok = fail(&err, "the selected Object model contains an out-of-range vertex index");
+                break;
+            }
+        }
+        if (!ok)
+            break;
+    }
+
+    std::vector<int32_t> material_indices;
+    if (ok) {
+        material_indices.reserve(model.faces.size());
+        for (size_t face_index = 0; face_index < model.faces.size(); ++face_index) {
+            const int32_t material_index = face_index < model.face_materials.size()
+                                               ? model.face_materials[face_index]
+                                               : -1;
+            material_indices.push_back(material_index);
+        }
+        std::sort(material_indices.begin(), material_indices.end());
+        material_indices.erase(std::unique(material_indices.begin(), material_indices.end()),
+                               material_indices.end());
+    }
+
+    const std::string obj_path = output_path ? output_path : "";
+    const std::string folder = obj_export_folder(obj_path);
+    const std::string stem = obj_export_stem(obj_path);
+    const std::string mtl_name = stem + ".mtl";
+    const std::string texture_folder_name = "textures";
+    const std::string mtl_path = obj_export_join(folder, mtl_name);
+    const std::string texture_folder = obj_export_join(folder, texture_folder_name);
+    if (ok && stem.empty())
+        ok = fail(&err, "the OBJ output path has no file name");
+    if (ok && !CreateDirectoryA(texture_folder.c_str(), nullptr) &&
+        GetLastError() != ERROR_ALREADY_EXISTS)
+        ok = fail(&err, "could not create OBJ texture folder '%s' (win32=%lu)",
+                  texture_folder.c_str(), GetLastError());
+
+    uint32_t texture_count = 0;
+    uint32_t missing_texture_count = 0;
+    std::vector<std::string> extracted_texture_names;
+    std::vector<std::string> used_texture_filenames;
+    std::ofstream mtl;
+    if (ok) {
+        mtl.open(mtl_path, std::ios::binary | std::ios::trunc);
+        if (!mtl)
+            ok = fail(&err, "could not create OBJ material library: %s", mtl_path.c_str());
+    }
+    if (ok) {
+        mtl << "# Sniper Elite 2005 static Object materials\n";
+        for (int32_t material_index : material_indices) {
+            if (material_index < 0)
+                continue;
+            const std::string material_name = obj_material_name(material_index);
+            mtl << "\nnewmtl " << material_name << "\n"
+                << "Ka 1.000000 1.000000 1.000000\n"
+                << "Kd 1.000000 1.000000 1.000000\n"
+                << "Ks 0.000000 0.000000 0.000000\n"
+                << "d 1.000000\n"
+                << "illum 1\n";
+            if (static_cast<uint32_t>(material_index) >= model.materials.size())
+                continue;
+
+            const EntityModelMaterial& material = model.materials[material_index];
+            if (material.texture_bytes.empty()) {
+                if (!material.texture_name.empty())
+                    ++missing_texture_count;
+                continue;
+            }
+
+            const Str texture_resource_name{material.texture_name.data(),
+                                            static_cast<uint32_t>(material.texture_name.size())};
+            std::string source_key = obj_texture_identity(texture_resource_name);
+            if (source_key.empty())
+                source_key = material_name;
+
+            std::string texture_name;
+            const std::string* extracted = obj_extracted_texture_name(extracted_texture_names, source_key);
+            if (extracted) {
+                texture_name = *extracted;
+            } else {
+                const std::string texture_stem = obj_texture_stem(texture_resource_name);
+                texture_name = texture_stem + ".dds";
+                uint32_t suffix = 2;
+                while (obj_texture_filename_is_used(
+                    used_texture_filenames, obj_texture_filename_key(texture_name))) {
+                    texture_name = texture_stem + "_" + std::to_string(suffix++) + ".dds";
+                }
+                const std::string texture_path = obj_export_join(texture_folder, texture_name);
+                if (!write_obj_texture(texture_path, material.texture_bytes, &err)) {
+                    ok = false;
+                    break;
+                }
+                extracted_texture_names.push_back(source_key);
+                extracted_texture_names.push_back(texture_name);
+                used_texture_filenames.push_back(obj_texture_filename_key(texture_name));
+                ++texture_count;
+            }
+            const std::string relative_texture_path = texture_folder_name + '/' + texture_name;
+            mtl << "map_Kd " << relative_texture_path << "\n";
+            if ((material.flags & 0x2u) != 0)
+                mtl << "map_d " << relative_texture_path << "\n";
+        }
+        if (ok && !mtl)
+            ok = fail(&err, "could not write OBJ material library: %s", mtl_path.c_str());
+    }
+    mtl.close();
+
+    std::ofstream obj;
+    if (ok) {
+        obj.open(obj_path, std::ios::binary | std::ios::trunc);
+        if (!obj)
+            ok = fail(&err, "could not create Wavefront OBJ: %s", obj_path.c_str());
+    }
+    if (ok) {
+        const Asura_Quat rotation = euler_quaternion(entity.rotation);
+        obj << "# Sniper Elite 2005 selected static Object\n"
+            << "mtllib " << mtl_name << "\n"
+            << "o " << stem << "\n" << std::setprecision(9);
+        for (const EntityModelVertex& vertex : model.vertices) {
+            const Asura_Vector_3 position = obj_static_object_position(vertex.position, entity, rotation);
+            obj << "v " << position.x << ' ' << position.y << ' ' << position.z << '\n';
+        }
+        for (const EntityModelVertex& vertex : model.vertices)
+            obj << "vt " << vertex.texcoord.x << ' ' << (1.0f - vertex.texcoord.y) << '\n';
+        for (const EntityModelVertex& vertex : model.vertices) {
+            const Asura_Vector_3 normal = obj_normalized(obj_static_object_vector(vertex.normal, rotation));
+            obj << "vn " << normal.x << ' ' << normal.y << ' ' << normal.z << '\n';
+        }
+        obj << "s off\n";
+        for (int32_t material_index : material_indices) {
+            if (material_index >= 0)
+                obj << "g " << obj_material_name(material_index) << "\nusemtl "
+                    << obj_material_name(material_index) << "\n";
+            else
+                obj << "g unmaterialed\n";
+            for (size_t face_index = 0; face_index < model.faces.size(); ++face_index) {
+                const int32_t face_material = face_index < model.face_materials.size()
+                                                  ? model.face_materials[face_index]
+                                                  : -1;
+                if (face_material != material_index)
+                    continue;
+                const auto& face = model.faces[face_index];
+                obj << 'f';
+                // The preview decoder reversed winding for its single Y reflection.
+                // OBJ applies the inverse Y/Z game conversion, so undo that reversal.
+                const uint16_t export_order[] = {face[0], face[2], face[1]};
+                for (uint16_t vertex_index : export_order) {
+                    const uint64_t obj_index = static_cast<uint64_t>(vertex_index) + 1;
+                    obj << ' ' << obj_index << '/' << obj_index << '/' << obj_index;
+                }
+                obj << '\n';
+            }
+        }
+        if (!obj)
+            ok = fail(&err, "could not write Wavefront OBJ: %s", obj_path.c_str());
+    }
+    obj.close();
+
+    if (ok && why) {
+        *why = "Exported selected Object with " + std::to_string(model.vertices.size()) +
+               " vertices, " + std::to_string(model.faces.size()) + " triangles, " +
+               std::to_string(material_indices.size()) + " material groups, and " +
+               std::to_string(texture_count) + " DDS textures to " + texture_folder_name + ".";
+        if (missing_texture_count)
+            *why += " " + std::to_string(missing_texture_count) +
+                    " referenced textures were not loaded with the Object model.";
+    } else if (!ok && why) {
+        *why = err.set ? err.message : "Could not export the selected static Object as Wavefront OBJ.";
+    }
+    return ok;
+}
 
 bool export_pc_environment_obj(const std::string& source_pc_path, const char* output_path,
                                std::string* why) {
