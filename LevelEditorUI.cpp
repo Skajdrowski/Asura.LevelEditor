@@ -406,7 +406,7 @@ bool environment_occludes_view_position(const Asura_Vector_3& view_position) {
 void set_status(const char* text) { SetWindowTextA(g.status, text ? text : ""); }
 
 void update_title() {
-    std::string title = "Asura 2005 Level Editor (Unfinished)";
+    std::string title = "Asura 2005 Level Editor";
     const std::string& display_path = !g.document.project_path.empty() ? g.document.project_path
                                       : !g.document.source_pc_path.empty() ? g.document.source_pc_path
                                                                           : g.document.obj_path;
