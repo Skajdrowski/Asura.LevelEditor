@@ -569,7 +569,7 @@ bool gpu_load_graphics_texture(const std::string& relative_path, ID3D11ShaderRes
     return ok;
 }
 
-bool gpu_load_rain_sprite(const ChunkList* chunks, const std::string& source_path, std::string* why) {
+bool gpu_load_rain_sprite(const std::string& source_path, std::string* why) {
     const size_t slash = source_path.find_last_of("\\/");
     const std::string basename =
         slash == std::string::npos ? source_path : source_path.substr(slash + 1);
@@ -602,17 +602,6 @@ bool gpu_load_rain_sprite(const ChunkList* chunks, const std::string& source_pat
 
     std::string last_error;
     for (const std::string& stem : stems) {
-        if (chunks) {
-            const std::string resource_name = "\\SpecialFX\\" + stem + ".dds";
-            RscfInfo resource{};
-
-            if (!pc_texture_resource(*chunks, str_from_c(resource_name.c_str()), &resource))
-                continue;
-            if (gpu_create_dds_view_from_memory(resource.payload, resource.payload_size,
-                resource_name.c_str(), &gpu.rain_texture,
-                &last_error))
-                return true;
-        }
         if (gpu_load_graphics_texture("SpecialFX\\" + stem + ".dds", &gpu.rain_texture, &last_error))
             return true;
     }
@@ -638,27 +627,12 @@ bool gpu_load_pc_environment_textures(const std::string& pc_path, uint32_t* load
         // intentionally override its original value before export.
         gpu.environment_wet_weather = g.document.rain_enabled;
         if (gpu.environment_wet_weather) {
-            gpu_load_rain_sprite(&chunks, pc_path, &last_texture_error);
-            RscfInfo splash{};
-            if (pc_texture_resource(chunks, str_lit("\\specialfx\\splash.bmp"), &splash) ||
-                pc_texture_resource(chunks, str_lit("specialfx\\splash.bmp"), &splash)) {
-                std::string texture_error;
-                if (!gpu_create_dds_view_from_memory(splash.payload, splash.payload_size,
-                                                     "\\specialfx\\splash.bmp", &gpu.environment_splash,
-                                                     &texture_error))
-                    last_texture_error = std::move(texture_error);
-            }
-            // splash.bmp is a globally registered game-root asset and need not
-            // be packed into an individual level. The copied SpecialFX asset is
-            // DDS data, just like target type-2 texture resources, despite the
-            // original engine path retaining its .bmp extension.
-            if (!gpu.environment_splash) {
-                std::string texture_error;
-                if (gpu_load_graphics_texture("SpecialFX\\splash.dds", &gpu.environment_splash, &texture_error))
-                    last_texture_error.clear();
-                else
-                    last_texture_error = std::move(texture_error);
-            }
+            gpu_load_rain_sprite(pc_path, &last_texture_error);
+            std::string texture_error;
+            if (gpu_load_graphics_texture("SpecialFX\\splash.dds", &gpu.environment_splash, &texture_error))
+                last_texture_error.clear();
+            else
+                last_texture_error = std::move(texture_error);
             if (!gpu.environment_splash && last_texture_error.empty())
                 last_texture_error = "Wet WTHR is enabled, but Graphics\\SpecialFX\\splash.dds was not found.";
         }
@@ -797,7 +771,7 @@ bool gpu_reload_environment_textures(std::string* why, uint32_t* loaded_count,
         const std::string& level_path = g.document.source_pc_path.empty()
                                             ? g.document.obj_path
                                             : g.document.source_pc_path;
-        gpu_load_rain_sprite(nullptr, level_path, why);
+        gpu_load_rain_sprite(level_path, why);
     }
     if (g.document.material_map.empty()) {
         if (missing_count)
