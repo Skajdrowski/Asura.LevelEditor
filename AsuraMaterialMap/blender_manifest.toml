@@ -1,0 +1,17 @@
+schema_version = "1.0.0"
+
+id = "asura_material_map"
+version = "1.0.0"
+name = "Asura Material Map"
+tagline = "Assign Asura material indices and export Level Editor material maps"
+maintainer = "AsuraLevels2005"
+type = "add-on"
+
+blender_version_min = "4.2.0"
+
+license = [
+    "SPDX:MIT",
+]
+
+[permissions]
+files = "Export Asura Level Editor material map JSON files"
