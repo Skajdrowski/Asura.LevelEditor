@@ -114,6 +114,7 @@
     <ClCompile Include="LevelEditorRaycast.cpp" />
     <ClCompile Include="LevelEditorRendering.cpp" />
     <ClCompile Include="LevelEditorProject.cpp" />
+    <ClCompile Include="LevelEditorSoundTriggers.cpp" />
     <ClCompile Include="LevelEditorUI.cpp" />
   </ItemGroup>
   <ItemGroup>
@@ -131,6 +132,7 @@
     <ClInclude Include="LevelEditorInternal.h" />
     <ClInclude Include="LevelEditorRaycast.h" />
     <ClInclude Include="LevelEditorProject.h" />
+    <ClInclude Include="LevelEditorSoundTriggers.h" />
     <ClInclude Include="LevelEditorRendering.h" />
     <ClInclude Include="LevelEditorUI.h" />
     <ClInclude Include="resource.h" />

@@ -133,6 +133,9 @@ struct GpuEntitySnapshot {
     Asura_Vector_3 spawn_direction{};
     Asura_Bounding_Box source_bounds{};
     Asura_Bounding_Box light_bounds{};
+    Asura_Vector_3 sound_trigger_offset{};
+    Asura_Vector_3 sound_trigger_size{};
+    bool sound_trigger_enabled = false;
     float sound_range = 0.0f;
     float light_range = 0.0f;
     uint32_t value_u32_a = 0;
@@ -161,6 +164,9 @@ bool same_entity_snapshot(const GpuEntitySnapshot& a, const GpuEntitySnapshot& b
     return a.model == b.model && a.kind == b.kind && same_vec3(a.position, b.position) &&
            same_vec3(a.rotation, b.rotation) && same_vec3(a.spawn_direction, b.spawn_direction) &&
            same_bounds(a.source_bounds, b.source_bounds) && same_bounds(a.light_bounds, b.light_bounds) &&
+           a.sound_trigger_enabled == b.sound_trigger_enabled &&
+           same_vec3(a.sound_trigger_offset, b.sound_trigger_offset) &&
+           same_vec3(a.sound_trigger_size, b.sound_trigger_size) &&
            a.sound_range == b.sound_range && a.light_range == b.light_range &&
            a.value_u32_a == b.value_u32_a && a.light_flags == b.light_flags &&
            a.selection_order == b.selection_order &&
@@ -2053,6 +2059,13 @@ GpuEntitySnapshot gpu_entity_snapshot(const Entity& entity, const EntityModel* m
     snapshot.sound_range = entity.value_b;
     snapshot.value_u32_a = entity.value_u32_a;
     snapshot.selection_order = selection_order;
+    if (entity.kind == EntityKind::Sound) {
+        // Applying sound box properties must invalidate the cached overlay even
+        // when selection, position and audible range have not changed.
+        snapshot.sound_trigger_enabled = entity.sound_trigger_enabled;
+        snapshot.sound_trigger_offset = entity.sound_trigger_offset;
+        snapshot.sound_trigger_size = entity.sound_trigger_size;
+    }
     if (entity.kind == EntityKind::Light) {
         snapshot.light_range = entity.light.Range;
         snapshot.light_flags = entity.light.m_uFlags;
@@ -2674,7 +2687,8 @@ void gpu_render() {
             if (kind == EntityKind::Light)
                 gizmo_line_capacity = kMaximumLightGizmoLines * g.selected_entities.size();
             else if (kind == EntityKind::Sound)
-                gizmo_line_capacity = kLightRangeSegments * 3 * g.selected_entities.size();
+                gizmo_line_capacity = (kLightRangeSegments * 3 + kLightBoundingBoxLines) *
+                                     g.selected_entities.size();
         }
         overlay.reserve((lines * 2 + 1) * 4 +
                         entity_count * (6 + kCameraSpawnArrowLines * 2 + kLightBoundingBoxLines * 2) +

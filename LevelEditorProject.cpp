@@ -12,7 +12,7 @@ namespace editor {
 namespace {
 
 constexpr char kProjectMagic[8] = {'A', 'L', 'E', 'V', '2', '0', '0', '5'};
-constexpr uint32_t kProjectVersion = 14;
+constexpr uint32_t kProjectVersion = 15;
 
 struct BinaryWriter {
     std::vector<uint8_t> bytes;
@@ -310,6 +310,12 @@ bool save_project(const Document& document, const char* path, std::string* why) 
             writer.u32(entity.sound_controller_active ? 1u : 0u);
             writer.u32(entity.sound_controller_padding);
             write_phonon(writer, entity.sound_phonon);
+            writer.u32(entity.sound_trigger_enabled ? 1u : 0u);
+            writer.u32(entity.sound_trigger_once ? 1u : 0u);
+            writer.u32(entity.sound_stop_on_exit ? 1u : 0u);
+            write_vec3(writer, entity.sound_trigger_offset);
+            write_vec3(writer, entity.sound_trigger_size);
+            writer.u32(entity.sound_trigger_source_guid);
         }
         if (entity.kind == EntityKind::Pickup || entity.kind == EntityKind::AssassinationTarget ||
             entity.kind == EntityKind::PositionMarker || entity.kind == EntityKind::StaticObject ||
@@ -522,6 +528,14 @@ bool load_project(Document* document, const char* path, std::string* why) {
             entity.sound_controller_active = reader.u32() != 0;
             entity.sound_controller_padding = static_cast<uint16_t>(reader.u32());
             entity.sound_phonon = read_phonon(reader);
+            if (project_version >= 15) {
+                entity.sound_trigger_enabled = reader.u32() != 0;
+                entity.sound_trigger_once = reader.u32() != 0;
+                entity.sound_stop_on_exit = reader.u32() != 0;
+                entity.sound_trigger_offset = read_vec3(reader);
+                entity.sound_trigger_size = read_vec3(reader);
+                entity.sound_trigger_source_guid = reader.u32();
+            }
         }
         if (project_version >= 8 && kind >= static_cast<uint32_t>(EntityKind::Pickup)) {
             entity.source_entity_record = reader.u32() != 0;

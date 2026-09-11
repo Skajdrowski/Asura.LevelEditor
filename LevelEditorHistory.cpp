@@ -69,6 +69,12 @@ bool equal(const Entity& a, const Entity& b) {
            a.sound_controller_active == b.sound_controller_active &&
            a.sound_controller_padding == b.sound_controller_padding &&
            equal(a.sound_phonon, b.sound_phonon) &&
+           a.sound_trigger_enabled == b.sound_trigger_enabled &&
+           a.sound_trigger_once == b.sound_trigger_once &&
+           a.sound_stop_on_exit == b.sound_stop_on_exit &&
+           equal(a.sound_trigger_offset, b.sound_trigger_offset) &&
+           equal(a.sound_trigger_size, b.sound_trigger_size) &&
+           a.sound_trigger_source_guid == b.sound_trigger_source_guid &&
            a.source_entity_record == b.source_entity_record &&
            a.source_entity_classification == b.source_entity_classification &&
            equal(a.source_bounds, b.source_bounds) &&
@@ -247,7 +253,7 @@ void canonicalize_clone(Entity* entity) {
     case EntityKind::Sound:
         entity->sound_source_record = false;
         entity->sound_has_controller = false;
-        entity->sound_controller_active = true;
+        entity->sound_trigger_source_guid = 0;
         entity->sound_controller_padding = 0x4974;
         entity->sound_phonon = {};
         break;

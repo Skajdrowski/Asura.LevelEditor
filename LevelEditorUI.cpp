@@ -1,4 +1,5 @@
 #include "LevelEditorInternal.h"
+#include "LevelEditorSoundTriggers.h"
 
 using namespace asura;
 using namespace asura::level;
@@ -306,6 +307,8 @@ void append_sound_gizmo(const Entity& entity, std::vector<LightGizmoLine>* lines
     const float range = fabsf(entity.value_b);
     if (isfinite(range) && range > .00001f && range <= kMaximumLightGizmoRange)
         append_range_globe(entity_view_position(entity.position), range, lines);
+    if (entity.sound_trigger_enabled)
+        append_light_bounding_box(sound_trigger_bounds(entity), lines);
 }
 
 void append_light_gizmo(const Entity& entity, std::vector<LightGizmoLine>* lines) {
@@ -723,9 +726,6 @@ struct LightPropertiesState {
     HWND bounds[6]{};
     HWND flags = nullptr;
     HWND flag_checks[_countof(kLightFlagControls)]{};
-    HWND old_position[3]{};
-    HWND old_range = nullptr;
-    HWND has_changed = nullptr;
     Asura_Light value{};
     bool accepted = false;
 };
@@ -785,6 +785,121 @@ bool run_centered_modal(const char* window_class, const char* title,
     return true;
 }
 
+enum SoundPropertiesId { ID_SOUND_START = 2100, ID_SOUND_TRIGGER, ID_SOUND_ONCE, ID_SOUND_EXIT,
+                         ID_SOUND_TRIGGER_OFFSET, ID_SOUND_TRIGGER_SIZE = ID_SOUND_TRIGGER_OFFSET + 3 };
+struct SoundPropertiesState {
+    HWND window = nullptr, start = nullptr, trigger = nullptr, once = nullptr, stop = nullptr;
+    HWND offset[3]{}, size[3]{};
+    Entity value;
+    bool accepted = false;
+};
+
+void update_sound_properties(SoundPropertiesState* state) {
+    const bool enabled = SendMessageA(state->trigger, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    const bool once = SendMessageA(state->once, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    EnableWindow(state->start, !enabled);
+    EnableWindow(state->once, enabled);
+    EnableWindow(state->stop, enabled && !once);
+    if (once) SendMessageA(state->stop, BM_SETCHECK, BST_UNCHECKED, 0);
+    for (HWND field : state->offset) EnableWindow(field, enabled);
+    for (HWND field : state->size) EnableWindow(field, enabled);
+}
+
+LRESULT CALLBACK sound_properties_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+    if (message == WM_NCCREATE) {
+        SetWindowLongPtrA(hwnd, GWLP_USERDATA,
+            reinterpret_cast<LONG_PTR>(reinterpret_cast<CREATESTRUCTA*>(lparam)->lpCreateParams));
+        return TRUE;
+    }
+    auto* state = reinterpret_cast<SoundPropertiesState*>(GetWindowLongPtrA(hwnd, GWLP_USERDATA));
+    if (message == WM_CREATE) {
+        state->window = hwnd;
+        const DWORD check = BS_AUTOCHECKBOX | WS_TABSTOP;
+        state->start = make_dialog_control(hwnd, "BUTTON", "Play when the level starts", check,
+                                           ID_SOUND_START, 18, 16, 480, 24);
+        state->trigger = make_dialog_control(hwnd, "BUTTON", "Use bounding box", check,
+                                             ID_SOUND_TRIGGER, 18, 48, 480, 24);
+        state->once = make_dialog_control(hwnd, "BUTTON", "Trigger once", check,
+                                          ID_SOUND_ONCE, 38, 82, 240, 24);
+        state->stop = make_dialog_control(hwnd, "BUTTON", "Stop when all players leave the box", check,
+                                          ID_SOUND_EXIT, 38, 114, 460, 24);
+        make_dialog_control(hwnd, "STATIC", "With a bounding box, playback starts when one of the players enter the box.",
+                            SS_LEFT, 0, 18, 154, 510, 42);
+        constexpr const char* axes[] = {"X", "Y", "Z"};
+        for (int row = 0; row < 2; ++row) {
+            make_dialog_control(hwnd, "STATIC", row ? "Box size" : "Offset from sound", SS_LEFT,
+                                0, 18, 216 + row * 38, 132, 24);
+            for (int axis = 0; axis < 3; ++axis) {
+                const int x = 158 + axis * 118, y = 212 + row * 38;
+                make_dialog_control(hwnd, "STATIC", axes[axis], SS_LEFT, 0, x, y + 3, 18, 24);
+                HWND field = make_dialog_control(hwnd, "EDIT", "", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP,
+                    (row ? ID_SOUND_TRIGGER_SIZE : ID_SOUND_TRIGGER_OFFSET) + axis, x + 20, y, 84, 24);
+                (row ? state->size : state->offset)[axis] = field;
+            }
+        }
+        const auto& e = state->value;
+        SendMessageA(state->start, BM_SETCHECK, e.sound_controller_active ? BST_CHECKED : BST_UNCHECKED, 0);
+        SendMessageA(state->trigger, BM_SETCHECK, e.sound_trigger_enabled ? BST_CHECKED : BST_UNCHECKED, 0);
+        SendMessageA(state->once, BM_SETCHECK, e.sound_trigger_once ? BST_CHECKED : BST_UNCHECKED, 0);
+        SendMessageA(state->stop, BM_SETCHECK, e.sound_stop_on_exit ? BST_CHECKED : BST_UNCHECKED, 0);
+        const float offset[] = {e.sound_trigger_offset.x, e.sound_trigger_offset.y, e.sound_trigger_offset.z};
+        const float size[] = {e.sound_trigger_size.x, e.sound_trigger_size.y, e.sound_trigger_size.z};
+        for (int axis = 0; axis < 3; ++axis) {
+            set_float(state->offset[axis], offset[axis]); set_float(state->size[axis], size[axis]);
+        }
+        make_dialog_control(hwnd, "BUTTON", "Apply", BS_DEFPUSHBUTTON | WS_TABSTOP, IDOK, 310, 354, 104, 30);
+        make_dialog_control(hwnd, "BUTTON", "Cancel", BS_PUSHBUTTON | WS_TABSTOP, IDCANCEL, 422, 354, 104, 30);
+        update_sound_properties(state);
+        return 0;
+    }
+    if (message == WM_COMMAND) {
+        const int id = LOWORD(wparam);
+        if (id == ID_SOUND_TRIGGER || id == ID_SOUND_ONCE) update_sound_properties(state);
+        if (id == IDOK) {
+            Entity& e = state->value;
+            e.sound_trigger_enabled = SendMessageA(state->trigger, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            e.sound_trigger_once = SendMessageA(state->once, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            e.sound_stop_on_exit = SendMessageA(state->stop, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            e.sound_controller_active = SendMessageA(state->start, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            float values[6]{};
+            for (int i = 0; i < 6; ++i) {
+                char text[128]{}; char* end = nullptr;
+                GetWindowTextA(i < 3 ? state->offset[i] : state->size[i-3], text, sizeof(text));
+                values[i] = strtof(text, &end);
+                const bool parsed = end != text;
+                while (*end == ' ' || *end == '\t') ++end;
+                if (e.sound_trigger_enabled && (!parsed || *end || !isfinite(values[i]) ||
+                                                 (i >= 3 && values[i] <= 0))) {
+                    MessageBoxA(hwnd, "Enter finite box offsets and a positive size on every axis.",
+                                "Sound playback", MB_OK | MB_ICONWARNING);
+                    return 0;
+                }
+            }
+            if (e.sound_trigger_enabled) {
+                e.sound_trigger_offset = {values[0], values[1], values[2]};
+                e.sound_trigger_size = {values[3], values[4], values[5]};
+            }
+            e.sound_has_controller = true;
+            state->accepted = true;
+            DestroyWindow(hwnd);
+        } else if (id == IDCANCEL) DestroyWindow(hwnd);
+        return 0;
+    }
+    if (message == WM_CLOSE) { DestroyWindow(hwnd); return 0; }
+    return DefWindowProcA(hwnd, message, wparam, lparam);
+}
+
+void command_sound_properties() {
+    if (!valid_entity_index(g.selected) || g.document.entities[g.selected].kind != EntityKind::Sound) return;
+    SoundPropertiesState state;
+    state.value = g.document.entities[g.selected];
+    if (!run_centered_modal("Asura2005SoundProperties", "Sound playback", 560, 438, &state) ||
+        !state.accepted || !g.history.begin(g.document, g.selected)) return;
+    g.document.entities[g.selected] = std::move(state.value);
+    commit_history_transaction();
+    refresh_inspector(); request_redraw();
+}
+
 void make_light_vector_row(LightPropertiesState* state, const char* label, int y, int first_id, HWND fields[3]) {
     make_dialog_control(state->window, "STATIC", label, SS_LEFT, 0, 14, y + 3, 94, 22);
     constexpr const char* axes[] = {"X", "Y", "Z"};
@@ -829,7 +944,7 @@ void create_light_properties_controls(LightPropertiesState* state) {
     }
 
     make_dialog_control(state->window, "STATIC", "Raw flags", SS_LEFT, 0, 14, 236, 94, 22);
-    state->flags = make_dialog_control(state->window, "EDIT", "", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP,
+    state->flags = make_dialog_control(state->window, "EDIT", "", ES_AUTOHSCROLL | ES_READONLY | WS_BORDER | WS_TABSTOP,
                                       ID_LIGHT_FLAGS, 130, 233, 142, 24);
     for (int i = 0; i < static_cast<int>(_countof(kLightFlagControls)); ++i) {
         const int column = i % 4, row = i / 4;
@@ -838,10 +953,15 @@ void create_light_properties_controls(LightPropertiesState* state) {
             ID_LIGHT_FLAG_FIRST + i, 14 + column * 185, 270 + row * 30, 178, 24);
     }
 
-    make_light_vector_row(state, "Old position", 338, ID_LIGHT_OLD_POSITION_X, state->old_position);
-    make_light_scalar(state, "Old range", ID_LIGHT_OLD_RANGE, 14, 376, &state->old_range);
-    state->has_changed = make_dialog_control(state->window, "BUTTON", "Has changed", BS_AUTOCHECKBOX | WS_TABSTOP,
-                                             ID_LIGHT_HAS_CHANGED, 280, 376, 150, 24);
+    // These legacy controls have no effect on the target's static entity
+    // lighting path (0x4432B0 / 0x443810 / 0x487750). Preserve their imported values.
+    EnableWindow(state->inner_range, FALSE);
+    for (int index : {0, 1, 3, 4}) EnableWindow(state->flag_checks[index], FALSE);
+    make_dialog_control(state->window, "STATIC",
+        "'Affects entities' enables lighting\r\n'Use bounding box' lightens only entities inside of it.\r\n"
+        "'Shadow strength' controls darkness; it does not cast shadows.\r\n"
+        "Greyed options do not affect static entity lighting. Their values are preserved only.",
+        SS_LEFT, 0, 14, 342, 728, 70);
 
     make_dialog_control(state->window, "BUTTON", "Apply", BS_DEFPUSHBUTTON | WS_TABSTOP, IDOK, 526, 430, 104, 30);
     make_dialog_control(state->window, "BUTTON", "Cancel", BS_PUSHBUTTON | WS_TABSTOP, IDCANCEL, 638, 430, 104, 30);
@@ -852,11 +972,9 @@ void create_light_properties_controls(LightPropertiesState* state) {
     const float bounds[] = {light.m_xBoundingBox.MinX, light.m_xBoundingBox.MaxX,
                             light.m_xBoundingBox.MinY, light.m_xBoundingBox.MaxY,
                             light.m_xBoundingBox.MinZ, light.m_xBoundingBox.MaxZ};
-    const float old_position[] = {light.OldPosition.x, light.OldPosition.y, light.OldPosition.z};
     for (int i = 0; i < 3; ++i) {
         set_float(state->position[i], position[i]);
         set_float(state->colour[i], colour[i]);
-        set_float(state->old_position[i], old_position[i]);
     }
     for (int i = 0; i < 6; ++i)
         set_float(state->bounds[i], bounds[i]);
@@ -868,8 +986,6 @@ void create_light_properties_controls(LightPropertiesState* state) {
     for (int i = 0; i < static_cast<int>(_countof(kLightFlagControls)); ++i)
         SendMessageA(state->flag_checks[i], BM_SETCHECK,
                      light.m_uFlags & kLightFlagControls[i].mask ? BST_CHECKED : BST_UNCHECKED, 0);
-    set_float(state->old_range, light.OldRange);
-    SendMessageA(state->has_changed, BM_SETCHECK, light.HasChanged ? BST_CHECKED : BST_UNCHECKED, 0);
     update_light_flag_dependent_controls(state, light.m_uFlags);
 }
 
@@ -883,7 +999,6 @@ void apply_light_properties(LightPropertiesState* state) {
     light.B = get_float(state->colour[2], light.B);
     light.Brightness = get_float(state->brightness, light.Brightness);
     light.Range = get_float(state->range, light.Range);
-    light.m_fInnerRange = get_float(state->inner_range, light.m_fInnerRange);
     light.ShadowStrength = get_float(state->shadow_strength, light.ShadowStrength);
     float* bounds[] = {&light.m_xBoundingBox.MinX, &light.m_xBoundingBox.MaxX,
                        &light.m_xBoundingBox.MinY, &light.m_xBoundingBox.MaxY,
@@ -897,11 +1012,6 @@ void apply_light_properties(LightPropertiesState* state) {
         else
             light.m_uFlags &= ~kLightFlagControls[i].mask;
     }
-    light.OldPosition = {get_float(state->old_position[0], light.OldPosition.x),
-                         get_float(state->old_position[1], light.OldPosition.y),
-                         get_float(state->old_position[2], light.OldPosition.z)};
-    light.OldRange = get_float(state->old_range, light.OldRange);
-    light.HasChanged = SendMessageA(state->has_changed, BM_GETCHECK, 0, 0) == BST_CHECKED;
 }
 
 LRESULT CALLBACK light_properties_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
@@ -936,6 +1046,17 @@ LRESULT CALLBACK light_properties_proc(HWND hwnd, UINT message, WPARAM wparam, L
             update_light_flag_dependent_controls(state, flags);
         } else if (LOWORD(wparam) == IDOK) {
             apply_light_properties(state);
+            const auto& light = state->value;
+            const auto& bounds = light.m_xBoundingBox;
+            if (((light.m_uFlags & ASURA_LIGHT_FLAG_AFFECTS_ENTITIES) && light.Range <= 0) ||
+                ((light.m_uFlags & ASURA_LIGHT_FLAG_USE_BOUNDING_BOX) &&
+                 (bounds.MinX >= bounds.MaxX || bounds.MinY >= bounds.MaxY || bounds.MinZ >= bounds.MaxZ)) ||
+                ((light.m_uFlags & ASURA_LIGHT_FLAG_IS_SHADOW_VOLUME) &&
+                 (light.ShadowStrength < 0 || light.ShadowStrength > 1))) {
+                MessageBoxA(hwnd, "Use a positive range, ordered box bounds, and shadow strength from 0 to 1.",
+                            "Light properties", MB_OK | MB_ICONWARNING);
+                return 0;
+            }
             state->accepted = true;
             DestroyWindow(hwnd);
         } else if (LOWORD(wparam) == IDCANCEL) {
@@ -1290,6 +1411,7 @@ void refresh_inspector() {
     ShowWindow(g.sound_browse, SW_HIDE);
     ShowWindow(g.sound_loop, SW_HIDE);
     ShowWindow(g.sound_preview, SW_HIDE);
+    ShowWindow(g.sound_properties, SW_HIDE);
     ShowWindow(g.light_properties, SW_HIDE);
     ShowWindow(g.pickup_item, SW_HIDE);
     ShowWindow(g.spawn_team_label, SW_HIDE);
@@ -1379,6 +1501,7 @@ void refresh_inspector() {
         ShowWindow(g.sound_loop, SW_SHOW);
         ShowWindow(g.sound_browse, SW_SHOW);
         ShowWindow(g.sound_preview, SW_SHOW);
+        ShowWindow(g.sound_properties, SW_SHOW);
     } else if (e.kind == EntityKind::Pickup) {
         set_control_text(g.value_label[0], "Item type");
         set_control_text(g.value_label[1], "Object file ID");
@@ -2363,6 +2486,7 @@ void layout_controls() {
     MoveWindow(g.sound_browse, edit_x, iy, ui_px(80), ui_px(26), TRUE);
     MoveWindow(g.sound_preview, edit_x + ui_px(84), iy, ui_px(80), ui_px(26), TRUE);
     MoveWindow(g.sound_loop, label_x, iy, ui_px(82), ui_px(26), TRUE);
+    MoveWindow(g.sound_properties, label_x, iy + ui_px(34), ui_px(252), ui_px(28), TRUE);
     MoveWindow(g.light_properties, edit_x, iy, ew, ui_px(26), TRUE);
     MoveWindow(g.spawn_team_label, label_x, iy, ui_px(252), ui_px(22), TRUE);
     for (int i = 0; i < static_cast<int>(_countof(kSpawnTeamControls)); ++i) {
@@ -2441,9 +2565,10 @@ void create_controls() {
         g.value[i] = make_control("EDIT", "", ES_AUTOHSCROLL | WS_BORDER, property_ids[i]);
     g.pickup_item = make_control("COMBOBOX", "", CBS_DROPDOWNLIST | CBS_AUTOHSCROLL | WS_VSCROLL,
                                  ID_PICKUP_ITEM);
-    g.sound_browse = make_control("BUTTON", "Choose WAV...", BS_PUSHBUTTON, ID_BROWSE_SOUND);
+    g.sound_browse = make_control("BUTTON", "Choose .WAV", BS_PUSHBUTTON, ID_BROWSE_SOUND);
     g.sound_loop = make_control("BUTTON", "Loop", BS_AUTOCHECKBOX, ID_SOUND_LOOP);
     g.sound_preview = make_control("BUTTON", "Play preview", BS_PUSHBUTTON, ID_SOUND_PREVIEW);
+    g.sound_properties = make_control("BUTTON", "Activation properties", BS_PUSHBUTTON, ID_SOUND_PROPERTIES);
     g.spawn_team_label = make_control("STATIC", "Teams", SS_LEFT, 919);
     g.spawn_game_mode_label = make_control("STATIC", "Game modes", SS_LEFT, 920);
     for (int i = 0; i < static_cast<int>(_countof(kSpawnTeamControls)); ++i)
@@ -4141,6 +4266,8 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             command_browse_sound();
         else if (id == ID_SOUND_PREVIEW)
             command_sound_preview();
+        else if (id == ID_SOUND_PROPERTIES)
+            command_sound_properties();
         else if (id == ID_LIGHT_PROPERTIES)
             command_light_properties();
         else if (id == ID_ENTITY_LIST) {

@@ -1,7 +1,9 @@
 #include "LevelEditorImport.h"
 #include "LevelEditorGeometry.h"
+#include "LevelEditorSoundTriggers.h"
 
 #include <algorithm>
+#include <set>
 
 using namespace asura;
 using namespace asura::level;
@@ -1147,20 +1149,42 @@ uint32_t allocate_editor_guid(Document* document) {
 }
 
 bool normalise_editor_guids(Document* document, std::string* why) {
+    std::set<uint32_t> reserved;
+    if (!document->source_pc_path.empty()) {
+        Arena arena{}; Error err{}; ChunkList source{};
+        const bool ok = arena_init(&arena, 64 * MiB, &err) &&
+                        parse_chunks(document->source_pc_path.c_str(), &source, &arena, &err);
+        if (ok) for (uint32_t i = 0; i < source.count; ++i) {
+            const auto& chunk = source.chunks[i];
+            if (chunk.cid == ASURA_CHUNK_ENTITY && chunk.size >= 24)
+                reserved.insert(read_u32(chunk.data + 16));
+        }
+        unmap_file(&source.file); arena_release(&arena);
+        if (!ok) { if (why) *why = err.message; return false; }
+    }
     for (size_t index = 0; index < document->entities.size(); ++index) {
         Entity& entity = document->entities[index];
         // Lights have no ENTI GUID on disk. Source-backed records retain their
         // original IDs exactly; only editor-authored ENTI records are migrated.
         const bool has_enti_guid = entity.kind == EntityKind::SpawnPoint || entity.kind == EntityKind::Sound ||
-                                   entity.kind == EntityKind::Pickup || entity.kind == EntityKind::StaticObject;
-        if (!has_enti_guid || entity.source_entity_record || entity.sound_source_record)
+                                   entity.kind == EntityKind::Pickup || entity.kind == EntityKind::StaticObject ||
+                                   entity.kind == EntityKind::BuildingVolume;
+        if (!has_enti_guid || entity.source_entity_record || entity.spawn_source_record ||
+            (entity.sound_source_record && entity.guid) ||
+            (entity.kind == EntityKind::Sound && entity.sound_source_record &&
+             !entity.sound_has_controller && !entity.sound_trigger_enabled))
             continue;
-        bool duplicate = false;
+        bool duplicate = reserved.count(entity.guid) != 0;
         for (size_t earlier = 0; earlier < index; ++earlier)
             duplicate |= document->entities[earlier].guid == entity.guid;
         if (!duplicate && entity.guid >= kToolCreatedGuidFirst && entity.guid <= kToolCreatedGuidLast)
             continue;
-        const uint32_t replacement = allocate_editor_guid(document);
+        uint32_t replacement = 0;
+        for (uint32_t attempts = 0; attempts <= kToolCreatedGuidLast - kToolCreatedGuidFirst; ++attempts) {
+            const uint32_t candidate = allocate_editor_guid(document);
+            if (!candidate) break;
+            if (!reserved.count(candidate)) { replacement = candidate; break; }
+        }
         if (!replacement) {
             if (why)
                 *why = "No free target-valid GUIDs remain for editor-authored entities.";
@@ -1179,18 +1203,26 @@ bool import_pc_entities(const ChunkList& chunks, Document* document, Error* err)
         const ChunkRef& chunk = chunks.chunks[chunk_index];
         if (chunk.cid != ASURA_CHUNK_LIGHTS)
             continue;
-        if (chunk.version < 3 || chunk.version > 5 || chunk.size < 60)
+        const uint32_t header_size = chunk.version == 5 ? 60 : chunk.version == 4 ? 48 : 32;
+        if (chunk.version < 3 || chunk.version > 5 || chunk.size < header_size)
             return fail(err, "LITE chunk %u has an unsupported version or size", chunk_index);
         const uint8_t* payload = chunk.data + sizeof(Asura_Chunk_Header);
         const uint32_t count = read_u32(payload);
-        const uint64_t required = 60ull + static_cast<uint64_t>(count) * sizeof(Asura_Light);
+        const uint64_t required = header_size + static_cast<uint64_t>(count) * sizeof(Asura_Light);
         if (required > chunk.size)
             return fail(err, "LITE chunk %u is truncated", chunk_index);
         memcpy(&document->light_header_a, payload + 4, sizeof(Asura_Vector_3));
-        memcpy(&document->light_header_b, payload + 16, sizeof(Asura_Vector_3));
-        memcpy(&document->light_header_c, payload + 28, sizeof(Asura_Vector_3));
-        document->light_header_flag = read_u32(payload + 40);
-        const uint8_t* records = payload + 44;
+        document->light_header_b = {}; // Entity ambient was introduced in v5.
+        if (chunk.version == 5)
+            memcpy(&document->light_header_b, payload + 16, sizeof(Asura_Vector_3));
+        document->light_header_c = document->light_header_a;
+        document->light_header_flag = 0;
+        if (chunk.version >= 4) {
+            const uint32_t offset = chunk.version == 5 ? 28 : 16;
+            memcpy(&document->light_header_c, payload + offset, sizeof(Asura_Vector_3));
+            document->light_header_flag = read_u32(payload + offset + 12);
+        }
+        const uint8_t* records = chunk.data + header_size;
         for (uint32_t i = 0; i < count; ++i) {
             Entity entity;
             entity.kind = EntityKind::Light;
@@ -1228,6 +1260,7 @@ bool import_pc_entities(const ChunkList& chunks, Document* document, Error* err)
             entity.value_a = entity.sound_phonon.m_fInnerRadius;
             entity.value_b = entity.sound_phonon.m_fOuterRadius;
             entity.sound_loop = (entity.sound_phonon.m_uFlags & 1u) != 0;
+            entity.sound_controller_active = (entity.sound_phonon.m_uFlags & 0x10u) != 0;
             entity.sound_name = pc_sound_name(chunks, entity.sound_phonon.m_uSoundResourceID);
             entity.name = entity.sound_name.empty() ? "Sound " + std::to_string(++sound_number) : entity.sound_name;
             document->entities.push_back(std::move(entity));
@@ -1544,6 +1577,8 @@ bool load_pc_level(const std::string& path, Document* document, Mesh* mesh, std:
     if (ok)
         ok = decode_pc_environment(environment, &next_mesh, &arena, &err) &&
              import_pc_entities(chunks, &next_document, &err);
+    if (ok)
+        import_sound_triggers(chunks, &next_document);
     if (ok)
         add_resource_backed_pickup_templates(chunks, &next_document);
     if (ok) {

@@ -53,6 +53,7 @@ enum ControlId : int {
     ID_LIGHT_PROPERTIES,
     ID_SOUND_LOOP,
     ID_SOUND_PREVIEW,
+    ID_SOUND_PROPERTIES,
     ID_SPAWN_TEAM_FIRST,
     ID_SPAWN_TEAM_LAST = ID_SPAWN_TEAM_FIRST + 3,
     ID_SPAWN_GAME_MODE_FIRST,
@@ -64,6 +65,7 @@ enum ControlId : int {
 bool load_spawn_puppets();
 LRESULT CALLBACK viewport_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
 LRESULT CALLBACK light_properties_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
+LRESULT CALLBACK sound_properties_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
 LRESULT CALLBACK skybox_properties_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
 LRESULT CALLBACK ambience_properties_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
 LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);

@@ -1,8 +1,10 @@
 #include "LevelEditorExport.h"
 #include "LevelEditorImport.h"
+#include "LevelEditorSoundTriggers.h"
 
 #include <algorithm>
 #include <fstream>
+#include <filesystem>
 #include <iomanip>
 
 using namespace asura;
@@ -14,8 +16,8 @@ bool append_editor_lights(Buffer* out, const Document& doc, Error* err) {
     uint32_t count = 0;
     for (const Entity& e : doc.entities)
         count += e.kind == EntityKind::Light;
-    if (!count)
-        return true;
+    // The target loads entity ambient RGB from LITE even when its light count
+    // is zero (MCP2 0x43EB50). Omitting the chunk loses ambient illumination.
     ChunkMark ch = begin_chunk(out, ASURA_CHUNK_LIGHTS, 5, 0, err);
     append_u32(out, count, err);
     buffer_append(out, &doc.light_header_a, sizeof(doc.light_header_a), err);
@@ -245,8 +247,8 @@ bool make_editor_sounds(const Document& doc, Sounds* sounds, Arena* arena, Error
             s.flags = e.sound_loop ? (e.sound_phonon.m_uFlags | 1u) : (e.sound_phonon.m_uFlags & ~1u);
             s.controller_guid = e.guid;
             s.controller_padding = e.sound_controller_padding;
-            s.emit_enti = e.sound_has_controller;
-            s.active = e.sound_controller_active;
+            s.emit_enti = e.sound_has_controller || e.sound_trigger_enabled;
+            s.active = !e.sound_trigger_enabled && e.sound_controller_active;
         } else {
             const float params[7] = {0, 0, 0, 1, 1, 1, 1};
             memcpy(s.legacy_volume_parameters, params, sizeof(params));
@@ -259,7 +261,7 @@ bool make_editor_sounds(const Document& doc, Sounds* sounds, Arena* arena, Error
             s.flags = e.sound_loop ? 3u : 2u;
             s.controller_padding = e.sound_controller_padding;
             s.emit_enti = true;
-            s.active = true;
+            s.active = !e.sound_trigger_enabled && e.sound_controller_active;
         }
         index++;
     }
@@ -933,14 +935,16 @@ bool append_static_object_support(Buffer* out, const Document& document,
     return !err->set;
 }
 
-bool pack_pc_document(const Document& doc, const char* output_path, std::string* why) {
+bool pack_pc_document(Document& doc, const char* output_path, std::string* why) {
     Error err{};
     Arena arena{};
     ChunkList source{};
     Buffer output{};
     Sounds sounds{};
+    SoundTriggerExport sound_triggers;
     bool ok = arena_init(&arena, 64 * MiB, &err) &&
-              parse_chunks(doc.source_pc_path.c_str(), &source, &arena, &err);
+              parse_chunks(doc.source_pc_path.c_str(), &source, &arena, &err) &&
+              prepare_sound_triggers(doc, &source, &sound_triggers, &err);
     uint32_t material_text_chunk = 0xffffffffu;
     uint32_t material_chunk = 0xffffffffu;
     if (ok && !doc.material_map.empty())
@@ -1007,6 +1011,8 @@ bool pack_pc_document(const Document& doc, const char* output_path, std::string*
 
     for (uint32_t i = 0; ok && i < source.count; ++i) {
         const ChunkRef& chunk = source.chunks[i];
+        if (replaces_sound_trigger_chunk(chunk, sound_triggers))
+            continue;
         // MCP2 MTRL processing at 0x440440 calls sub_405AD0, which frees and
         // recreates the original-index conversion array. The Env reader then
         // resolves every strip through that array at 0x49E6AD. Replace the
@@ -1084,8 +1090,9 @@ bool pack_pc_document(const Document& doc, const char* output_path, std::string*
         write_lights();
         write_phonons();
         write_entities();
+        ok = ok && append_sound_trigger_export(&output, sound_triggers, &err);
         if (!source_has_ambience && !doc.ambient_stream_path.empty())
-            ok = append_editor_ambience(&output, doc, &err);
+            ok = ok && append_editor_ambience(&output, doc, &err);
         ok = ok && buffer_append(&output, nullptr, sizeof(Asura_Chunk_Header), &err) != ~0ull;
     }
     if (ok)
@@ -1096,6 +1103,43 @@ bool pack_pc_document(const Document& doc, const char* output_path, std::string*
     unmap_file(&source.file);
     if (ok)
         ok = write_entire_file(output_path, output.base, output.size, &err);
+    if (ok) {
+        std::error_code source_error, output_error;
+        const auto source_path = std::filesystem::weakly_canonical(doc.source_pc_path, source_error);
+        const auto destination = std::filesystem::weakly_canonical(output_path, output_error);
+        if (!source_error && !output_error && _wcsicmp(source_path.c_str(), destination.c_str()) == 0) {
+            uint32_t sound_index = 0;
+            // When overwriting the backing file, the next export must replace
+            // these newly generated triggers instead of appending duplicates.
+            for (auto& entity : doc.entities) {
+                if (entity.kind != EntityKind::Sound) continue;
+                const SoundEntry& sound = sounds.items[sound_index++];
+                // Newly authored controllers/resources are now source-backed.
+                // Keep their IDs stable when exporting to this file again.
+                entity.sound_source_record = true;
+                entity.sound_has_controller = sound.emit_enti;
+                auto& phonon = entity.sound_phonon;
+                phonon.m_uSoundResourceID = sound.sound_resource_id;
+                phonon.m_uGuid = sound.phonon_guid;
+                phonon.m_xPosition = sound.position;
+                phonon.m_fInnerRadius = sound.inner_radius;
+                phonon.m_fOuterRadius = sound.outer_radius;
+                phonon.m_uFlags = sound.flags;
+                memcpy(phonon.m_afLegacyVolumeParameters, sound.legacy_volume_parameters,
+                       sizeof(phonon.m_afLegacyVolumeParameters));
+                phonon.m_xInnerCuboidRadius = sound.inner_cuboid_radius;
+                phonon.m_xOuterCuboidRadius = sound.outer_cuboid_radius;
+                phonon.m_xRetriggerBoundingBox = sound.retrigger_bounding_box;
+                phonon.m_xOrient = sound.orientation;
+                if (!sound_triggers.replace_message_set_zero) continue;
+                const uint32_t old_guid = entity.sound_trigger_source_guid;
+                entity.sound_trigger_source_guid = 0;
+                for (const auto& link : sound_triggers.controller_trigger_guids)
+                    if (link.first == entity.guid) entity.sound_trigger_source_guid = link.second;
+                doc.dirty |= old_guid != entity.sound_trigger_source_guid;
+            }
+        }
+    }
     if (!ok && why)
         *why = err.set ? err.message : "Packing the imported PC level failed.";
     buffer_release(&output);
@@ -1153,6 +1197,7 @@ bool pack_document(Document& doc, const char* output_path, std::string* why) {
     EnvBuild env{};
     EnvView view{};
     Sounds sounds{};
+    SoundTriggerExport sound_triggers;
     TextureSet textures{};
     ModuleMetric* metrics = nullptr;
     bool ok = arena_init(&arena, cfg.arena_reserve, &err) && arena_init(&scratch, cfg.arena_reserve, &err) &&
@@ -1172,7 +1217,8 @@ bool pack_document(Document& doc, const char* output_path, std::string* why) {
     }
     if (ok) {
         metrics = arena_array<ModuleMetric>(&arena, view.module_count, &err);
-        ok = metrics && make_editor_sounds(doc, &sounds, &arena, &err);
+        ok = metrics && make_editor_sounds(doc, &sounds, &arena, &err) &&
+             prepare_sound_triggers(doc, nullptr, &sound_triggers, &err);
     }
     if (ok) {
         buffer_append(&output, kAsuraMagic, sizeof(kAsuraMagic), &err);
@@ -1195,6 +1241,7 @@ bool pack_document(Document& doc, const char* output_path, std::string* why) {
               append_sound_entities(&output, sounds, &err) && append_editor_spawnpoints(&output, doc, &err) &&
                append_editor_pickups(&output, doc, &err) && append_editor_static_objects(&output, doc, &err) &&
                append_editor_building_volumes(&output, doc, &err) &&
+               append_sound_trigger_export(&output, sound_triggers, &err) &&
                append_editor_skybox(&output, doc.skybox, &err) &&
              append_fog(&output, &err) && append_editor_weather(&output, doc, &err) &&
              buffer_append(&output, nullptr, sizeof(Asura_Chunk_Header), &err) != ~0ull &&

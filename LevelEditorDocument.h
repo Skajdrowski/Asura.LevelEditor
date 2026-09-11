@@ -47,6 +47,14 @@ struct Entity {
     bool sound_controller_active = true;
     uint16_t sound_controller_padding = 0x4974;
     Asura_Chunk_Phonons_PhononDataV9 sound_phonon{};
+    // A server-side player-entry trigger; bounds move with the sound but stay
+    // aligned to world axes. Source GUID lets export replace its original ENTI.
+    bool sound_trigger_enabled = false;
+    bool sound_trigger_once = false;
+    bool sound_stop_on_exit = false;
+    Asura_Vector_3 sound_trigger_offset{};
+    Asura_Vector_3 sound_trigger_size{10, 5, 10};
+    uint32_t sound_trigger_source_guid = 0;
     // Source-backed ENTI classes whose transforms are patched in-place during
     // export. Their unreversed fields remain byte-for-byte from the source PC.
     bool source_entity_record = false;

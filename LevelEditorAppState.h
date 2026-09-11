@@ -34,6 +34,7 @@ struct AppState {
     HWND sound_browse = nullptr;
     HWND sound_loop = nullptr;
     HWND sound_preview = nullptr;
+    HWND sound_properties = nullptr;
     HWND spawn_team_label = nullptr;
     HWND spawn_game_mode_label = nullptr;
     HWND spawn_team_checks[4]{};
