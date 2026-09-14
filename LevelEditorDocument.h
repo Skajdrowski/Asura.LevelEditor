@@ -131,7 +131,7 @@ struct Document {
     // for example "Sounds\\Streams\\m1_karl1.wav".  An empty path disables
     // the default stream. Regional sound records are not represented or exported.
     std::string ambient_stream_path;
-    float ambient_volume = 1.0f;
+    float ambient_volume = .85f;
     bool ambient_source_record = false;
     // Legacy project import metadata. Export always uses the current entities.
     bool source_pickup_inventory_complete = false;
