@@ -48,15 +48,14 @@ struct Entity {
     uint16_t sound_controller_padding = 0x4974;
     Asura_Chunk_Phonons_PhononDataV9 sound_phonon{};
     // A server-side player-entry trigger; bounds move with the sound but stay
-    // aligned to world axes. Source GUID lets export replace its original ENTI.
+    // aligned to world axes. Source GUID identifies the imported trigger.
     bool sound_trigger_enabled = false;
     bool sound_trigger_once = false;
     bool sound_stop_on_exit = false;
     Asura_Vector_3 sound_trigger_offset{};
     Asura_Vector_3 sound_trigger_size{10, 5, 10};
     uint32_t sound_trigger_source_guid = 0;
-    // Source-backed ENTI classes whose transforms are patched in-place during
-    // export. Their unreversed fields remain byte-for-byte from the source PC.
+    // Identifies imported entities and their supported asset templates.
     bool source_entity_record = false;
     uint16_t source_entity_classification = 0;
     Asura_Bounding_Box source_bounds{};
@@ -104,8 +103,7 @@ struct SkyboxSettings {
     // Retail v7 levels legitimately contain either flag, both, or neither.
     bool back_texture_is_front_upside_down = false;
     bool right_texture_is_left_upside_down = false;
-    // Imported SKYB chunks are rebuilt from these fields during source-PC
-    // export. Older projects leave this false and preserve their source chunk.
+    // Older projects use this marker to recover settings from their source PC.
     bool source_record = false;
 };
 
@@ -132,12 +130,11 @@ struct Document {
     bool weather_source_record = false;
     // Target path consumed by the independent SBSN streaming ambience system,
     // for example "Sounds\\Streams\\m1_karl1.wav".  An empty path disables
-    // the default stream while retaining any imported regional sound records.
+    // the default stream. Regional sound records are not represented or exported.
     std::string ambient_stream_path;
     float ambient_volume = 1.0f;
     bool ambient_source_record = false;
-    // True only when every source physical-object ENTI was imported. This
-    // makes absence from entities an intentional deletion during export.
+    // Legacy project import metadata. Export always uses the current entities.
     bool source_pickup_inventory_complete = false;
     bool source_static_object_inventory_complete = false;
     bool dirty = false;
@@ -174,13 +171,45 @@ struct EntityModelMaterial {
     std::vector<uint8_t> texture_bytes;
 };
 
+struct ModelBoneTransform {
+    Asura_Vector_3 position{};
+    Asura_Quat orientation{0, 0, 0, 1};
+};
+
+struct ModelBone {
+    uint32_t parent = 0;
+    ModelBoneTransform bind;
+};
+
+struct ModelVertexWeights {
+    std::array<uint16_t, 4> bones{};
+    std::array<float, 4> weights{};
+};
+
+struct ModelAnimationKey {
+    float time = 0; // HCAN normalized time, 0..1.
+    ModelBoneTransform transform;
+};
+
+struct ModelAnimation {
+    uint32_t id = 0;
+    float duration = 0;
+    float loop_point = 0;
+    std::vector<std::vector<ModelAnimationKey>> tracks;
+};
+
 struct EntityModel {
     std::string resource_name;
+    uint32_t resource_subtype = ASURA_RESOURCEFILE_TYPE_PC_OBJECT;
     std::vector<EntityModelVertex> vertices;
     std::vector<std::array<uint16_t, 3>> faces;
     std::vector<int32_t> face_materials;
     std::vector<EntityModelMaterial> materials;
     Asura_Vector_3 min{}, max{};
+    // Derived preview data. Original HSKN/HCAN resources remain the export source.
+    std::vector<ModelBone> bones;
+    std::vector<ModelVertexWeights> weights;
+    std::vector<ModelAnimation> animations;
 };
 
 struct SpawnPuppet : EntityModel {};

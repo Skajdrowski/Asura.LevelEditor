@@ -4,13 +4,19 @@
 
 #include <algorithm>
 #include <fstream>
-#include <filesystem>
 #include <iomanip>
+#include <unordered_map>
 
 using namespace asura;
 using namespace asura::level;
 
 namespace editor {
+
+// The target loads Snipe physical flag bit 0 into the client visibility gate
+// (MCP2 0x576A00); Render and LOSTest skip the instance when it is set
+// (0x575D70, 0x576100). The editor shows these objects, and does not export
+// the original mission scripts that could reveal them later.
+constexpr uint32_t kSnipePhysicalHidden = 1u;
 
 bool append_editor_lights(Buffer* out, const Document& doc, Error* err) {
     uint32_t count = 0;
@@ -68,43 +74,8 @@ bool append_editor_weather(Buffer* out, const Document& document, Error* err) {
     return buffer_patch(out, start + 21, enabled, sizeof(enabled), err);
 }
 
-bool append_editor_weather_copy(Buffer* out, const ChunkRef& chunk, const Document& document,
-                                Error* err) {
-    if (chunk.size <= 22)
-        return fail(err, "the source WTHR rain state is truncated");
-    const uint64_t start = out->size;
-    if (!append_chunk_copy(out, chunk, err))
-        return false;
-    // SniperElite.exe's WTHR v5/v6 reader loads the adjacent bytes at +21 and
-    // +22 into the two runtime rain gates. Retail rainy levels set both and
-    // retail dry levels clear both. The byte at +20 is a separate legacy
-    // weather flag (it is set in some dry levels), so preserve it verbatim.
-    const uint8_t enabled[2]{document.rain_enabled ? 1u : 0u,
-                             document.rain_enabled ? 1u : 0u};
-    return buffer_patch(out, start + 21, enabled, sizeof(enabled), err);
-}
-
-// AEPR v0 stores the extended rain system's two runtime enable bits in the
-// low bits of the dword at chunk +0x1c. Retail rainy levels set both bits,
-// while dry levels clear both. WTHR controls wet-material response, but an
-// imported level's preserved AEPR overrides whether its rain particles run.
-constexpr uint32_t kExtendedRainFlagsOffset = 0x1cu;
-constexpr uint32_t kExtendedRainEnabledMask = 0x3u;
 constexpr uint32_t kStreamingBackgroundSoundDefaultVolumeOffset = 0x18u;
 constexpr uint32_t kStreamingBackgroundSoundDefaultPathOffset = 0x1cu;
-
-bool append_editor_extended_rain_copy(Buffer* out, const ChunkRef& chunk,
-                                      const Document& document, Error* err) {
-    if (chunk.version != 0 || chunk.size < kExtendedRainFlagsOffset + sizeof(uint32_t))
-        return fail(err, "the source AEPR rain flags are truncated or unsupported");
-    const uint64_t start = out->size;
-    if (!append_chunk_copy(out, chunk, err))
-        return false;
-    uint32_t flags = read_u32(chunk.data + kExtendedRainFlagsOffset);
-    flags = (flags & ~kExtendedRainEnabledMask) |
-            (document.rain_enabled ? kExtendedRainEnabledMask : 0u);
-    return buffer_patch(out, start + kExtendedRainFlagsOffset, &flags, sizeof(flags), err);
-}
 
 bool source_ambience_info(const ChunkRef& chunk, std::string* path, float* volume,
                           uint32_t* tail_offset, Error* err) {
@@ -149,37 +120,6 @@ bool append_editor_ambience(Buffer* out, const Document& document, Error* err) {
                             err))
         return false;
     return end_chunk(out, chunk, err);
-}
-
-bool append_editor_ambience_copy(Buffer* out, const ChunkRef& chunk,
-                                 const Document& document, Error* err) {
-    if (!valid_ambience_settings(document, err))
-        return false;
-    std::string source_path;
-    float source_volume = 0.0f;
-    uint32_t tail_offset = 0;
-    if (!source_ambience_info(chunk, &source_path, &source_volume, &tail_offset, err))
-        return false;
-    if (source_path == document.ambient_stream_path &&
-        memcmp(&source_volume, &document.ambient_volume, sizeof(source_volume)) == 0)
-        return append_chunk_copy(out, chunk, err);
-
-    const uint64_t start = out->size;
-    if (buffer_append(out, chunk.data, kStreamingBackgroundSoundDefaultPathOffset, err) == ~0ull ||
-        !append_padded_cstr(out,
-                            {document.ambient_stream_path.data(),
-                             static_cast<uint32_t>(document.ambient_stream_path.size())},
-                            err) ||
-        buffer_append(out, chunk.data + tail_offset, chunk.size - tail_offset, err) == ~0ull)
-        return false;
-    const uint64_t rebuilt_size = out->size - start;
-    if (rebuilt_size > UINT32_MAX)
-        return fail(err, "the edited SBSN chunk is too large");
-    const uint32_t rebuilt_size_32 = static_cast<uint32_t>(rebuilt_size);
-    return buffer_patch(out, start + offsetof(Asura_Chunk_Header, Size), &rebuilt_size_32,
-                        sizeof(rebuilt_size_32), err) &&
-           buffer_patch(out, start + kStreamingBackgroundSoundDefaultVolumeOffset,
-                        &document.ambient_volume, sizeof(document.ambient_volume), err);
 }
 
 bool append_editor_spawnpoints(Buffer* out, const Document& doc, Error* err) {
@@ -284,12 +224,16 @@ void make_pickup_body(const Entity& entity, std::array<uint8_t, kPickupBodySize>
     wire.m_xPhysicalObject.m_uSkinID = entity.pickup_skin_id;
     wire.m_xPhysicalObject.m_uAnimID = entity.pickup_anim_id;
     wire.m_xPhysicalObject.m_uAnimFileID = entity.pickup_anim_file_id;
+    wire.m_uSnipePhysicalFlags &= ~kSnipePhysicalHidden;
+    // Original navigation links are not part of the rebuilt level. The target
+    // reader (MCP2 0x465B10) consumes this many trailing u32 records.
+    wire.m_uNumLinksToBlock = 0;
     memcpy(body->data(), &wire, sizeof(wire));
 }
 
 bool append_editor_pickups(Buffer* out, const Document& doc, Error* err) {
     for (const Entity& entity : doc.entities) {
-        if (entity.kind != EntityKind::Pickup || entity.source_entity_record)
+        if (entity.kind != EntityKind::Pickup)
             continue;
         if (!entity.pickup_has_template)
             return fail(err, "pickup '%s' has no resolved item asset profile", entity.name.c_str());
@@ -323,12 +267,14 @@ void make_static_object_body(const Entity& entity,
     wire.m_xPhysicalObject.m_uSkinID = entity.pickup_skin_id;
     wire.m_xPhysicalObject.m_uAnimID = entity.pickup_anim_id;
     wire.m_xPhysicalObject.m_uAnimFileID = entity.pickup_anim_file_id;
+    wire.m_uSnipePhysicalFlags &= ~kSnipePhysicalHidden;
+    wire.m_uNumLinksToBlock = 0;
     memcpy(body->data(), &wire, sizeof(wire));
 }
 
 bool append_editor_static_objects(Buffer* out, const Document& doc, Error* err) {
     for (const Entity& entity : doc.entities) {
-        if (entity.kind != EntityKind::StaticObject || entity.source_entity_record)
+        if (entity.kind != EntityKind::StaticObject)
             continue;
         if (!entity.static_object_has_template)
             return fail(err, "Object '%s' has no resolved asset profile", entity.name.c_str());
@@ -447,22 +393,6 @@ bool validate_spawn_clearance(const Document& doc, const ObjData& obj, const Con
     return true;
 }
 
-bool editable_pc_entity_chunk(const ChunkRef& chunk) {
-    if (chunk.cid != ASURA_CHUNK_ENTITY || chunk.size < sizeof(Asura_Chunk_Entity))
-        return false;
-    const uint16_t classification = read_u16(
-        chunk.data + sizeof(Asura_Chunk_Header) + offsetof(Asura_Chunk_Entity_PayloadHeader, Classification));
-    return classification == SnipeEntityClass_SpawnPoint || classification == AsuraEntityClass_SoundController;
-}
-
-bool nearly_equal(float a, float b) {
-    return fabsf(a - b) <= 1.0e-5f;
-}
-
-bool nearly_equal(const Asura_Vector_3& a, const Asura_Vector_3& b) {
-    return nearly_equal(a.x, b.x) && nearly_equal(a.y, b.y) && nearly_equal(a.z, b.z);
-}
-
 Asura_Vector_3 oriented_box_dimensions(const Entity& entity) {
     return {entity.source_bounds.MaxX - entity.source_bounds.MinX,
             entity.source_bounds.MaxY - entity.source_bounds.MinY,
@@ -482,15 +412,6 @@ bool valid_oriented_box_dimensions(const Entity& entity) {
            size.x > 0.0f && size.y > 0.0f && size.z > 0.0f;
 }
 
-bool nearly_equal_rotation(const Asura_Vector_3& a, const Asura_Vector_3& b) {
-    auto equal_angle = [](float x, float y) {
-        float difference = fmodf(fabsf(x - y), 360.0f);
-        difference = fminf(difference, 360.0f - difference);
-        return difference <= 1.0e-3f;
-    };
-    return equal_angle(a.x, b.x) && equal_angle(a.y, b.y) && equal_angle(a.z, b.z);
-}
-
 void quaternion_matrix(const Asura_Quat& q, float* m) {
     m[0] = 1.0f - 2.0f * (q.y * q.y + q.z * q.z);
     m[1] = 2.0f * (q.x * q.y - q.z * q.w);
@@ -503,160 +424,9 @@ void quaternion_matrix(const Asura_Quat& q, float* m) {
     m[8] = 1.0f - 2.0f * (q.x * q.x + q.y * q.y);
 }
 
-const Entity* find_source_entity(const Document& doc, uint32_t guid, uint16_t classification) {
-    for (const Entity& entity : doc.entities)
-        if (entity.source_entity_record && entity.guid == guid &&
-            entity.source_entity_classification == classification)
-            return &entity;
-    return nullptr;
-}
-
-bool append_source_entity_copy(Buffer* out, const ChunkRef& chunk, const Document& doc, Error* err) {
-    if (chunk.cid != ASURA_CHUNK_ENTITY || chunk.size < sizeof(Asura_Chunk_Entity))
-        return append_chunk_copy(out, chunk, err);
-    const uint8_t* payload = chunk.data + sizeof(Asura_Chunk_Header);
-    const uint32_t guid = read_u32(payload);
-    const uint16_t classification = read_u16(
-        payload + offsetof(Asura_Chunk_Entity_PayloadHeader, Classification));
-    const Entity* entity = find_source_entity(doc, guid, classification);
-    if (!entity) {
-        if (classification == SnipeEntityClass_Pickup && doc.source_pickup_inventory_complete)
-            return true;
-        if (classification == SnipeEntityClass_StaticObject && doc.source_static_object_inventory_complete)
-            return true;
-        return append_chunk_copy(out, chunk, err);
-    }
-
-    const uint8_t* body = payload + sizeof(Asura_Chunk_Entity_PayloadHeader);
-    if (classification == SnipeEntityClass_Pickup && entity->pickup_has_template) {
-        if (chunk.size < sizeof(Asura_Chunk_Entity) + kPickupBodySize)
-            return fail(err, "source physical-object ENTI is truncated");
-        Asura_Vector_3 source_position{};
-        Asura_Quat source_orientation{};
-        memcpy(&source_position, body + 0x4c, sizeof(source_position));
-        memcpy(&source_orientation, body + 0x58, sizeof(source_orientation));
-        const bool template_changed = memcmp(entity->pickup_body.data(), body, entity->pickup_body.size()) != 0 ||
-                                      entity->value_u32_a != read_u32(body + 0x10) ||
-                                      entity->value_u32_b != read_u32(body + 0x6c) ||
-                                      entity->pickup_skin_id != read_u32(body + 0x70) ||
-                                      entity->pickup_anim_id != read_u32(body + 0x74) ||
-                                      entity->pickup_anim_file_id != read_u32(body + 0x78);
-        if (!template_changed && nearly_equal(entity->position, source_position) &&
-            nearly_equal_rotation(entity->rotation, quaternion_euler(source_orientation)))
-            return append_chunk_copy(out, chunk, err);
-        std::vector<uint8_t> patched(chunk.data, chunk.data + chunk.size);
-        std::array<uint8_t, kPickupBodySize> patched_body{};
-        make_pickup_body(*entity, &patched_body);
-        memcpy(patched.data() + sizeof(Asura_Chunk_Entity), patched_body.data(), patched_body.size());
-        return buffer_append(out, patched.data(), patched.size(), err) != ~0ull;
-    }
-    if (classification == SnipeEntityClass_StaticObject && entity->static_object_has_template) {
-        if (chunk.size < sizeof(Asura_Chunk_Entity) + kStaticObjectBodySize)
-            return fail(err, "source static-object ENTI is truncated");
-        Asura_Vector_3 source_position{};
-        Asura_Quat source_orientation{};
-        memcpy(&source_position, body + 0x30, sizeof(source_position));
-        memcpy(&source_orientation, body + 0x3c, sizeof(source_orientation));
-        const bool template_changed =
-            memcmp(entity->static_object_body.data(), body, entity->static_object_body.size()) != 0 ||
-            entity->value_u32_b != read_u32(body + 0x50) ||
-            entity->pickup_skin_id != read_u32(body + 0x54) ||
-            entity->pickup_anim_id != read_u32(body + 0x58) ||
-            entity->pickup_anim_file_id != read_u32(body + 0x5c);
-        if (!template_changed && nearly_equal(entity->position, source_position) &&
-            nearly_equal_rotation(entity->rotation, quaternion_euler(source_orientation)))
-            return append_chunk_copy(out, chunk, err);
-        std::vector<uint8_t> patched(chunk.data, chunk.data + chunk.size);
-        std::array<uint8_t, kStaticObjectBodySize> patched_body{};
-        make_static_object_body(*entity, &patched_body);
-        memcpy(patched.data() + sizeof(Asura_Chunk_Entity), patched_body.data(), patched_body.size());
-        return buffer_append(out, patched.data(), patched.size(), err) != ~0ull;
-    }
-
-    const bool oriented_box = classification == SnipeEntityClass_PositionMarker ||
-                              classification == SnipeEntityClass_BuildingVolume;
-    uint32_t position_offset = 0, orientation_offset = 0;
-    if (classification == SnipeEntityClass_StaticObject) {
-        position_offset = 0x30;
-        orientation_offset = 0x3c;
-    } else if (classification == SnipeEntityClass_Pickup) {
-        position_offset = 0x4c;
-        orientation_offset = 0x58;
-    } else if (classification == SnipeEntityClass_AssassinationTarget) {
-        position_offset = 0x38;
-        orientation_offset = 0x44;
-    } else if (oriented_box) {
-        position_offset = 0x64;
-    } else {
-        return append_chunk_copy(out, chunk, err);
-    }
-    if (sizeof(Asura_Chunk_Entity) + position_offset + sizeof(Asura_Vector_3) > chunk.size)
-        return fail(err, "source ENTI 0x%04X is truncated", classification);
-
-    Asura_Vector_3 source_position{};
-    memcpy(&source_position, body + position_offset, sizeof(source_position));
-    Asura_Vector_3 source_rotation{};
-    if (oriented_box) {
-        if (sizeof(Asura_Chunk_Entity) + 0x70 + sizeof(uint32_t) > chunk.size)
-            return fail(err, "source oriented-box ENTI 0x%04X is truncated", classification);
-        float source_matrix[9]{};
-        memcpy(source_matrix, body + 4, sizeof(source_matrix));
-        source_rotation = matrix_euler(source_matrix);
-    } else {
-        if (sizeof(Asura_Chunk_Entity) + orientation_offset + sizeof(Asura_Quat) > chunk.size)
-            return fail(err, "source physical-object ENTI is truncated");
-        Asura_Quat source_orientation{};
-        memcpy(&source_orientation, body + orientation_offset, sizeof(source_orientation));
-        source_rotation = quaternion_euler(source_orientation);
-    }
-
-    const bool position_changed = !nearly_equal(entity->position, source_position);
-    const bool rotation_changed = !nearly_equal_rotation(entity->rotation, source_rotation);
-    bool bounds_changed = false, flags_changed = false;
-    Asura_Bounding_Box source_bounds{}, desired_bounds{};
-    if (oriented_box) {
-        memcpy(&source_bounds, body + 0x4c, sizeof(source_bounds));
-        if (!valid_oriented_box_dimensions(*entity))
-            return fail(err, "oriented-box ENTI 0x%04X has invalid bounds", classification);
-        const Asura_Vector_3 source_size{source_bounds.MaxX - source_bounds.MinX,
-                                         source_bounds.MaxY - source_bounds.MinY,
-                                         source_bounds.MaxZ - source_bounds.MinZ};
-        const Asura_Vector_3 edited_size = oriented_box_dimensions(*entity);
-        bounds_changed = position_changed || !nearly_equal(source_size, edited_size);
-        desired_bounds = centered_oriented_box_bounds(*entity);
-        flags_changed = entity->value_u32_a != read_u32(body + 0x70);
-    }
-    if (!position_changed && !rotation_changed && !bounds_changed && !flags_changed)
-        return append_chunk_copy(out, chunk, err);
-
-    std::vector<uint8_t> patched(chunk.data, chunk.data + chunk.size);
-    uint8_t* patched_body = patched.data() + sizeof(Asura_Chunk_Entity);
-    if (bounds_changed)
-        memcpy(patched_body + 0x4c, &desired_bounds, sizeof(desired_bounds));
-    if (position_changed || bounds_changed)
-        memcpy(patched_body + position_offset, &entity->position, sizeof(entity->position));
-    if (rotation_changed) {
-        const Asura_Quat orientation = euler_quaternion(entity->rotation);
-        if (oriented_box) {
-            float matrix[9]{}, transpose[9]{};
-            quaternion_matrix(orientation, matrix);
-            for (uint32_t row = 0; row < 3; ++row)
-                for (uint32_t column = 0; column < 3; ++column)
-                    transpose[row * 3 + column] = matrix[column * 3 + row];
-            memcpy(patched_body + 4, matrix, sizeof(matrix));
-            memcpy(patched_body + 0x28, transpose, sizeof(transpose));
-        } else {
-            memcpy(patched_body + orientation_offset, &orientation, sizeof(orientation));
-        }
-    }
-    if (flags_changed)
-        memcpy(patched_body + 0x70, &entity->value_u32_a, sizeof(entity->value_u32_a));
-    return buffer_append(out, patched.data(), patched.size(), err) != ~0ull;
-}
-
 bool append_editor_building_volumes(Buffer* out, const Document& doc, Error* err) {
     for (const Entity& entity : doc.entities) {
-        if (entity.kind != EntityKind::BuildingVolume || entity.source_entity_record)
+        if (entity.kind != EntityKind::BuildingVolume && entity.kind != EntityKind::PositionMarker)
             continue;
         if (!valid_oriented_box_dimensions(entity))
             return fail(err, "building volume '%s' has invalid bounds", entity.name.c_str());
@@ -664,7 +434,8 @@ bool append_editor_building_volumes(Buffer* out, const Document& doc, Error* err
         ChunkMark chunk = begin_chunk(out, ASURA_CHUNK_ENTITY, 0, 0, err);
         Asura_Chunk_Entity_PayloadHeader header{};
         header.Guid = entity.guid;
-        header.Classification = SnipeEntityClass_BuildingVolume;
+        header.Classification = entity.kind == EntityKind::BuildingVolume
+                                    ? SnipeEntityClass_BuildingVolume : SnipeEntityClass_PositionMarker;
         header.m_usPadding = entity.entity_padding;
         std::array<uint8_t, 0x74> body{};
         float matrix[9]{}, transpose[9]{};
@@ -685,21 +456,6 @@ bool append_editor_building_volumes(Buffer* out, const Document& doc, Error* err
     }
     return true;
 }
-
-bool replaced_pc_sound_resource(const Document& doc, const RscfInfo& resource) {
-    if (resource.type != ASURA_RESOURCEFILE_TYPE_SOUND)
-        return false;
-    for (const Entity& entity : doc.entities)
-        if (entity.kind == EntityKind::Sound && entity.sound_source_record && !entity.sound_file.empty() &&
-            entity.sound_phonon.m_uSoundResourceID == resource.subtype)
-            return true;
-    return false;
-}
-
-bool append_pc_material_map_override(Buffer* out, const ChunkList& source,
-                                     const char* material_map_path, Arena* arena, Error* err);
-bool pc_environment_material_chunk_indices(const ChunkList& source, uint32_t* text_chunk_index,
-                                           uint32_t* material_chunk_index, Error* err);
 
 bool contains_u32(const std::vector<uint32_t>& values, uint32_t value) {
     for (uint32_t existing : values)
@@ -765,51 +521,29 @@ bool static_text_references(const ChunkRef& chunk, Str resource_name) {
     return false;
 }
 
+bool append_imported_hierarchy_support(Buffer*, const Document&, const ChunkList&, Error*);
+
 bool append_static_object_support(Buffer* out, const Document& document,
-                                  const ChunkList* existing, Error* err) {
+                                  Error* err) {
     std::vector<uint32_t> required_roots;
     for (const Entity& entity : document.entities) {
         if (entity.kind != EntityKind::StaticObject)
             continue;
-        bool needs_donor = !entity.source_entity_record;
-        if (entity.source_entity_record) {
-            needs_donor = false;
-            for (const StaticObjectTemplate& object : document.static_object_templates)
-                if (object.file_id == entity.value_u32_b && !object.donor_path.empty() &&
-                    object.donor_path != document.source_pc_path) {
-                    needs_donor = true;
-                    break;
-                }
-        }
-        if (needs_donor && !contains_u32(required_roots, entity.value_u32_b))
+        if (!contains_u32(required_roots, entity.value_u32_b))
             required_roots.push_back(entity.value_u32_b);
     }
     if (required_roots.empty())
         return true;
 
-    std::vector<uint32_t> present_objects, present_shapes;
+    std::vector<uint32_t> present_objects, present_shapes, present_hierarchies;
     std::vector<std::string> present_textures;
-    if (existing) {
-        for (uint32_t i = 0; i < existing->count; ++i) {
-            const ChunkRef& chunk = existing->chunks[i];
-            RscfInfo resource{};
-            if (rscf_info(chunk, &resource)) {
-                if (resource.type == ASURA_RESOURCEFILE_TYPE_PLATFORMSPECIFIC &&
-                    resource.subtype == ASURA_RESOURCEFILE_TYPE_PC_OBJECT && resource.payload_size >= 4)
-                    present_objects.push_back(read_u32(resource.payload));
-                else if (resource.type == ASURA_RESOURCEFILE_TYPE_TEXTURE)
-                    present_textures.push_back(normalized_resource_path(resource.name));
-            } else if (chunk.cid == ASURA_CHUNK_SHAPE &&
-                       chunk.size >= sizeof(Asura_Chunk_Header) + 4) {
-                present_shapes.push_back(read_u32(chunk.data + sizeof(Asura_Chunk_Header)));
-            }
-        }
-    }
-
     Arena scratch{};
     if (!arena_init(&scratch, 128 * MiB, err))
         return false;
-    for (const std::string& donor_path : document.object_donors) {
+    std::vector<std::string> donors = document.object_donors;
+    if (!document.source_pc_path.empty() && !contains_string(donors, document.source_pc_path))
+        donors.push_back(document.source_pc_path);
+    for (const std::string& donor_path : donors) {
         bool donor_needed = false;
         for (const StaticObjectTemplate& object : document.static_object_templates)
             donor_needed |= object.donor_path == donor_path && contains_u32(required_roots, object.file_id) &&
@@ -830,15 +564,7 @@ bool append_static_object_support(Buffer* out, const Document& document,
                 !contains_u32(donor_ids, object.file_id))
                 donor_ids.push_back(object.file_id);
 
-        const uint32_t support_ids[] = {ASURA_CHUNK_TEXTURENAMES, ASURA_CHUNK_TEXTUREFLAGS,
-                                        ASURA_CHUNK_MATERIAL, ASURA_CHUNK_MATERIALNAMES};
-        auto is_material_support = [&](uint32_t cid) {
-            for (uint32_t support : support_ids)
-                if (cid == support)
-                    return true;
-            return false;
-        };
-        for (size_t id_index = 0; id_index < donor_ids.size(); ++id_index) {
+        for (size_t id_index = 0; !err->set && id_index < donor_ids.size(); ++id_index) {
             const uint32_t id = donor_ids[id_index];
             for (uint32_t i = 0; i < donor.count; ++i) {
                 RscfInfo resource{};
@@ -849,9 +575,8 @@ bool append_static_object_support(Buffer* out, const Document& document,
                     continue;
                 if (!contains_u32(present_objects, id)) {
                     wanted[i] = 1;
-                    for (int32_t before = static_cast<int32_t>(i) - 1;
-                         before >= 0 && is_material_support(donor.chunks[before].cid); --before)
-                        wanted[before] = 1;
+                    if (!mark_material_support(donor, i, wanted.data(), err))
+                        break;
                 }
                 const uint32_t vertex_count = read_u32(resource.payload + 8);
                 const uint32_t index_count = read_u32(resource.payload + 12);
@@ -872,10 +597,17 @@ bool append_static_object_support(Buffer* out, const Document& document,
                         read_u32(shape.data + sizeof(Asura_Chunk_Header)) != id)
                         continue;
                     wanted[i] = 1;
-                    if (i + 1 < donor.count && donor.chunks[i + 1].cid == ASURA_CHUNK_SHAPEDATA)
-                        wanted[i + 1] = 1;
                     break;
                 }
+            }
+            // SHPD is keyed by shape ID, not adjacency to SHAP. In level05d,
+            // shelving's SHPD precedes its model while SHAP is hundreds of
+            // chunks later. MCP2 0x4415A0 reads ID, flags and optional bounds.
+            for (uint32_t i = 0; i < donor.count; ++i) {
+                const ChunkRef& data = donor.chunks[i];
+                if (data.cid == ASURA_CHUNK_SHAPEDATA && data.size >= 24 &&
+                    read_u32(data.data + 16) == id)
+                    wanted[i] = 1;
             }
         }
         for (uint32_t i = 0; i < donor.count; ++i) {
@@ -918,6 +650,25 @@ bool append_static_object_support(Buffer* out, const Document& document,
             }
             append_chunk_copy(out, donor.chunks[i], err);
         }
+        if (!err->set && append_imported_hierarchy_support(out, document, donor, err)) {
+            for (const auto& object : document.static_object_templates) {
+                if (object.donor_path != donor_path || !contains_u32(required_roots, object.file_id)) continue;
+                Snipe_ServerEntity_StaticObject_ChunkDataV0 body{};
+                memcpy(&body, object.body.data(), sizeof(body));
+                const uint32_t skin = body.m_xPhysicalObject.m_uSkinID;
+                if (!skin) continue;
+                for (uint32_t i = 0; i < donor.count; ++i) {
+                    RscfInfo resource{};
+                    if (rscf_info(donor.chunks[i], &resource) && resource.type == 0 &&
+                        (resource.subtype == ASURA_RESOURCEFILE_TYPE_PC_CHARACTER ||
+                         resource.subtype == ASURA_RESOURCEFILE_TYPE_PC_OBJECTHIERARCHY) &&
+                        asura_lower_name_hash(resource.name) == skin) {
+                        present_hierarchies.push_back(object.file_id);
+                        break;
+                    }
+                }
+            }
+        }
         unmap_file(&donor.file);
         arena_reset(&scratch, mark);
         if (err->set)
@@ -925,8 +676,18 @@ bool append_static_object_support(Buffer* out, const Document& document,
     }
     if (!err->set) {
         for (uint32_t id : required_roots) {
+            if (contains_u32(present_hierarchies, id)) continue;
             if (!contains_u32(present_objects, id) || !contains_u32(present_shapes, id)) {
-                fail(err, "Object %08X is not available from the selected Objects donors", id);
+                // Imported entities can reference assets supplied by shared
+                // game files. Keep that existing reference; a newly selected
+                // external donor must still supply its model and collision.
+                bool source_reference = false;
+                for (const StaticObjectTemplate& object : document.static_object_templates)
+                    source_reference |= object.file_id == id && !document.source_pc_path.empty() &&
+                                        object.donor_path == document.source_pc_path;
+                if (source_reference) continue;
+                fail(err, "Object %08X is missing %s from the selected Objects donors", id,
+                     !contains_u32(present_objects, id) ? "its model" : "its collision shape");
                 break;
             }
         }
@@ -935,226 +696,385 @@ bool append_static_object_support(Buffer* out, const Document& document,
     return !err->set;
 }
 
-bool pack_pc_document(Document& doc, const char* output_path, std::string* why) {
-    Error err{};
-    Arena arena{};
-    ChunkList source{};
-    Buffer output{};
-    Sounds sounds{};
-    SoundTriggerExport sound_triggers;
-    bool ok = arena_init(&arena, 64 * MiB, &err) &&
-              parse_chunks(doc.source_pc_path.c_str(), &source, &arena, &err) &&
-              prepare_sound_triggers(doc, &source, &sound_triggers, &err);
-    uint32_t material_text_chunk = 0xffffffffu;
-    uint32_t material_chunk = 0xffffffffu;
-    if (ok && !doc.material_map.empty())
-        ok = pc_environment_material_chunk_indices(source, &material_text_chunk,
-                                                   &material_chunk, &err);
-    uint64_t reserve = 0;
-    if (ok) {
-        if (source.file.size > UINT64_MAX - 64 * MiB)
-            ok = fail(&err, "source .PC is too large");
-        else
-            reserve = source.file.size + 64 * MiB;
+bool append_imported_hierarchy_support(Buffer* out, const Document& doc,
+                                       const ChunkList& source, Error* err) {
+    std::vector<uint32_t> required, present, required_anims, present_anims;
+    std::vector<std::string> textures;
+    for (const Entity& entity : doc.entities)
+        if ((entity.kind == EntityKind::StaticObject || entity.kind == EntityKind::Pickup) &&
+            entity.pickup_skin_id && !contains_u32(required, entity.pickup_skin_id))
+            required.push_back(entity.pickup_skin_id);
+    if (required.empty()) return true;
+    for (const Entity& entity : doc.entities)
+        if ((entity.kind == EntityKind::StaticObject || entity.kind == EntityKind::Pickup) &&
+            entity.pickup_skin_id && entity.pickup_anim_id && !contains_u32(required_anims, entity.pickup_anim_id))
+            required_anims.push_back(entity.pickup_anim_id);
+    // Weapon support may already have emitted some of these hierarchies.
+    for (uint64_t at = sizeof(kAsuraMagic); at + sizeof(Asura_Chunk_Header) <= out->size;) {
+        const uint8_t* bytes = out->base + at;
+        const uint32_t size = read_u32(bytes + 4);
+        if (size < sizeof(Asura_Chunk_Header) || size > out->size - at)
+            return fail(err, "invalid output while collecting hierarchy dependencies");
+        const ChunkRef chunk{bytes, size, read_u32(bytes), read_u32(bytes + 8), read_u32(bytes + 12), 0};
+        RscfInfo resource{};
+        if (rscf_info(chunk, &resource)) {
+            if (resource.type == ASURA_RESOURCEFILE_TYPE_PLATFORMSPECIFIC &&
+                (resource.subtype == ASURA_RESOURCEFILE_TYPE_PC_OBJECTHIERARCHY ||
+                 resource.subtype == ASURA_RESOURCEFILE_TYPE_PC_CHARACTER))
+                present.push_back(asura_lower_name_hash(resource.name));
+            else if (resource.type == ASURA_RESOURCEFILE_TYPE_TEXTURE)
+                textures.push_back(normalized_resource_path(resource.name));
+        }
+        if (chunk.cid == ASURA_CHUNK_HIERARCHY_COMPRESSEDANIM && chunk.version <= 4) {
+            const Str name = padded_string_at(chunk.data, chunk.size, 44);
+            if (name.data) present_anims.push_back(asura_lower_name_hash(name));
+        }
+        at += size;
     }
-    if (ok && sizeof(void*) == 4 && reserve > 512 * MiB)
-        ok = fail(&err, "source .PC is too large for the 32-bit editor; use the x64 build");
-    if (ok)
-        ok = buffer_init(&output, reserve, &err) && make_editor_sounds(doc, &sounds, &arena, &err) &&
-             buffer_append(&output, kAsuraMagic, sizeof(kAsuraMagic), &err) != ~0ull;
-
-    bool source_has_lights = false, source_has_phonons = false, source_has_editable_entities = false;
-    bool source_has_ambience = false;
-    if (ok) {
+    std::vector<uint8_t> wanted(source.count);
+    // MCP2 0x43D6C0: HSKL names its root skin and LOD skin, followed by
+    // optional weighted vertices and a distance. Keep the named LOD meshes.
+    for (size_t root = 0; root < required.size(); ++root) {
         for (uint32_t i = 0; i < source.count; ++i) {
-            source_has_lights |= source.chunks[i].cid == ASURA_CHUNK_LIGHTS;
-            source_has_phonons |= source.chunks[i].cid == ASURA_CHUNK_PHONONS;
-            source_has_editable_entities |= editable_pc_entity_chunk(source.chunks[i]);
-            source_has_ambience |=
-                source.chunks[i].cid == ASURA_CHUNK_STREAMINGBACKGROUNDSOUND;
+            const auto& lod = source.chunks[i];
+            if (lod.cid != ASURA_CHUNK_HIERARCHY_SKINLOD || lod.version != 0) continue;
+            const auto root_name = padded_string_at(lod.data, lod.size, 16);
+            if (!root_name.data || asura_lower_name_hash(root_name) != required[root]) continue;
+            const uint32_t name_at = static_cast<uint32_t>(align_up(17ull + root_name.size, 4));
+            const auto lod_name = padded_string_at(lod.data, lod.size, name_at);
+            if (!lod_name.data) return fail(err, "invalid HSKL name");
+            const uint64_t data_at = align_up(static_cast<uint64_t>(name_at) + lod_name.size + 1, 4);
+            if (data_at + 8 > lod.size || data_at + 8 + 72ull * read_u32(lod.data + data_at) > lod.size)
+                return fail(err, "truncated HSKL data");
+            const uint32_t id = asura_lower_name_hash(lod_name);
+            if (!contains_u32(present, id)) wanted[i] = 1;
+            if (!contains_u32(required, id)) required.push_back(id);
         }
     }
-    bool wrote_lights = false, wrote_phonons = false, wrote_entities = false, wrote_sound_resources = false;
-    bool wrote_object_support = false;
-    bool wrote_skybox = false;
-    auto write_lights = [&]() {
-        if (!wrote_lights) {
-            wrote_lights = true;
-            ok = ok && append_editor_lights(&output, doc, &err);
+    for (uint32_t i = 0; i < source.count; ++i) {
+        RscfInfo resource{};
+        if (!rscf_info(source.chunks[i], &resource) ||
+            resource.type != ASURA_RESOURCEFILE_TYPE_PLATFORMSPECIFIC ||
+            (resource.subtype != ASURA_RESOURCEFILE_TYPE_PC_OBJECTHIERARCHY &&
+             resource.subtype != ASURA_RESOURCEFILE_TYPE_PC_CHARACTER)) continue;
+        const uint32_t skin = asura_lower_name_hash(resource.name);
+        if (!contains_u32(required, skin) || contains_u32(present, skin)) continue;
+        wanted[i] = 1;
+        present.push_back(skin);
+        if (!mark_material_support(source, i, wanted.data(), err)) return false;
+        for (uint32_t scan = i; scan > 0; --scan) {
+            const uint32_t h = scan - 1;
+            const ChunkRef& chunk = source.chunks[h];
+            if (chunk.cid != ASURA_CHUNK_HIERARCHY_SKIN ||
+                !str_ieq(padded_string_at(chunk.data, chunk.size, 24), resource.name)) continue;
+            wanted[h] = 1;
+            // Animation dependencies are resolved by name below, not adjacency.
+            break;
         }
-    };
-    auto write_phonons = [&]() {
-        if (!wrote_sound_resources) {
-            wrote_sound_resources = true;
-            ok = ok && append_sound_resources(&output, sounds, &arena, &err);
+        for (uint32_t adjunct = 0; adjunct < source.count; ++adjunct) {
+            const auto& data = source.chunks[adjunct];
+            uint32_t name_at = 0;
+            if (data.cid == fourcc('H','S','B','B')) name_at = 16;
+            else if (data.cid == fourcc('H','M','P','T') || data.cid == fourcc('H','S','N','D')) name_at = 20;
+            if (name_at && str_ieq(padded_string_at(data.data, data.size, name_at), resource.name))
+                wanted[adjunct] = 1;
         }
-        if (!wrote_phonons) {
-            wrote_phonons = true;
-            ok = ok && append_phon(&output, sounds, &err);
-        }
-    };
-    auto write_object_support = [&]() {
-        if (!wrote_object_support) {
-            wrote_object_support = true;
-            ok = ok && append_static_object_support(&output, doc, &source, &err);
-        }
-    };
-    auto write_entities = [&]() {
-        if (!wrote_entities) {
-            write_object_support();
-            wrote_entities = true;
-            ok = ok && append_sound_entities(&output, sounds, &err) && append_editor_spawnpoints(&output, doc, &err) &&
-                 append_editor_pickups(&output, doc, &err) && append_editor_static_objects(&output, doc, &err) &&
-                 append_editor_building_volumes(&output, doc, &err);
-        }
-    };
-
-    for (uint32_t i = 0; ok && i < source.count; ++i) {
+    }
+    // MCP2 sub_43D8E0 reads the HCAN name after its 44-byte header. Match
+    // the entity's animation ID across the whole stream: 5dlava_rest follows
+    // its Character resource, so the old backwards-only skin scan missed it.
+    for (uint32_t i = 0; i < source.count; ++i) {
         const ChunkRef& chunk = source.chunks[i];
-        if (replaces_sound_trigger_chunk(chunk, sound_triggers))
-            continue;
-        // MCP2 MTRL processing at 0x440440 calls sub_405AD0, which frees and
-        // recreates the original-index conversion array. The Env reader then
-        // resolves every strip through that array at 0x49E6AD. Replace the
-        // source table at its original stream position so the imported map is
-        // the one active for Env without leaving a duplicate material state.
-        if (!doc.material_map.empty() && i == material_text_chunk) {
-            ok = append_pc_material_map_override(&output, source, doc.material_map.c_str(),
-                                                 &arena, &err);
-            if (!ok)
+        if (chunk.cid != ASURA_CHUNK_HIERARCHY_COMPRESSEDANIM || chunk.version > 4) continue;
+        const Str name = padded_string_at(chunk.data, chunk.size, 44);
+        if (!name.data) continue;
+        const uint32_t id = asura_lower_name_hash(name);
+        if (contains_u32(required_anims, id) && !contains_u32(present_anims, id)) {
+            wanted[i] = 1;
+            present_anims.push_back(id);
+        }
+    }
+    for (uint32_t i = 0; i < source.count; ++i) {
+        RscfInfo resource{};
+        if (!rscf_info(source.chunks[i], &resource) || resource.type != ASURA_RESOURCEFILE_TYPE_TEXTURE ||
+            contains_string(textures, normalized_resource_path(resource.name))) continue;
+        for (uint32_t j = 0; j < source.count; ++j)
+            if (wanted[j] && static_text_references(source.chunks[j], resource.name)) {
+                wanted[i] = 1;
+                textures.push_back(normalized_resource_path(resource.name));
                 break;
-            continue;
-        }
-        if (!doc.material_map.empty() &&
-            (i == material_chunk ||
-             (material_chunk != 0xffffffffu && i > material_text_chunk && i < material_chunk &&
-              chunk.cid == ASURA_CHUNK_TEXTUREFLAGS)))
-            continue;
-        if (chunk.cid == ASURA_CHUNK_SKYBOX && doc.skybox.source_record) {
-            if (!wrote_skybox) {
-                wrote_skybox = true;
-                ok = append_editor_skybox(&output, doc.skybox, &err);
             }
-            continue;
-        }
-        // The target updates its global weather state whenever it encounters a
-        // supported WTHR. Keep every source record consistent so a duplicate
-        // or reordered chunk cannot restore the level's authored rain value.
-        if (chunk.cid == ASURA_CHUNK_WEATHERSYSTEM && doc.weather_source_record &&
-            chunk.version >= 5 && chunk.version <= 6 && chunk.size > 21) {
-            ok = append_editor_weather_copy(&output, chunk, doc, &err);
-            continue;
-        }
-        if (chunk.cid == ASURA_CHUNK_EXTENDED_PARTICLE_RAIN_SYSTEM && doc.weather_source_record &&
-            chunk.version == 0 && chunk.size >= kExtendedRainFlagsOffset + sizeof(uint32_t)) {
-            ok = append_editor_extended_rain_copy(&output, chunk, doc, &err);
-            continue;
-        }
-        if (chunk.cid == ASURA_CHUNK_STREAMINGBACKGROUNDSOUND &&
-            doc.ambient_source_record) {
-            ok = append_editor_ambience_copy(&output, chunk, doc, &err);
-            continue;
-        }
-        if (chunk.cid == ASURA_CHUNK_RESOURCEFILE) {
-            RscfInfo resource{};
-            if (rscf_info(chunk, &resource) && replaced_pc_sound_resource(doc, resource))
-                continue;
-        }
-        if (chunk.cid == ASURA_CHUNK_LIGHTS) {
-            write_lights();
-            continue;
-        }
-        if (chunk.cid == ASURA_CHUNK_PHONONS) {
-            if (!source_has_lights)
-                write_lights();
-            write_phonons();
-            continue;
-        }
-        if (chunk.cid == ASURA_CHUNK_ENTITY) {
-            write_object_support();
-            if (!source_has_lights)
-                write_lights();
-            if (!source_has_phonons)
-                write_phonons();
-            const bool editable = editable_pc_entity_chunk(chunk);
-            if (!wrote_entities && (editable || !source_has_editable_entities))
-                write_entities();
-            if (editable)
-                continue;
-            ok = append_source_entity_copy(&output, chunk, doc, &err);
-            continue;
-        }
-        ok = ok && append_chunk_copy(&output, chunk, &err);
     }
-    if (ok) {
-        write_lights();
-        write_phonons();
-        write_entities();
-        ok = ok && append_sound_trigger_export(&output, sound_triggers, &err);
-        if (!source_has_ambience && !doc.ambient_stream_path.empty())
-            ok = ok && append_editor_ambience(&output, doc, &err);
-        ok = ok && buffer_append(&output, nullptr, sizeof(Asura_Chunk_Header), &err) != ~0ull;
-    }
-    if (ok)
-        ok = patch_fnfo_file_size(&output, &err);
-
-    // The source may also be the explicitly selected destination. Release its
-    // read mapping before opening the output with CREATE_ALWAYS.
-    unmap_file(&source.file);
-    if (ok)
-        ok = write_entire_file(output_path, output.base, output.size, &err);
-    if (ok) {
-        std::error_code source_error, output_error;
-        const auto source_path = std::filesystem::weakly_canonical(doc.source_pc_path, source_error);
-        const auto destination = std::filesystem::weakly_canonical(output_path, output_error);
-        if (!source_error && !output_error && _wcsicmp(source_path.c_str(), destination.c_str()) == 0) {
-            uint32_t sound_index = 0;
-            // When overwriting the backing file, the next export must replace
-            // these newly generated triggers instead of appending duplicates.
-            for (auto& entity : doc.entities) {
-                if (entity.kind != EntityKind::Sound) continue;
-                const SoundEntry& sound = sounds.items[sound_index++];
-                // Newly authored controllers/resources are now source-backed.
-                // Keep their IDs stable when exporting to this file again.
-                entity.sound_source_record = true;
-                entity.sound_has_controller = sound.emit_enti;
-                auto& phonon = entity.sound_phonon;
-                phonon.m_uSoundResourceID = sound.sound_resource_id;
-                phonon.m_uGuid = sound.phonon_guid;
-                phonon.m_xPosition = sound.position;
-                phonon.m_fInnerRadius = sound.inner_radius;
-                phonon.m_fOuterRadius = sound.outer_radius;
-                phonon.m_uFlags = sound.flags;
-                memcpy(phonon.m_afLegacyVolumeParameters, sound.legacy_volume_parameters,
-                       sizeof(phonon.m_afLegacyVolumeParameters));
-                phonon.m_xInnerCuboidRadius = sound.inner_cuboid_radius;
-                phonon.m_xOuterCuboidRadius = sound.outer_cuboid_radius;
-                phonon.m_xRetriggerBoundingBox = sound.retrigger_bounding_box;
-                phonon.m_xOrient = sound.orientation;
-                if (!sound_triggers.replace_message_set_zero) continue;
-                const uint32_t old_guid = entity.sound_trigger_source_guid;
-                entity.sound_trigger_source_guid = 0;
-                for (const auto& link : sound_triggers.controller_trigger_guids)
-                    if (link.first == entity.guid) entity.sound_trigger_source_guid = link.second;
-                doc.dirty |= old_guid != entity.sound_trigger_source_guid;
-            }
-        }
-    }
-    if (!ok && why)
-        *why = err.set ? err.message : "Packing the imported PC level failed.";
-    buffer_release(&output);
-    arena_release(&arena);
-    return ok;
+    for (uint32_t i = 0; i < source.count; ++i)
+        if (wanted[i] && !append_chunk_copy(out, source.chunks[i], err)) return false;
+    return true;
 }
+
+// Convert precisely the renderable triangles decoded by the importer to the
+// shared environment builder's input. No source modules, visibility, navigation
+// or collision payloads are copied into the new level.
+bool make_pc_geometry(const ChunkList& source, ObjData* obj,
+                      std::vector<PcEnvironmentMaterialBinding>* materials,
+                      Arena* arena, Error* err) {
+    RscfInfo resource{};
+    Mesh mesh;
+    if (!find_pc_environment(source, &resource))
+        return fail(err, "the .PC contains no PC environment RSCF");
+    if (!decode_pc_environment(resource, &mesh, arena, err) ||
+        !pc_environment_material_bindings(source, materials, err))
+        return false;
+    if (mesh.positions.size() > INT32_MAX || mesh.faces.size() > UINT32_MAX)
+        return fail(err, "the PC geometry exceeds the shared builder's limits");
+    obj->position_count = obj->normal_count = obj->texcoord_count =
+        static_cast<uint32_t>(mesh.positions.size());
+    obj->face_count = static_cast<uint32_t>(mesh.faces.size());
+    obj->positions = arena_array<Asura_Vector_3>(arena, obj->position_count, err);
+    obj->normals = arena_array<Asura_Vector_3>(arena, obj->normal_count, err);
+    obj->texcoords = arena_array<Asura_Vector_2>(arena, obj->texcoord_count, err);
+    obj->colors = arena_array<uint32_t>(arena, obj->position_count, err);
+    obj->has_color = arena_array<uint8_t>(arena, obj->position_count, err);
+    obj->faces = arena_array<ObjFace>(arena, obj->face_count, err);
+    if (err->set) return false;
+    for (uint32_t i = 0; i < obj->position_count; ++i) {
+        obj->positions[i] = mesh.positions[i];
+        obj->normals[i] = mesh.normals[i];
+        obj->texcoords[i] = {mesh.texcoords[i].x, 1.0f - mesh.texcoords[i].y};
+        obj->colors[i] = mesh.diffuse_abgr[i];
+        obj->has_color[i] = 1;
+    }
+    // Untextured geometry still needs an explicit material table on re-export.
+    if (materials->empty()) materials->resize(1);
+    const uint32_t untextured = static_cast<uint32_t>(materials->size());
+    std::vector<Str> names(materials->size() + 1);
+    for (uint32_t i = 0; i < obj->face_count; ++i) {
+        const int32_t original = mesh.face_materials[i];
+        const uint32_t material = original < 0 ? untextured
+                                   : original >= 1000 ? original - 1000 : original;
+        if (original >= 0 && material >= untextured)
+            return fail(err, "PC geometry references missing material %u", material);
+        if (material == untextured && materials->size() == untextured)
+            materials->push_back({});
+        if (!names[material].data) {
+            char* name = arena_array<char>(arena, 32, err);
+            if (!name) return false;
+            snprintf(name, 32, "mat_%u", material);
+            names[material] = str_from_c(name);
+        }
+        auto index = [](uint32_t vertex) {
+            const int32_t one_based = static_cast<int32_t>(vertex + 1);
+            return ObjIndex{one_based, one_based, one_based};
+        };
+        const auto& face = mesh.faces[i];
+        obj->faces[i] = {index(face[0]), index(face[1]), index(face[2]), names[material], i};
+    }
+    return true;
+}
+
+bool append_pc_texture(Buffer* out, const ChunkList& source, Str name, Error* err) {
+    if (!name.size) return true;
+    for (uint32_t i = 0; i < source.count; ++i) {
+        RscfInfo resource{};
+        if (rscf_info(source.chunks[i], &resource) &&
+            resource.type == ASURA_RESOURCEFILE_TYPE_TEXTURE &&
+            text_name_matches_resource(name, resource.name)) {
+            if (resource.payload_size < 4 || memcmp(resource.payload, "DDS ", 4))
+                return fail(err, "PC texture '%.*s' is not a DDS payload", name.size, name.data);
+            return append_rscf(out, resource.name, resource.type, resource.subtype,
+                               resource.payload, resource.payload_size, err);
+        }
+    }
+    // Stock levels may reference textures supplied by the game's shared files.
+    return true;
+}
+
+bool append_pc_materials(Buffer* out, const ChunkList& source, const EnvView& env,
+                         const MaterialMap& map,
+                         const std::vector<PcEnvironmentMaterialBinding>& materials,
+                         Error* err) {
+    std::vector<uint8_t> used(materials.size());
+    for (uint32_t i = 0; i < env.strip_count; ++i) {
+        const int32_t original = env.strips[i].m_iOriginalMaterialIndex;
+        if (original < 0) continue;
+        const uint32_t ordinal = original >= 1000 ? original - 1000 : original;
+        if (ordinal >= materials.size()) return fail(err, "rebuilt PC material index is invalid");
+        used[ordinal] = 1;
+    }
+    std::vector<Str> names(materials.size());
+    std::vector<std::string> emitted;
+    for (uint32_t i = 0; i < materials.size(); ++i) {
+        if (!used[i]) continue;
+        const Str mapped = material_texture_name(map, i);
+        names[i] = mapped.size ? mapped : materials[i].texture_name;
+        const std::string key = normalized_resource_path(names[i]);
+        if (!contains_string(emitted, key)) {
+            if (!append_pc_texture(out, source, names[i], err)) return false;
+            emitted.push_back(key);
+        }
+    }
+    // MCP2 0x440440 recreates the original-index material conversion array;
+    // write this table immediately before Env so object/weapon tables cannot
+    // change the meaning of its strips (target consumer at 0x49E6AD).
+    const uint32_t count = static_cast<uint32_t>(materials.size());
+    ChunkMark text = begin_chunk(out, ASURA_CHUNK_TEXTURENAMES, 3, 0, err);
+    append_u32(out, count, err);
+    for (Str name : names) append_padded_cstr(out, name, err);
+    if (!end_chunk(out, text, err)) return false;
+    ChunkMark txfl = begin_chunk(out, ASURA_CHUNK_TEXTUREFLAGS, 1, 0, err);
+    append_u32(out, count, err);
+    for (uint32_t i = 0; i < count; ++i)
+        append_u32(out, used[i] ? materials[i].texture_flags : 0, err);
+    if (!end_chunk(out, txfl, err)) return false;
+    ChunkMark mtrl = begin_chunk(out, ASURA_CHUNK_MATERIAL, 1, 0, err);
+    append_u32(out, count, err);
+    for (uint32_t i = 0; i < count; ++i) {
+        append_u32(out, names[i].size ? i : UINT32_MAX, err);
+        append_u32(out, used[i] ? material_override(map, "transparency_flag_by_material_index",
+                                                   i, materials[i].flags) : 0, err);
+        append_u32(out, used[i] ? material_override(map, "surface_type_by_material_index",
+                                                   i, materials[i].surface_type) : 0, err);
+    }
+    return end_chunk(out, mtrl, err);
+}
+
+bool append_pc_sky_textures(Buffer* out, const ChunkList& source, const Document& doc, Error* err) {
+    if (!doc.sky_texture_dir.empty()) return true;
+    std::vector<std::string> emitted;
+    for (const std::string& path : doc.skybox.texture_paths) {
+        const Str name{path.data(), static_cast<uint32_t>(path.size())};
+        const std::string key = normalized_resource_path(name);
+        if (contains_string(emitted, key)) continue;
+        if (!append_pc_texture(out, source, name, err)) return false;
+        emitted.push_back(key);
+    }
+    return true;
+}
+
+bool append_pc_sound_resources(Buffer* out, const ChunkList& source, const Sounds& sounds, Error* err) {
+    std::vector<uint32_t> emitted;
+    for (uint32_t i = 0; i < sounds.count; ++i) {
+        const SoundEntry& sound = sounds.items[i];
+        if (sound.file || contains_u32(emitted, sound.sound_resource_id)) continue;
+        for (uint32_t j = 0; j < source.count; ++j) {
+            RscfInfo resource{};
+            if (rscf_info(source.chunks[j], &resource) && resource.type == ASURA_RESOURCEFILE_TYPE_SOUND &&
+                resource.subtype == sound.sound_resource_id) {
+                if (!append_rscf(out, resource.name, resource.type, resource.subtype,
+                                 resource.payload, resource.payload_size, err)) return false;
+                break;
+            }
+        }
+        emitted.push_back(sound.sound_resource_id);
+    }
+    return true;
+}
+
+bool append_editor_targets(Buffer* out, const ChunkList& source, const Document& doc, Error* err) {
+    for (const Entity& entity : doc.entities) {
+        if (entity.kind != EntityKind::AssassinationTarget) continue;
+        const ChunkRef* record = nullptr;
+        for (uint32_t i = 0; i < source.count; ++i) {
+            const ChunkRef& chunk = source.chunks[i];
+            if (chunk.cid == ASURA_CHUNK_ENTITY && chunk.version == 0 &&
+                chunk.size >= sizeof(Asura_Chunk_Entity) + 0x80 &&
+                read_u32(chunk.data + 16) == entity.guid &&
+                read_u16(chunk.data + 20) == SnipeEntityClass_AssassinationTarget) {
+                record = &chunk;
+                break;
+            }
+        }
+        if (!record) return fail(err, "Assassination target '%s' has no supported source record", entity.name.c_str());
+        // Only this explicitly represented, version-checked entity is retained;
+        // do not copy unknown extensions or other source entities around it.
+        std::array<uint8_t, 0x80> body{};
+        memcpy(body.data(), record->data + sizeof(Asura_Chunk_Entity), body.size());
+        // Assassination targets inherit the same static/physical record after
+        // their eight-byte class prefix.
+        constexpr size_t flags_offset = 8 +
+            offsetof(Snipe_ServerEntity_StaticObject_ChunkDataV0, m_uSnipePhysicalFlags);
+        const uint32_t flags = read_u32(body.data() + flags_offset) & ~kSnipePhysicalHidden;
+        memcpy(body.data() + flags_offset, &flags, sizeof(flags));
+        const Asura_Quat orientation = euler_quaternion(entity.rotation);
+        memcpy(body.data() + 0x38, &entity.position, sizeof(entity.position));
+        memcpy(body.data() + 0x44, &orientation, sizeof(orientation));
+        memcpy(body.data() + 0x54, &entity.value_a, sizeof(entity.value_a));
+        ChunkMark chunk = begin_chunk(out, ASURA_CHUNK_ENTITY, 0, 0, err);
+        buffer_append(out, record->data + sizeof(Asura_Chunk_Header),
+                      sizeof(Asura_Chunk_Entity_PayloadHeader), err);
+        buffer_append(out, body.data(), body.size(), err);
+        if (!end_chunk(out, chunk, err)) return false;
+    }
+    return true;
+}
+
+struct CollisionVertexCell {
+    int64_t x, y, z;
+    uint32_t material;
+    bool operator==(const CollisionVertexCell&) const = default;
+};
+
+struct CollisionVertexCellHash {
+    size_t operator()(const CollisionVertexCell& cell) const {
+        uint64_t h = static_cast<uint64_t>(cell.x) * 0x9e3779b185ebca87ull;
+        h ^= static_cast<uint64_t>(cell.y) * 0xc2b2ae3d27d4eb4full;
+        h ^= static_cast<uint64_t>(cell.z) * 0x165667b19e3779f9ull;
+        return static_cast<size_t>(h ^ (static_cast<uint64_t>(cell.material) * 0x85ebca77));
+    }
+};
+
+// Match decoded collision properties to visible faces, without copying source
+// collision geometry. Quads may be triangulated along either diagonal by the
+// renderer. A millimetre tolerance allows for local/world float round-off.
+struct PcCollisionFlagLookup {
+    std::vector<PcCollisionPolygon> polygons;
+    std::unordered_multimap<CollisionVertexCell, uint32_t, CollisionVertexCellHash> cells;
+
+    static CollisionVertexCell cell(Asura_Vector_3 p, uint32_t material) {
+        return {static_cast<int64_t>(floor(static_cast<double>(p.x) * 100)),
+                static_cast<int64_t>(floor(static_cast<double>(p.y) * 100)),
+                static_cast<int64_t>(floor(static_cast<double>(p.z) * 100)), material};
+    }
+    void build() {
+        cells.reserve(polygons.size() * 4);
+        for (uint32_t i = 0; i < polygons.size(); ++i)
+            for (uint32_t j = 0; j < polygons[i].vertex_count; ++j)
+                cells.emplace(cell(polygons[i].vertices[j], polygons[i].material), i);
+    }
+    static bool vertices_close(Asura_Vector_3 a, Asura_Vector_3 b) {
+        return fabsf(a.x - b.x) <= 0.001f && fabsf(a.y - b.y) <= 0.001f && fabsf(a.z - b.z) <= 0.001f;
+    }
+    static uint32_t resolve(const void* context, uint32_t material,
+                            const Asura_Vector_3* corners, uint32_t fallback) {
+        const auto& lookup = *static_cast<const PcCollisionFlagLookup*>(context);
+        const CollisionVertexCell origin = cell(corners[0], material);
+        uint32_t best = 0x10000;
+        for (int x = -1; x <= 1; ++x) for (int y = -1; y <= 1; ++y) for (int z = -1; z <= 1; ++z) {
+            const auto range = lookup.cells.equal_range({origin.x + x, origin.y + y, origin.z + z, material});
+            for (auto it = range.first; it != range.second; ++it) {
+                const auto& polygon = lookup.polygons[it->second];
+                uint32_t used = 0;
+                for (uint32_t corner = 0; corner < 3; ++corner) {
+                    bool found = false;
+                    for (uint32_t vertex = 0; vertex < polygon.vertex_count; ++vertex) {
+                        if (!(used & (1u << vertex)) && vertices_close(corners[corner], polygon.vertices[vertex])) {
+                            used |= 1u << vertex; found = true; break;
+                        }
+                    }
+                    if (!found) { used = 0; break; }
+                }
+                if (used) best = std::min(best, static_cast<uint32_t>(polygon.flags));
+            }
+        }
+        return best <= 0xffff ? best : fallback;
+    }
+};
 
 bool pack_document(Document& doc, const char* output_path, std::string* why) {
     if (!normalise_editor_guids(&doc, why))
         return false;
-    if (!doc.source_pc_path.empty())
-        return pack_pc_document(doc, output_path, why);
-    if (doc.obj_path.empty()) {
+    const bool from_pc = !doc.source_pc_path.empty();
+    if (!from_pc && doc.obj_path.empty()) {
         if (why)
-            *why = "Open an OBJ before exporting.";
+            *why = "Open an OBJ or PC level before exporting.";
         return false;
     }
     bool has_pickups = false, has_static_objects = false;
@@ -1162,19 +1082,19 @@ bool pack_document(Document& doc, const char* output_path, std::string* why) {
         has_pickups |= entity.kind == EntityKind::Pickup;
         has_static_objects |= entity.kind == EntityKind::StaticObject;
     }
-    if (has_pickups && doc.weapons_donor.empty()) {
+    if (has_pickups && !from_pc && doc.weapons_donor.empty()) {
         if (why)
             *why = "Choose a Weapons donor .PC before exporting pickups from a custom level.";
         return false;
     }
-    if (has_static_objects && doc.object_donors.empty()) {
+    if (has_static_objects && !from_pc && doc.object_donors.empty()) {
         if (why)
             *why = "Choose at least one Objects donor .PC before exporting Objects from a custom level.";
         return false;
     }
     Error err{};
     Config cfg{};
-    if (!initialize_editor_config(doc.obj_path.c_str(), &cfg, &err)) {
+    if (!initialize_editor_config(from_pc ? doc.source_pc_path.c_str() : doc.obj_path.c_str(), &cfg, &err)) {
         if (why)
             *why = err.message;
         return false;
@@ -1182,6 +1102,9 @@ bool pack_document(Document& doc, const char* output_path, std::string* why) {
     cfg.material_map = doc.material_map.empty() ? nullptr : doc.material_map.c_str();
     cfg.texture_dir = doc.texture_dir.empty() ? nullptr : doc.texture_dir.c_str();
     cfg.weapon_from_pc = doc.weapons_donor.empty() ? nullptr : doc.weapons_donor.c_str();
+    if (from_pc && has_pickups && !cfg.weapon_from_pc)
+        cfg.weapon_from_pc = doc.source_pc_path.c_str();
+    if (from_pc) cfg.flip_z = false; // The PC importer has already converted Y to editor space.
     cfg.sky_texture_dir = doc.sky_texture_dir.empty() ? nullptr : doc.sky_texture_dir.c_str();
     for (uint32_t slot = 0; slot < ASURA_SKYBOX_V5_V7_TEXTURE_PATH_COUNT; ++slot)
         cfg.sky_texture_paths[slot] = doc.skybox.texture_paths[slot].empty()
@@ -1192,6 +1115,10 @@ bool pack_document(Document& doc, const char* output_path, std::string* why) {
     Arena arena{}, scratch{};
     Buffer output{}, env_payload{};
     MappedFile obj_file{};
+    ChunkList source{};
+    std::vector<PcEnvironmentMaterialBinding> pc_materials;
+    std::vector<uint32_t> pc_collision_flags;
+    PcCollisionFlagLookup pc_face_collision;
     MaterialMap material_map{};
     ObjData obj{};
     EnvBuild env{};
@@ -1201,12 +1128,34 @@ bool pack_document(Document& doc, const char* output_path, std::string* why) {
     TextureSet textures{};
     ModuleMetric* metrics = nullptr;
     bool ok = arena_init(&arena, cfg.arena_reserve, &err) && arena_init(&scratch, cfg.arena_reserve, &err) &&
-              map_file(cfg.obj, &obj_file, &err) && parse_obj(&obj_file, &obj, &arena, &err);
-    if (ok)
+              load_material_map(cfg, &material_map, &arena, &err);
+    if (ok && from_pc) {
+        ok = parse_chunks(doc.source_pc_path.c_str(), &source, &arena, &err) &&
+             make_pc_geometry(source, &obj, &pc_materials, &arena, &err);
+        // Collision is rebuilt from visible geometry. Retain face/material masks
+        // only when the source collision format is understood; an unsupported
+        // collision chunk must not prevent exporting the decoded render mesh.
+        Error collision_error{};
+        if (ok && !pc_environment_collision_flags(source, static_cast<uint32_t>(pc_materials.size()),
+                                                   &pc_collision_flags, &collision_error,
+                                                   &pc_face_collision.polygons)) {
+            pc_collision_flags.assign(pc_materials.size(), 0);
+            pc_face_collision.polygons.clear();
+        }
+        if (ok && !pc_face_collision.polygons.empty()) {
+            pc_face_collision.build();
+            material_map.collision_flag_context = &pc_face_collision;
+            material_map.resolve_collision_flags = PcCollisionFlagLookup::resolve;
+        }
+        material_map.default_collision_flags = pc_collision_flags.data();
+        material_map.default_collision_flag_count = static_cast<uint32_t>(pc_collision_flags.size());
+    } else if (ok) {
+        ok = map_file(cfg.obj, &obj_file, &err) && parse_obj(&obj_file, &obj, &arena, &err);
+    }
+    if (ok && !from_pc)
         ok = validate_spawn_clearance(doc, obj, cfg, &err);
     if (ok)
         ok = buffer_init(&output, cfg.output_reserve, &err) &&
-             load_material_map(cfg, &material_map, &arena, &err) &&
              build_env(cfg, obj, material_map, &arena, &scratch, &env, &err);
     if (ok) {
         env_payload = env.payload;
@@ -1218,19 +1167,23 @@ bool pack_document(Document& doc, const char* output_path, std::string* why) {
     if (ok) {
         metrics = arena_array<ModuleMetric>(&arena, view.module_count, &err);
         ok = metrics && make_editor_sounds(doc, &sounds, &arena, &err) &&
-             prepare_sound_triggers(doc, nullptr, &sound_triggers, &err);
+             prepare_sound_triggers(doc, &sound_triggers, &err);
     }
     if (ok) {
         buffer_append(&output, kAsuraMagic, sizeof(kAsuraMagic), &err);
         ok = append_fnfo(&output, &err) && append_rsfl(&output, &err) &&
              append_weapon_support(&output, cfg, &scratch, &err) &&
-             append_static_object_support(&output, doc, nullptr, &err) &&
+             append_static_object_support(&output, doc, &err) &&
+             (!from_pc || append_imported_hierarchy_support(&output, doc, source, &err)) &&
              append_sky_resources(&output, cfg, &scratch, &err) &&
-             append_textures(&output, cfg, view, material_map, &arena, &scratch, &textures, &err) &&
+             (!from_pc || append_pc_sky_textures(&output, source, doc, &err)) &&
+             (from_pc ? append_pc_materials(&output, source, view, material_map, pc_materials, &err)
+                      : append_textures(&output, cfg, view, material_map, &arena, &scratch, &textures, &err)) &&
              append_rscf(&output, str_from_c(cfg.env_name), ASURA_RESOURCEFILE_TYPE_PLATFORMSPECIFIC,
                          ASURA_RESOURCEFILE_TYPE_PC_ENVIRONMENT, env_payload.base,
                          static_cast<uint32_t>(env_payload.size), &err) &&
              append_sound_resources(&output, sounds, &scratch, &err) &&
+             (!from_pc || append_pc_sound_resources(&output, source, sounds, &err)) &&
              (doc.ambient_stream_path.empty() || append_editor_ambience(&output, doc, &err)) &&
              append_editor_lights(&output, doc, &err) &&
              append_phon(&output, sounds, &err) &&
@@ -1238,16 +1191,20 @@ bool pack_document(Document& doc, const char* output_path, std::string* why) {
                          &scratch, metrics, &err) &&
              append_mlin(&output, metrics, view.module_count, &err) &&
              append_mrvb(&output, view.module_count, &err) && append_nav1(&output, view.module_count, &err) &&
-              append_sound_entities(&output, sounds, &err) && append_editor_spawnpoints(&output, doc, &err) &&
-               append_editor_pickups(&output, doc, &err) && append_editor_static_objects(&output, doc, &err) &&
-               append_editor_building_volumes(&output, doc, &err) &&
-               append_sound_trigger_export(&output, sound_triggers, &err) &&
-               append_editor_skybox(&output, doc.skybox, &err) &&
+             append_sound_entities(&output, sounds, &err) && append_editor_spawnpoints(&output, doc, &err) &&
+             append_editor_pickups(&output, doc, &err) && append_editor_static_objects(&output, doc, &err) &&
+             append_editor_building_volumes(&output, doc, &err) &&
+             append_editor_targets(&output, source, doc, &err) &&
+             append_sound_trigger_export(&output, sound_triggers, &err) &&
+             append_editor_skybox(&output, doc.skybox, &err) &&
              append_fog(&output, &err) && append_editor_weather(&output, doc, &err) &&
              buffer_append(&output, nullptr, sizeof(Asura_Chunk_Header), &err) != ~0ull &&
-             patch_fnfo_file_size(&output, &err) &&
-             write_entire_file(output_path, output.base, output.size, &err);
+             patch_fnfo_file_size(&output, &err);
     }
+    // Allow the selected output to overwrite its backing PC after all required
+    // data has been consumed. Every later export also rebuilds from Document.
+    unmap_file(&source.file);
+    if (ok) ok = write_entire_file(output_path, output.base, output.size, &err);
     if (!ok && why)
         *why = err.set ? err.message : "Packing failed.";
     unmap_file(&material_map.file);
@@ -1931,8 +1888,10 @@ bool advance_pc_padded_string(const ChunkRef& chunk, uint64_t* at, Error* err) {
 }
 
 bool pc_environment_collision_flags(const ChunkList& chunks, uint32_t material_count,
-                                    std::vector<uint32_t>* output, Error* err) {
+                                    std::vector<uint32_t>* output, Error* err,
+                                    std::vector<PcCollisionPolygon>* polygons) {
     output->assign(material_count, 0);
+    if (polygons) polygons->clear();
     const ChunkRef* module_list = nullptr;
     for (uint32_t i = 0; i < chunks.count; ++i) {
         if (chunks.chunks[i].cid == ASURA_CHUNK_ENVIRONMENT_MODULELIST) {
@@ -1971,6 +1930,7 @@ bool pc_environment_collision_flags(const ChunkList& chunks, uint32_t material_c
             return fail(err, "the PC EMOD module %u is truncated", module_index);
 
         const uint8_t* entry = module_list->data + at;
+        const Asura_Vector_3 translation{read_f32(entry), read_f32(entry + 4), read_f32(entry + 8)};
         const uint32_t collision_size = read_u32(
             entry + offsetof(Asura_Chunk_Environment_ModuleList_EntryV6,
                              m_uCollisionDataSize));
@@ -2055,6 +2015,26 @@ bool pc_environment_collision_flags(const ChunkList& chunks, uint32_t material_c
             if (ordinal < material_count) {
                 const uint32_t packed = (ordinal << 16) | flags;
                 frequencies.push_back(static_cast<int32_t>(packed));
+                if (polygons) {
+                    PcCollisionPolygon face;
+                    face.material = ordinal; face.flags = flags;
+                    const uint8_t* ids = collision + fixed_size + vertex_bytes + static_cast<uint64_t>(polygon) * 8;
+                    for (uint32_t corner = 0; corner < 4; ++corner) {
+                        const uint16_t index = read_u16(ids + corner * 2);
+                        if (corner == 3 && index == 0xffff) break;
+                        if (index >= vertex_count)
+                            return fail(err, "the PC EMOD module %u has an invalid collision vertex", module_index);
+                        const uint8_t* vertex = collision + fixed_size + static_cast<uint64_t>(index) * 12;
+                        Asura_Vector_3 point{read_f32(vertex) + translation.x,
+                                             read_f32(vertex + 4) + translation.y,
+                                             read_f32(vertex + 8) + translation.z};
+                        if (!isfinite(point.x) || !isfinite(point.y) || !isfinite(point.z) ||
+                            fabsf(point.x) > 1e12f || fabsf(point.y) > 1e12f || fabsf(point.z) > 1e12f)
+                            return fail(err, "the PC EMOD module %u has invalid collision coordinates", module_index);
+                        face.vertices[face.vertex_count++] = point;
+                    }
+                    polygons->push_back(face);
+                }
             }
         }
     }
@@ -2062,10 +2042,9 @@ bool pc_environment_collision_flags(const ChunkList& chunks, uint32_t material_c
         return fail(err, "the PC EMOD collision table has %llu trailing bytes",
                     static_cast<unsigned long long>(module_list->size - at));
 
-    // Retail collision flags may vary polygon-by-polygon even when polygons
-    // share a render material. collision_flags is material-level, so choose
-    // the mode: it exactly preserves the largest possible number of source
-    // polygons. Prefer the lower mask on a tie for deterministic output.
+    // Per-face records preserve matching visible geometry's masks. Material
+    // modes remain a fallback for render faces absent from source collision,
+    // and for the material-map export. Prefer the lower mask on a tie.
     std::sort(frequencies.begin(), frequencies.end());
     size_t sample = 0;
     uint32_t current_material = 0xffffffffu;
@@ -2096,116 +2075,5 @@ bool pc_environment_collision_flags(const ChunkList& chunks, uint32_t material_c
         (*output)[current_material] = best_flags;
     return true;
 }
-
-bool pc_environment_material_chunk_indices(const ChunkList& source, uint32_t* text_chunk_index,
-                                           uint32_t* material_chunk_index, Error* err) {
-    RscfInfo environment{};
-    if (!find_pc_environment(source, &environment))
-        return fail(err, "the .PC contains no PC environment RSCF");
-
-    uint32_t last_text = 0xffffffffu;
-    uint32_t active_text = 0xffffffffu;
-    uint32_t active_material = 0xffffffffu;
-    bool reached_environment = false;
-    for (uint32_t i = 0; i < source.count; ++i) {
-        const ChunkRef& chunk = source.chunks[i];
-        RscfInfo resource{};
-        if (rscf_info(chunk, &resource) && resource.payload == environment.payload) {
-            reached_environment = true;
-            break;
-        }
-        if (chunk.cid == ASURA_CHUNK_TEXTURENAMES) {
-            last_text = i;
-            if (chunk.version < 3) {
-                active_text = i;
-                active_material = 0xffffffffu;
-            }
-        } else if (chunk.cid == ASURA_CHUNK_MATERIAL) {
-            if (last_text == 0xffffffffu)
-                return fail(err, "the PC environment material table has no preceding TEXT chunk");
-            active_text = last_text;
-            active_material = i;
-        }
-    }
-    if (!reached_environment)
-        return fail(err, "the PC environment resource is absent from the chunk stream");
-    if (active_text == 0xffffffffu)
-        return fail(err, "the PC environment has no material table to override");
-    *text_chunk_index = active_text;
-    *material_chunk_index = active_material;
-    return true;
-}
-
-bool append_pc_material_map_override(Buffer* out, const ChunkList& source,
-                                     const char* material_map_path, Arena* arena, Error* err) {
-    MaterialMap material_map{};
-    Config config{};
-    config.material_map = material_map_path;
-    std::vector<PcEnvironmentMaterialBinding> source_materials;
-    bool ok = load_material_map(config, &material_map, arena, err) &&
-              pc_environment_material_bindings(source, &source_materials, err);
-    if (ok && source_materials.empty())
-        ok = fail(err, "the PC environment has no material bindings to override");
-
-    std::vector<Str> texture_names;
-    std::vector<int32_t> texture_indices;
-    std::vector<uint32_t> material_flags;
-    std::vector<uint32_t> texture_flags;
-    std::vector<uint32_t> surface_types;
-    if (ok) {
-        texture_names.resize(source_materials.size());
-        texture_indices.resize(source_materials.size());
-        material_flags.resize(source_materials.size());
-        texture_flags.resize(source_materials.size());
-        surface_types.resize(source_materials.size());
-        for (uint32_t material_index = 0;
-             material_index < static_cast<uint32_t>(source_materials.size()); ++material_index) {
-            const PcEnvironmentMaterialBinding& source_material = source_materials[material_index];
-            const Str mapped_name = material_texture_name(material_map, material_index);
-            texture_names[material_index] = mapped_name.size ? mapped_name : source_material.texture_name;
-            texture_indices[material_index] = texture_names[material_index].size
-                                                  ? static_cast<int32_t>(material_index)
-                                                  : -1;
-            material_flags[material_index] = material_override(
-                material_map, "transparency_flag_by_material_index", material_index,
-                source_material.flags);
-            texture_flags[material_index] = source_material.texture_flags;
-            surface_types[material_index] = material_override(
-                material_map, "surface_type_by_material_index", material_index,
-                source_material.surface_type);
-        }
-    }
-
-    const uint32_t count = static_cast<uint32_t>(source_materials.size());
-    if (ok) {
-        ChunkMark text = begin_chunk(out, ASURA_CHUNK_TEXTURENAMES, 3, 0, err);
-        ok = append_u32(out, count, err) != ~0ull;
-        for (uint32_t i = 0; ok && i < count; ++i)
-            ok = append_padded_cstr(out, texture_names[i], err);
-        ok = ok && end_chunk(out, text, err);
-    }
-    if (ok) {
-        ChunkMark txfl = begin_chunk(out, ASURA_CHUNK_TEXTUREFLAGS, 1, 0, err);
-        ok = append_u32(out, count, err) != ~0ull;
-        for (uint32_t i = 0; ok && i < count; ++i)
-            ok = append_u32(out, texture_flags[i], err) != ~0ull;
-        ok = ok && end_chunk(out, txfl, err);
-    }
-    if (ok) {
-        ChunkMark mtrl = begin_chunk(out, ASURA_CHUNK_MATERIAL, 1, 0, err);
-        ok = append_u32(out, count, err) != ~0ull;
-        for (uint32_t i = 0; ok && i < count; ++i) {
-            ok = append_u32(out, texture_indices[i] < 0
-                                     ? 0xffffffffu
-                                     : static_cast<uint32_t>(texture_indices[i]), err) != ~0ull &&
-                 append_u32(out, material_flags[i], err) != ~0ull &&
-                 append_u32(out, surface_types[i], err) != ~0ull;
-        }
-        ok = ok && end_chunk(out, mtrl, err);
-    }
-    unmap_file(&material_map.file);
-    return ok;
-}
-
 
 } // namespace editor

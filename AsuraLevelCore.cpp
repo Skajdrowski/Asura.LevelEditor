@@ -103,6 +103,56 @@ bool append_chunk_copy(Buffer* out, const ChunkRef& ch, Error* err) {
     return buffer_append(out, ch.data, ch.size, err) != ~0ull;
 }
 
+bool mark_material_support(const ChunkList& chunks, uint32_t before_chunk,
+                            uint8_t* wanted, Error* err) {
+    if (before_chunk > chunks.count)
+        return fail(err, "material support resource index is out of range");
+    uint32_t last_text = UINT32_MAX, active_text = UINT32_MAX;
+    bool has_materials = false;
+    // TEXT v0-v2 creates implicit materials; v3 only changes the texture
+    // conversion list. MTRL resolves texture indices when it is processed
+    // (MCP2 0x440440, reference Asura_Chunk_Material::Process 0x821FCC78).
+    // A later TEXT v3 therefore cannot replace an existing MTRL's dependency.
+    for (uint32_t i = 0; i < before_chunk; ++i) {
+        const ChunkRef& chunk = chunks.chunks[i];
+        if (chunk.cid == ASURA_CHUNK_TEXTURENAMES) {
+            last_text = i;
+            if (chunk.version < 3) {
+                active_text = i;
+                has_materials = true;
+            }
+        } else if (chunk.cid == ASURA_CHUNK_MATERIAL) {
+            active_text = last_text;
+            has_materials = true;
+        }
+    }
+    if (!has_materials) return true;
+    if (active_text == UINT32_MAX)
+        return fail(err, "model material table has no preceding TEXT chunk");
+    // Keep the effective table and its intervening flag updates, even when
+    // shapes, textures, unselected models or LODs separate it from the model.
+    // Marking the original stream emits shared tables once, in source order,
+    // instead of allocating duplicate runtime material handles per object.
+    for (uint32_t i = active_text; i < before_chunk; ++i) {
+        const ChunkRef& chunk = chunks.chunks[i];
+        switch (chunk.cid) {
+        case ASURA_CHUNK_TEXTURENAMES:
+            if (chunk.version > 3) return fail(err, "unsupported model TEXT version %u", chunk.version);
+            break;
+        case ASURA_CHUNK_TEXTUREFLAGS:
+        case ASURA_CHUNK_MATERIAL:
+            if (chunk.version > 1) return fail(err, "unsupported model material/texture flags version %u", chunk.version);
+            break;
+        case ASURA_CHUNK_MATERIALNAMES:
+            break;
+        default:
+            continue;
+        }
+        wanted[i] = 1;
+    }
+    return true;
+}
+
 bool append_rscf(Buffer* out, Str name, uint32_t type, uint32_t subtype, const void* payload, uint32_t payload_size,
                  Error* err) {
     ChunkMark mark = begin_chunk(out, ASURA_CHUNK_RESOURCEFILE, 0, 0, err);
@@ -953,7 +1003,19 @@ bool append_module_collision_v3(Buffer* out, const EnvView& env, uint32_t module
             if (m > 0xffff)
                 m = 0xffff;
             const uint32_t material_ordinal = m >= 1000 ? m - 1000 : m;
-            const uint32_t flags = material_override(materials, "collision_flags", material_ordinal, 0);
+            uint32_t default_flags = material_ordinal < materials.default_collision_flag_count
+                                               ? materials.default_collision_flags[material_ordinal] : 0;
+            if (materials.resolve_collision_flags) {
+                Asura_Vector_3 corners[3];
+                const uint16_t ids[3]{x, y, z};
+                for (uint32_t corner = 0; corner < 3; ++corner) {
+                    const uint8_t* vertex = vertices + static_cast<uint64_t>(ids[corner]) * 36;
+                    corners[corner] = {read_f32(vertex), read_f32(vertex + 4), read_f32(vertex + 8)};
+                }
+                default_flags = materials.resolve_collision_flags(
+                    materials.collision_flag_context, material_ordinal, corners, default_flags);
+            }
+            const uint32_t flags = material_override(materials, "collision_flags", material_ordinal, default_flags);
             if (flags > 0xffff)
                 return fail(err, "collision_flags[%u] exceeds a u16 mask", material_ordinal);
             tris[nt++] = {x, y, z, static_cast<uint16_t>(flags), static_cast<uint16_t>(m)};
@@ -1570,6 +1632,20 @@ bool append_weapon_support(Buffer* out, const Config& cfg, Arena* scratch, Error
             want[i] = 1;
             if (i + 1 < d.count && d.chunks[i + 1].cid == fourcc('S', 'H', 'P', 'D'))
                 want[i + 1] = 1;
+        }
+    }
+    // A selected model may share a non-adjacent material table with an omitted
+    // resource. Retain the table active at each model, including LOD variants.
+    for (uint32_t i = 0; i < d.count; ++i) {
+        RscfInfo resource{};
+        if (want[i] && rscf_info(d.chunks[i], &resource) &&
+            resource.type == ASURA_RESOURCEFILE_TYPE_PLATFORMSPECIFIC &&
+            (resource.subtype == ASURA_RESOURCEFILE_TYPE_PC_OBJECT ||
+             resource.subtype == ASURA_RESOURCEFILE_TYPE_PC_OBJECTHIERARCHY) &&
+            !mark_material_support(d, i, want, err)) {
+            unmap_file(&d.file);
+            arena_reset(scratch, mark);
+            return false;
         }
     }
     // Pickup/weapon TEXT chunks name texture resources without the leading

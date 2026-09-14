@@ -23,11 +23,19 @@ bool pc_environment_material_bindings(
     std::vector<PcEnvironmentMaterialBinding>* materials,
     asura::Error* err);
 
+struct PcCollisionPolygon {
+    Asura_Vector_3 vertices[4]{}; // Game coordinates, including module translation.
+    uint32_t vertex_count = 0;
+    uint32_t material = 0;
+    uint16_t flags = 0;
+};
+
 bool pc_environment_collision_flags(
     const asura::level::ChunkList& chunks,
     uint32_t material_count,
     std::vector<uint32_t>* flags,
-    asura::Error* err);
+    asura::Error* err,
+    std::vector<PcCollisionPolygon>* polygons = nullptr);
 
 Asura_Vector_3 oriented_box_dimensions(const Entity& entity);
 

@@ -112,6 +112,11 @@ struct VertexKey {
 struct MaterialMap {
     MappedFile file;
     Json* root;
+    const uint32_t* default_collision_flags = nullptr;
+    uint32_t default_collision_flag_count = 0;
+    // Imported geometry can carry flags per face, independently of materials.
+    const void* collision_flag_context = nullptr;
+    uint32_t (*resolve_collision_flags)(const void*, uint32_t, const Asura_Vector_3*, uint32_t) = nullptr;
 };
 
 struct EnvBuild {
@@ -171,6 +176,8 @@ bool rscf_info(const ChunkRef& chunk, RscfInfo* out);
 ChunkMark begin_chunk(Buffer* out, ASURA_CHUNKID cid, uint32_t version, uint32_t flags, Error* err);
 bool end_chunk(Buffer* out, ChunkMark mark, Error* err);
 bool append_chunk_copy(Buffer* out, const ChunkRef& chunk, Error* err);
+bool mark_material_support(const ChunkList& chunks, uint32_t before_chunk,
+                            uint8_t* wanted, Error* err);
 bool append_rscf(Buffer* out, Str name, uint32_t type, uint32_t subtype, const void* payload,
                  uint32_t payload_size, Error* err);
 bool patch_fnfo_file_size(Buffer* out, Error* err);

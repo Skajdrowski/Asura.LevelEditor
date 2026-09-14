@@ -1,4 +1,5 @@
 #include "LevelEditorInternal.h"
+#include "LevelEditorAnimation.h"
 
 #include <initializer_list>
 #include <new>
@@ -113,6 +114,36 @@ struct GpuEntityModelRange {
     const EntityModelMaterial* material = nullptr;
     bool selected = false;
     EntityKind kind;
+    Asura_Vector_3 center{};
+    uint32_t resource_subtype = ASURA_RESOURCEFILE_TYPE_PC_OBJECT;
+};
+
+enum class GpuEntityBlend { Opaque, Alpha, Additive };
+
+GpuEntityBlend gpu_entity_blend(const GpuEntityModelRange& range) {
+    if (!range.material || range.material->texture_bytes.empty())
+        return GpuEntityBlend::Opaque;
+    // MCP2 sub_48E760 (Object) and sub_489C30 (ObjectHierarchy): flag 1
+    // takes precedence, then flag 2 selects cutout or TXFL-8 alpha blending.
+    const uint32_t flags = range.material->flags;
+    // MCP2 0x48B590: Character uses alpha blending for material flag 2,
+    // independently of TXFL and of the Object renderer's flag-1 precedence.
+    if (range.resource_subtype == ASURA_RESOURCEFILE_TYPE_PC_CHARACTER)
+        return flags & 2u ? GpuEntityBlend::Alpha : GpuEntityBlend::Opaque;
+    if (flags & 1u)
+        return GpuEntityBlend::Opaque;
+    if (flags & 2u)
+        return range.material->texture_flags & 8u ? GpuEntityBlend::Alpha : GpuEntityBlend::Opaque;
+    // Object's additional 0x1000 branch (sub_48AE70) uses blend mode 5:
+    // SRC_ALPHA / ONE, with ZWRITE disabled. This is used by 5d_glare.
+    if (range.resource_subtype == ASURA_RESOURCEFILE_TYPE_PC_OBJECT && (flags & 0x1000u))
+        return GpuEntityBlend::Additive;
+    return GpuEntityBlend::Opaque;
+}
+
+struct GpuTransparentEntityRange {
+    const GpuEntityModelRange* range;
+    float depth;
 };
 
 struct GpuModelTexture {
@@ -141,6 +172,7 @@ struct GpuEntitySnapshot {
     uint32_t value_u32_a = 0;
     uint32_t light_flags = 0;
     uint32_t selection_order = 0;
+    uint32_t animation_id = 0;
 };
 
 struct GpuModelLookupSnapshot {
@@ -170,6 +202,7 @@ bool same_entity_snapshot(const GpuEntitySnapshot& a, const GpuEntitySnapshot& b
            a.sound_range == b.sound_range && a.light_range == b.light_range &&
            a.value_u32_a == b.value_u32_a && a.light_flags == b.light_flags &&
            a.selection_order == b.selection_order &&
+           a.animation_id == b.animation_id &&
            a.vertices == b.vertices && a.faces == b.faces && a.materials == b.materials &&
            a.face_count == b.face_count;
 }
@@ -229,6 +262,7 @@ struct GpuRenderer {
     ID3D11Buffer* mesh_vertices = nullptr;
     ID3D11Buffer* mesh_indices = nullptr;
     ID3D11Buffer* entity_model_vertices = nullptr;
+    ID3D11Buffer* animated_model_vertices = nullptr;
     ID3D11Buffer* overlay_vertices = nullptr;
     ID3D11Buffer* rain_vertices = nullptr;
     ID3D11RasterizerState* rasterizer_cull_back = nullptr;
@@ -254,6 +288,7 @@ struct GpuRenderer {
     uint32_t mesh_index_count = 0;
     uint32_t skybox_cloud_vertex_count = 0;
     uint32_t entity_model_capacity = 0;
+    uint32_t animated_model_capacity = 0;
     uint32_t overlay_capacity = 0;
     uint32_t rain_capacity = 0;
     uint32_t rain_vertex_count = 0;
@@ -262,6 +297,12 @@ struct GpuRenderer {
     std::vector<GpuVertex> rain_scratch;
     std::vector<GpuVertex> entity_model_scratch;
     std::vector<GpuEntityModelRange> entity_model_range_scratch;
+    std::vector<GpuEntityModelRange> animated_model_ranges;
+    std::vector<GpuVertex> animated_model_scratch;
+    std::vector<EntityModelVertex> skinned_vertex_scratch;
+    bool animated_models_active = false;
+    ULONGLONG animation_start = GetTickCount64();
+    std::vector<GpuTransparentEntityRange> transparent_entity_range_scratch;
     std::vector<GpuVertex> overlay_scratch;
     std::vector<uint32_t> entity_selection_order_scratch;
     std::vector<const EntityModel*> entity_models_scratch;
@@ -300,7 +341,7 @@ void refresh_scene_animation_timer() {
         return;
     const bool animated_clouds = g.document.skybox.draw_clouds && gpu.skybox_cloud;
     const bool animated_rain = g.document.rain_enabled && gpu.rain_texture && gpu.rain_pixel_shader;
-    if (animated_clouds || animated_rain)
+    if (animated_clouds || animated_rain || gpu.animated_models_active)
         SetTimer(g.window, 2, 33, nullptr);
     else
         KillTimer(g.window, 2);
@@ -1292,6 +1333,7 @@ void gpu_shutdown() {
     gpu_release(gpu.rain_vertices);
     gpu_release(gpu.overlay_vertices);
     gpu_release(gpu.entity_model_vertices);
+    gpu_release(gpu.animated_model_vertices);
     gpu_release(gpu.mesh_indices);
     gpu_release(gpu.mesh_vertices);
     gpu_release(gpu.depth_disabled);
@@ -1469,7 +1511,9 @@ float4 PSMain(VSOutput input) : SV_TARGET {
     float3 baseColor = dot(abs(input.color.rgb), float3(1.0, 1.0, 1.0)) > 0.001
                            ? input.color.rgb
                            : float3(0.32, 0.39, 0.43);
-    return float4(baseColor * albedo.rgb * light, 1.0);
+    // Preserve texture alpha for translucent object materials. Opaque and
+    // cutout draws still disable blending and write scene depth.
+    return float4(baseColor * albedo.rgb * light, albedo.a);
 }
 Texture2D environmentTexture : register(t2);
 Texture2D environmentAuxiliary : register(t3);
@@ -2059,6 +2103,7 @@ GpuEntitySnapshot gpu_entity_snapshot(const Entity& entity, const EntityModel* m
     snapshot.sound_range = entity.value_b;
     snapshot.value_u32_a = entity.value_u32_a;
     snapshot.selection_order = selection_order;
+    snapshot.animation_id = entity.pickup_anim_id;
     if (entity.kind == EntityKind::Sound) {
         // Applying sound box properties must invalidate the cached overlay even
         // when selection, position and audible range have not changed.
@@ -2201,16 +2246,18 @@ void gpu_render_skybox(const DirectX::XMFLOAT4X4& view_projection) {
 
 void append_gpu_entity_model_range(std::vector<GpuEntityModelRange>* ranges, uint32_t start_vertex,
                                    uint32_t vertex_count, const EntityModelMaterial* material,
-                                   bool selected, EntityKind kind) {
+                                   bool selected, EntityKind kind, uint32_t model_start_vertex = 0,
+                                   uint32_t resource_subtype = ASURA_RESOURCEFILE_TYPE_PC_OBJECT) {
     if (!ranges || !vertex_count)
         return;
     if (!ranges->empty() && ranges->back().material == material &&
         ranges->back().selected == selected && ranges->back().kind == kind &&
+        ranges->back().start_vertex >= model_start_vertex &&
         ranges->back().start_vertex + ranges->back().vertex_count == start_vertex) {
         ranges->back().vertex_count += vertex_count;
         return;
     }
-    ranges->push_back({start_vertex, vertex_count, material, selected, kind});
+    ranges->push_back({start_vertex, vertex_count, material, selected, kind, {}, resource_subtype});
 }
 
 void append_gpu_spawn_puppet(const Entity& entity, bool selected, std::vector<GpuVertex>* output,
@@ -2249,9 +2296,11 @@ void append_gpu_spawn_puppet(const Entity& entity, bool selected, std::vector<Gp
 
 void append_gpu_entity_model(const Entity& entity, const EntityModel* model, bool selected,
                              std::vector<GpuVertex>* output,
-                             std::vector<GpuEntityModelRange>* ranges = nullptr) {
+                             std::vector<GpuEntityModelRange>* ranges = nullptr,
+                             const std::vector<EntityModelVertex>* posed_vertices = nullptr) {
     if (!model)
         return;
+    const uint32_t model_start_vertex = static_cast<uint32_t>(output->size());
     for (uint32_t face_index = 0; face_index < model->faces.size(); ++face_index) {
         const auto& face = model->faces[face_index];
         const int32_t material_index = face_index < model->face_materials.size()
@@ -2273,8 +2322,9 @@ void append_gpu_entity_model(const Entity& entity, const EntityModel* model, boo
                                                              : DirectX::XMFLOAT4{1.0f, .68f, .22f, 0};
         const uint32_t start_vertex = static_cast<uint32_t>(output->size());
         for (uint16_t index : face)
-            output->push_back(gpu_model_vertex(model->vertices[index], entity, color));
-        append_gpu_entity_model_range(ranges, start_vertex, 3, material, selected, entity.kind);
+            output->push_back(gpu_model_vertex(posed_vertices ? (*posed_vertices)[index] : model->vertices[index], entity, color));
+        append_gpu_entity_model_range(ranges, start_vertex, 3, material, selected, entity.kind,
+                                      model_start_vertex, model->resource_subtype);
     }
 }
 
@@ -2284,7 +2334,8 @@ void append_gpu_entity_geometry(const Entity& entity, const EntityModel* model, 
     if (entity.kind == EntityKind::SpawnPoint)
         append_gpu_spawn_puppet(entity, selected, vertices, ranges);
     else if (entity.kind == EntityKind::Pickup || entity.kind == EntityKind::StaticObject)
-        append_gpu_entity_model(entity, model, selected, vertices, ranges);
+        if (!entity_model_animation(entity, *model))
+            append_gpu_entity_model(entity, model, selected, vertices, ranges);
 }
 
 DirectX::XMFLOAT4 gpu_overlay_entity_color(EntityKind kind, bool selected) {
@@ -2372,15 +2423,14 @@ void append_oriented_bounds_gizmo(const Entity& entity, std::vector<LightGizmoLi
     append_box_edges(corners, lines);
 }
 
-void gpu_draw_entity_model_ranges(const std::vector<GpuEntityModelRange>& ranges, bool selected) {
+void gpu_draw_entity_model_ranges(const std::vector<GpuEntityModelRange>& ranges, bool selected,
+                                  Asura_Vector_3 camera_position, Asura_Vector_3 camera_forward) {
     gpu.context->PSSetSamplers(0, 1, &gpu.environment_sampler);
     ID3D11RasterizerState* bound_rasterizer = nullptr;
     ID3D11ShaderResourceView* bound_texture = nullptr;
     bool rasterizer_bound = false;
     bool texture_bound = false;
-    for (const GpuEntityModelRange& range : ranges) {
-        if (range.selected != selected || !range.vertex_count)
-            continue;
+    const auto draw_range = [&](const GpuEntityModelRange& range) {
         ID3D11RasterizerState* rasterizer = range.kind == EntityKind::SpawnPoint || !g.backface_culling
                                                ? gpu.rasterizer_no_cull
                                                : gpu.rasterizer_cull_back;
@@ -2396,7 +2446,40 @@ void gpu_draw_entity_model_ranges(const std::vector<GpuEntityModelRange>& ranges
             texture_bound = true;
         }
         gpu.context->Draw(range.vertex_count, range.start_vertex);
+    };
+    auto& transparent = gpu.transparent_entity_range_scratch;
+    transparent.clear();
+    gpu.context->OMSetBlendState(nullptr, nullptr, 0xffffffffu);
+    gpu.context->OMSetDepthStencilState(gpu.depth_enabled, 0);
+    for (const GpuEntityModelRange& range : ranges) {
+        if (range.selected != selected || !range.vertex_count)
+            continue;
+        if (gpu_entity_blend(range) == GpuEntityBlend::Opaque)
+            draw_range(range);
+        else
+            transparent.push_back({&range, dot(sub(range.center, camera_position), camera_forward)});
     }
+    // Complete solid objects before compositing effects, regardless of entity
+    // list order. Alpha and additive ranges share a back-to-front pass so an
+    // alpha surface can correctly cover a light shaft behind it.
+    std::stable_sort(transparent.begin(), transparent.end(),
+                     [](const auto& a, const auto& b) { return a.depth > b.depth; });
+    if (!transparent.empty()) {
+        // skybox_depth is LESS_EQUAL with depth writes disabled.
+        gpu.context->OMSetDepthStencilState(gpu.skybox_depth, 0);
+        ID3D11BlendState* bound_blend = nullptr;
+        for (const auto& entry : transparent) {
+            ID3D11BlendState* blend = gpu_entity_blend(*entry.range) == GpuEntityBlend::Additive
+                                          ? gpu.additive_blend : gpu.alpha_blend;
+            if (blend != bound_blend) {
+                gpu.context->OMSetBlendState(blend, nullptr, 0xffffffffu);
+                bound_blend = blend;
+            }
+            draw_range(*entry.range);
+        }
+    }
+    gpu.context->OMSetBlendState(nullptr, nullptr, 0xffffffffu);
+    gpu.context->OMSetDepthStencilState(gpu.depth_enabled, 0);
     ID3D11ShaderResourceView* none = nullptr;
     gpu.context->PSSetShaderResources(0, 1, &none);
 }
@@ -2669,6 +2752,14 @@ void gpu_render() {
                                            &entity_model_vertices, &entity_model_ranges);
         gpu.cached_selected_model_count =
             static_cast<uint32_t>(entity_model_vertices.size()) - gpu.cached_unselected_model_count;
+        for (auto& range : entity_model_ranges) {
+            Asura_Vector_3 sum{};
+            for (uint32_t i = 0; i < range.vertex_count; ++i) {
+                const auto& p = entity_model_vertices[range.start_vertex + i].position;
+                sum = add(sum, {p.x, p.y, p.z});
+            }
+            range.center = mul(sum, 1.0f / range.vertex_count);
+        }
         gpu.cached_entity_models_ready = !entity_model_vertices.empty() &&
                                          gpu_update_dynamic_vertices(&gpu.entity_model_vertices,
                                                                      &gpu.entity_model_capacity,
@@ -2746,6 +2837,38 @@ void gpu_render() {
         gpu.cached_overlay_mesh_radius = g.mesh.radius;
         gpu.entity_snapshot.swap(next_snapshot);
     }
+    // Keep the large static scene cached. Only deform and upload animated
+    // objects each frame, including separate poses for shared-mesh instances.
+    gpu.animated_model_scratch.clear();
+    gpu.animated_model_ranges.clear();
+    const double animation_seconds = (GetTickCount64() - gpu.animation_start) * .001;
+    for (size_t i = 0; i < entity_count; ++i) {
+        if (!entity_models[i] || !sample_entity_model(g.document.entities[i], *entity_models[i],
+                animation_seconds, &gpu.skinned_vertex_scratch)) continue;
+        append_gpu_entity_model(g.document.entities[i], entity_models[i], selection_order[i] != 0,
+            &gpu.animated_model_scratch, &gpu.animated_model_ranges, &gpu.skinned_vertex_scratch);
+    }
+    const bool animations_active = !gpu.animated_model_ranges.empty();
+    if (gpu.animated_models_active != animations_active) {
+        gpu.animated_models_active = animations_active;
+        refresh_scene_animation_timer();
+    }
+    for (auto& range : gpu.animated_model_ranges) {
+        Asura_Vector_3 sum{};
+        for (uint32_t i = 0; i < range.vertex_count; ++i) {
+            const auto& p = gpu.animated_model_scratch[range.start_vertex + i].position;
+            sum = add(sum, {p.x, p.y, p.z});
+        }
+        range.center = mul(sum, 1.0f / range.vertex_count);
+    }
+    const bool animated_ready = animations_active && gpu_update_dynamic_vertices(
+        &gpu.animated_model_vertices, &gpu.animated_model_capacity, gpu.animated_model_scratch);
+    const auto draw_animated = [&](bool selected) {
+        if (!animated_ready) return;
+        gpu.context->IASetVertexBuffers(0, 1, &gpu.animated_model_vertices, &stride, &offset);
+        gpu.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        gpu_draw_entity_model_ranges(gpu.animated_model_ranges, selected, camera_position, forward);
+    };
     std::vector<GpuEntityModelRange>& entity_model_ranges = gpu.entity_model_range_scratch;
     const uint32_t unselected_model_count = gpu.cached_unselected_model_count;
     const uint32_t selected_model_count = gpu.cached_selected_model_count;
@@ -2761,19 +2884,25 @@ void gpu_render() {
         gpu.context->OMSetDepthStencilState(gpu.depth_enabled, 0);
         gpu.context->IASetVertexBuffers(0, 1, &gpu.entity_model_vertices, &stride, &offset);
         gpu.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        gpu_draw_entity_model_ranges(entity_model_ranges, false);
+        gpu_draw_entity_model_ranges(entity_model_ranges, false, camera_position, forward);
     }
+    draw_animated(false);
     if (overlay_ready)
         gpu_draw_overlay_range(entity_start, selected_entity_start - entity_start, gpu.depth_enabled);
     // Only the selected model discards scene depth. Drawing with depth enabled
     // after the clear preserves the model's own self-occlusion.
-    if (entity_models_ready && selected_model_count) {
+    bool selected_animation = false;
+    for (const auto& range : gpu.animated_model_ranges) selected_animation |= range.selected;
+    if ((entity_models_ready && selected_model_count) || (animated_ready && selected_animation)) {
         gpu.context->ClearDepthStencilView(gpu.depth_view, D3D11_CLEAR_DEPTH, 1, 0);
+    }
+    if (entity_models_ready && selected_model_count) {
         gpu.context->OMSetDepthStencilState(gpu.depth_enabled, 0);
         gpu.context->IASetVertexBuffers(0, 1, &gpu.entity_model_vertices, &stride, &offset);
         gpu.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        gpu_draw_entity_model_ranges(entity_model_ranges, true);
+        gpu_draw_entity_model_ranges(entity_model_ranges, true, camera_position, forward);
     }
+    draw_animated(true);
     if (overlay_ready)
         gpu_draw_overlay_range(selected_entity_start,
                                gpu.cached_overlay_vertex_count - selected_entity_start,
@@ -2784,6 +2913,7 @@ void gpu_render() {
 bool gpu_ready() { return gpu.ready; }
 bool gpu_has_skybox_cloud() { return gpu.skybox_cloud != nullptr; }
 bool gpu_has_rain_texture() { return gpu.rain_texture != nullptr; }
+bool gpu_has_animated_models() { return gpu.animated_models_active; }
 
 void gpu_set_skybox_tint(const SkyboxSettings& skybox) {
     gpu.skybox_tint = {std::clamp(skybox.red / 255.0f, 0.0f, 1.0f),

@@ -26,7 +26,7 @@ SURFACE_TYPES = (
 )
 
 BLENDING_FLAGS = (
-    (1, "?Additive pass (SRC_ALPHA / ONE)"),
+    (1, "Additive pass (SRC_ALPHA / ONE)"),
     (2, "Alpha texture"),
     (4, "?Detail mapping via detail.dds"),
     (0x80, "Spheremap1.dds reflection"),

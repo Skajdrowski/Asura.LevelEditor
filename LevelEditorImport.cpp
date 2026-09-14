@@ -1,6 +1,7 @@
 #include "LevelEditorImport.h"
 #include "LevelEditorGeometry.h"
 #include "LevelEditorSoundTriggers.h"
+#include "LevelEditorAnimation.h"
 
 #include <algorithm>
 #include <set>
@@ -426,7 +427,8 @@ std::string static_object_resource_name(const ChunkList& chunks, uint32_t file_i
         if (resource.subtype == ASURA_RESOURCEFILE_TYPE_PC_OBJECT && resource.payload_size >= 4 &&
             read_u32(resource.payload) == file_id)
             return std::string(resource.name.data, resource.name.size);
-        if (resource.subtype == ASURA_RESOURCEFILE_TYPE_PC_OBJECTHIERARCHY && skin_id &&
+        if ((resource.subtype == ASURA_RESOURCEFILE_TYPE_PC_OBJECTHIERARCHY ||
+             resource.subtype == ASURA_RESOURCEFILE_TYPE_PC_CHARACTER) && skin_id &&
             asura_lower_name_hash(resource.name) == skin_id)
             return std::string(resource.name.data, resource.name.size);
     }
@@ -646,6 +648,9 @@ bool donor_has_static_shape(const ChunkList& chunks, uint32_t file_id) {
     return false;
 }
 
+bool decode_pc_pickup_model(const ChunkList&, uint32_t, const RscfInfo&, uint32_t, PickupModel*, Error*);
+bool decode_pc_character_model(const ChunkList&, uint32_t, const RscfInfo&, uint32_t, PickupModel*, Error*);
+
 bool load_static_object_donors(const std::vector<std::string>& paths,
                                std::vector<StaticObjectTemplate>* templates,
                                std::vector<StaticObjectModel>* models, std::string* why) {
@@ -697,6 +702,41 @@ bool load_static_object_donors(const std::vector<std::string>& paths,
                 next_models.push_back(std::move(model));
             else if (err.set)
                 ok = false;
+        }
+        // Animated static objects are identified by their ENTI skin, rather
+        // than by a PC_OBJECT file ID and SHAP. Their HSKN owns the collision.
+        for (uint32_t i = 0; ok && i < chunks.count; ++i) {
+            const ChunkRef& chunk = chunks.chunks[i];
+            if (chunk.cid != ASURA_CHUNK_ENTITY || chunk.version != 0 ||
+                chunk.size < sizeof(Asura_Chunk_Entity) + kStaticObjectBodySize ||
+                read_u16(chunk.data + 20) != SnipeEntityClass_StaticObject) continue;
+            Snipe_ServerEntity_StaticObject_ChunkDataV0 body{};
+            memcpy(&body, chunk.data + sizeof(Asura_Chunk_Entity), sizeof(body));
+            if (!valid_static_object_body(body) || body.m_uNumLinksToBlock || !body.m_xPhysicalObject.m_uSkinID) continue;
+            const uint32_t file_id = body.m_xPhysicalObject.m_uFileID;
+            bool duplicate = false;
+            for (const auto& entry : next_templates) duplicate |= entry.file_id == file_id;
+            if (duplicate) continue;
+            for (uint32_t r = 0; r < chunks.count; ++r) {
+                RscfInfo resource{};
+                if (!rscf_info(chunks.chunks[r], &resource) || resource.type != 0 ||
+                    (resource.subtype != ASURA_RESOURCEFILE_TYPE_PC_CHARACTER &&
+                     resource.subtype != ASURA_RESOURCEFILE_TYPE_PC_OBJECTHIERARCHY) ||
+                    asura_lower_name_hash(resource.name) != body.m_xPhysicalObject.m_uSkinID) continue;
+                PickupModel decoded;
+                ok = resource.subtype == ASURA_RESOURCEFILE_TYPE_PC_CHARACTER
+                    ? decode_pc_character_model(chunks, r, resource, body.m_xPhysicalObject.m_uSkinID, &decoded, &err)
+                    : decode_pc_pickup_model(chunks, r, resource, body.m_xPhysicalObject.m_uSkinID, &decoded, &err);
+                if (ok) ok = decode_model_animations(chunks, {body.m_xPhysicalObject.m_uAnimID}, &decoded.mesh, &err);
+                if (ok) {
+                    auto object = make_canonical_static_object_template(file_id, resource.name, path);
+                    memcpy(object.body.data(), &body, sizeof(body));
+                    object.entity_padding = read_u16(chunk.data + 22);
+                    next_templates.push_back(std::move(object));
+                    next_models.push_back({file_id, std::move(decoded.mesh)});
+                }
+                break;
+            }
         }
         unmap_file(&chunks.file);
         arena_reset(&arena, mark);
@@ -923,6 +963,7 @@ bool decode_pc_pickup_model(const ChunkList& chunks, uint32_t chunk_index, const
     PickupModel next;
     next.skin_id = skin_id;
     next.mesh.resource_name.assign(resource.name.data, resource.name.size);
+    next.mesh.resource_subtype = ASURA_RESOURCEFILE_TYPE_PC_OBJECTHIERARCHY;
     if (!decode_pc_model_materials(chunks, chunk_index, &next.mesh.materials, err))
         return false;
     std::vector<HierarchyBindTransform> bind_pose;
@@ -991,6 +1032,10 @@ bool decode_pc_pickup_model(const ChunkList& chunks, uint32_t chunk_index, const
                         vertex.normal = hierarchy_rotate(vertex.normal, bind.orientation);
                         destination = static_cast<uint16_t>(next.mesh.vertices.size());
                         next.mesh.vertices.push_back(vertex);
+                        ModelVertexWeights weights;
+                        weights.bones[0] = static_cast<uint16_t>(strip_index);
+                        weights.weights[0] = 1;
+                        next.mesh.weights.push_back(weights);
                     }
                     destination_indices[corner] = destination;
                 }
@@ -1022,6 +1067,82 @@ bool decode_pc_pickup_model(const ChunkList& chunks, uint32_t chunk_index, const
     return true;
 }
 
+bool decode_pc_character_model(const ChunkList& chunks, uint32_t chunk_index,
+                               const RscfInfo& resource, uint32_t skin_id,
+                               PickupModel* output, Error* err) {
+    // MCP2 sub_49E420: padded skin name, four counts/material words, 64-byte
+    // skinned vertices, then a 16-bit triangle strip. The first 32 vertex
+    // bytes are the same bind-pose position/normal/UV used by Object meshes.
+    const Str name = padded_string_at(resource.payload, resource.payload_size, 0);
+    if (!name.data || !str_ieq(name, resource.name))
+        return fail(err, "Character preview has a mismatched embedded skin name");
+    const uint64_t counts_at = align_up(static_cast<uint64_t>(name.size) + 1, 4);
+    if (counts_at + 16 > resource.payload_size)
+        return fail(err, "Character '%.*s' counts are truncated", name.size, name.data);
+    const uint32_t windows = read_u32(resource.payload + counts_at);
+    const uint32_t vertex_count = read_u32(resource.payload + counts_at + 4);
+    const uint32_t index_count = read_u32(resource.payload + counts_at + 8);
+    const int32_t material = static_cast<int32_t>(read_u32(resource.payload + counts_at + 12));
+    const uint64_t vertices_at = counts_at + 16;
+    const uint64_t indices_at = vertices_at + static_cast<uint64_t>(vertex_count) * 64;
+    if (!vertex_count || vertex_count > 65535 || index_count < 3 || windows != index_count - 2 ||
+        indices_at + static_cast<uint64_t>(index_count) * 2 > resource.payload_size)
+        return fail(err, "Character '%.*s' has invalid geometry counts", name.size, name.data);
+    PickupModel next;
+    next.skin_id = skin_id;
+    next.mesh.resource_name.assign(name.data, name.size);
+    next.mesh.resource_subtype = ASURA_RESOURCEFILE_TYPE_PC_CHARACTER;
+    if (!decode_pc_model_materials(chunks, chunk_index, &next.mesh.materials, err))
+        return false;
+    next.mesh.vertices.resize(vertex_count);
+    next.mesh.weights.resize(vertex_count);
+    for (uint32_t i = 0; i < vertex_count; ++i) {
+        auto& vertex = next.mesh.vertices[i];
+        if (!decode_pc_preview_vertex(resource.payload + vertices_at + static_cast<uint64_t>(i) * 64, &vertex))
+            return fail(err, "Character '%.*s' contains non-finite vertices", name.size, name.data);
+        const uint8_t* source = resource.payload + vertices_at + static_cast<uint64_t>(i) * 64;
+        for (size_t j = 0; j < 4; ++j) {
+            const float palette_index = read_f32(source + 32 + j * 4);
+            const float weight = read_f32(source + 48 + j * 4);
+            if (!isfinite(weight) || weight < 0 || !isfinite(palette_index) ||
+                palette_index < 0 || palette_index > 93 || fmodf(palette_index, 3) != 0)
+                return fail(err, "Character '%.*s' has invalid bone weights", name.size, name.data);
+            // MCP2 shader at 0x6FD038 reads c[index+9]; 0x48B590 uploads
+            // bone 1 at c12. The serialized index is therefore bone * 3.
+            next.mesh.weights[i].bones[j] = static_cast<uint16_t>(palette_index / 3);
+            next.mesh.weights[i].weights[j] = weight;
+        }
+        if (!i) next.mesh.min = next.mesh.max = vertex.position;
+        else {
+            next.mesh.min.x = fminf(next.mesh.min.x, vertex.position.x);
+            next.mesh.min.y = fminf(next.mesh.min.y, vertex.position.y);
+            next.mesh.min.z = fminf(next.mesh.min.z, vertex.position.z);
+            next.mesh.max.x = fmaxf(next.mesh.max.x, vertex.position.x);
+            next.mesh.max.y = fmaxf(next.mesh.max.y, vertex.position.y);
+            next.mesh.max.z = fmaxf(next.mesh.max.z, vertex.position.z);
+        }
+    }
+    next.mesh.faces.reserve(windows);
+    next.mesh.face_materials.reserve(windows);
+    for (uint32_t i = 0; i < windows; ++i) {
+        uint16_t a = read_u16(resource.payload + indices_at + static_cast<uint64_t>(i) * 2);
+        uint16_t b = read_u16(resource.payload + indices_at + static_cast<uint64_t>(i + 1) * 2);
+        const uint16_t c = read_u16(resource.payload + indices_at + static_cast<uint64_t>(i + 2) * 2);
+        if (i & 1) std::swap(a, b);
+        if (a == 0xffff || b == 0xffff || c == 0xffff) continue;
+        if (a >= vertex_count || b >= vertex_count || c >= vertex_count)
+            return fail(err, "Character '%.*s' has an out-of-range index", name.size, name.data);
+        if (a != b && a != c && b != c) {
+            next.mesh.faces.push_back({a, c, b}); // Viewport Y reflection.
+            next.mesh.face_materials.push_back(material);
+        }
+    }
+    if (next.mesh.faces.empty())
+        return fail(err, "Character '%.*s' has no renderable triangles", name.size, name.data);
+    *output = std::move(next);
+    return true;
+}
+
 bool decode_pc_pickup_models(const ChunkList& chunks, const Document& document,
                              std::vector<PickupModel>* models, Error* err) {
     models->clear();
@@ -1029,7 +1150,8 @@ bool decode_pc_pickup_models(const ChunkList& chunks, const Document& document,
         RscfInfo resource{};
         if (!rscf_info(chunks.chunks[chunk_index], &resource) ||
             resource.type != ASURA_RESOURCEFILE_TYPE_PLATFORMSPECIFIC ||
-            resource.subtype != ASURA_RESOURCEFILE_TYPE_PC_OBJECTHIERARCHY)
+            (resource.subtype != ASURA_RESOURCEFILE_TYPE_PC_OBJECTHIERARCHY &&
+             resource.subtype != ASURA_RESOURCEFILE_TYPE_PC_CHARACTER))
             continue;
         const uint32_t skin_id = asura_lower_name_hash(resource.name);
         if (!pickup_skin_is_referenced(document, skin_id))
@@ -1040,8 +1162,21 @@ bool decode_pc_pickup_models(const ChunkList& chunks, const Document& document,
         if (duplicate)
             continue;
         PickupModel model;
-        if (!decode_pc_pickup_model(chunks, chunk_index, resource, skin_id, &model, err))
+        const bool ok = resource.subtype == ASURA_RESOURCEFILE_TYPE_PC_CHARACTER
+                            ? decode_pc_character_model(chunks, chunk_index, resource, skin_id, &model, err)
+                            : decode_pc_pickup_model(chunks, chunk_index, resource, skin_id, &model, err);
+        if (!ok)
             return false;
+        std::vector<uint32_t> animation_ids;
+        for (const Entity& entity : document.entities)
+            if (entity.pickup_skin_id == skin_id && entity.pickup_anim_id &&
+                std::find(animation_ids.begin(), animation_ids.end(), entity.pickup_anim_id) == animation_ids.end())
+                animation_ids.push_back(entity.pickup_anim_id);
+        for (const auto& item : document.pickup_templates)
+            if (item.skin_id == skin_id && item.anim_id &&
+                std::find(animation_ids.begin(), animation_ids.end(), item.anim_id) == animation_ids.end())
+                animation_ids.push_back(item.anim_id);
+        if (!decode_model_animations(chunks, animation_ids, &model.mesh, err)) return false;
         models->push_back(std::move(model));
     }
     return true;

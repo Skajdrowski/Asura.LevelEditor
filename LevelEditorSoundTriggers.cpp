@@ -133,94 +133,37 @@ Asura_Bounding_Box sound_trigger_bounds(const Entity& e) {
             e.position.z + o.z - s.z/2, e.position.z + o.z + s.z/2};
 }
 
-bool prepare_sound_triggers(const Document& doc, const ChunkList* source,
-                            SoundTriggerExport* out, Error* err) {
+bool prepare_sound_triggers(const Document& doc, SoundTriggerExport* out, Error* err) {
     *out = {};
-    bool needed = false;
-    for (const auto& e : doc.entities)
-        needed |= e.kind == EntityKind::Sound && (e.sound_trigger_enabled || e.sound_trigger_source_guid);
-    if (!needed && !source) return true;
     Blocks blocks;
-    std::set<uint32_t> used, source_sounds;
-    bool found_set = false;
-    if (source) for (uint32_t i = 0; i < source->count; ++i) {
-        const auto& c = source->chunks[i];
-        if (c.cid == ASURA_CHUNK_ENTITY && c.size >= 24) used.insert(read_u32(c.data + 16));
-        if (c.cid == ASURA_CHUNK_ENTITY && c.size >= 40 &&
-            read_u16(c.data + 20) == AsuraEntityClass_SoundController)
-            source_sounds.insert(read_u32(c.data + 16));
-        if (c.cid == ASURA_CHUNK_STATICMESSAGES && message_set(c) == UINT32_MAX) {
-            if (!needed) return true;
-            return fail(err, "Cannot extend a malformed static-message chunk.");
-        }
-        if (message_set(c) == 0) {
-            if (found_set || !read_blocks(c, &blocks)) {
-                if (!needed) return true;
-                return fail(err, "Cannot extend this level's static-message set safely (duplicate or unsupported data).");
-            }
-            found_set = true;
-        }
-    }
-    // A deleted source sound no longer carries its trigger GUID in Document.
-    // Remove only the same simple, sound-only trigger shape that import owns;
-    // arbitrary game scripts remain untouched and existing blocks stay valid.
-    if (source) for (uint32_t i = 0; i < source->count; ++i) {
-        WireTrigger t;
-        if (!read_trigger(source->chunks[i], &t) || t.enter >= blocks.size() ||
-            blocks[t.enter].size() != 1) continue;
-        const uint32_t sound_guid = blocks[t.enter][0].to;
-        if (!source_sounds.count(sound_guid) || !matches_sound(blocks, t, sound_guid)) continue;
-        const bool exists = std::any_of(doc.entities.begin(), doc.entities.end(), [&](const Entity& e) {
-            return e.kind == EntityKind::Sound && e.guid == sound_guid;
-        });
-        if (!exists) { out->replaced_guids.push_back(t.guid); needed = true; }
-    }
-    if (!needed) return true;
-    for (const auto& e : doc.entities) used.insert(e.guid);
+    std::set<uint32_t> used;
+    for (const auto& entity : doc.entities) used.insert(entity.guid);
     uint32_t candidate = kToolCreatedGuidFirst;
-    for (const auto& e : doc.entities) {
-        if (e.kind != EntityKind::Sound) continue;
-        WireTrigger previous;
-        bool replace = false;
-        if (source && e.sound_trigger_source_guid) for (uint32_t i = 0; i < source->count; ++i) {
-            WireTrigger t;
-            if (read_trigger(source->chunks[i], &t) && t.guid == e.sound_trigger_source_guid &&
-                matches_sound(blocks, t, e.guid)) { previous = t; replace = true; break; }
-        }
-        if (e.sound_trigger_source_guid && source && !replace)
-            return fail(err, "Sound '%s': its original trigger or messages changed; reopen the source level.", e.name.c_str());
-        if (replace) out->replaced_guids.push_back(previous.guid);
-        if (!e.sound_trigger_enabled) continue;
-        if (!e.guid || e.guid == 999 || !finite_bounds(sound_trigger_bounds(e)))
-            return fail(err, "Sound '%s': a valid controller GUID and positive, finite trigger size are required.", e.name.c_str());
-        if (e.sound_trigger_once && e.sound_stop_on_exit)
-            return fail(err, "Sound '%s': Stop on exit requires a trigger that rearms after exit.", e.name.c_str());
-        // Append fresh blocks: existing blocks can also be referenced by unrelated scripts.
-        // Reuse our previous blocks only if their contents already match the action.
-        auto block_for = [&](uint16_t old, uint16_t id) -> uint16_t {
-            if (replace && single_message(blocks, old, id, e.guid)) return old;
-            if (blocks.size() >= kMaxBlocks) return kEmptyBlock;
-            const uint16_t index = static_cast<uint16_t>(blocks.size());
-            blocks.push_back({Message{id, e.guid, {}}}); return index;
-        };
-        const uint16_t enter = block_for(previous.enter, 5);
-        const uint16_t exit = e.sound_stop_on_exit ? block_for(previous.exit, 4) : kEmptyBlock;
-        if (enter == kEmptyBlock || (e.sound_stop_on_exit && exit == kEmptyBlock))
+    for (const auto& entity : doc.entities) {
+        if (entity.kind != EntityKind::Sound || !entity.sound_trigger_enabled) continue;
+        if (!entity.guid || entity.guid == 999 || !finite_bounds(sound_trigger_bounds(entity)))
+            return fail(err, "Sound '%s': a valid controller GUID and positive, finite trigger size are required.", entity.name.c_str());
+        if (entity.sound_trigger_once && entity.sound_stop_on_exit)
+            return fail(err, "Sound '%s': Stop on exit requires a trigger that rearms after exit.", entity.name.c_str());
+        const size_t needed = entity.sound_stop_on_exit ? 2 : 1;
+        if (blocks.size() + needed > kMaxBlocks)
             return fail(err, "The level has no free static-message blocks for a sound trigger.");
-        uint32_t guid = previous.guid;
-        if (!replace) {
-            while (candidate <= kToolCreatedGuidLast && used.count(candidate)) ++candidate;
-            if (candidate > kToolCreatedGuidLast) return fail(err, "No free GUID remains for a sound trigger.");
-            guid = candidate++; used.insert(guid);
+        const uint16_t enter = static_cast<uint16_t>(blocks.size());
+        blocks.push_back({Message{5, entity.guid, {}}});
+        uint16_t exit = kEmptyBlock;
+        if (entity.sound_stop_on_exit) {
+            exit = static_cast<uint16_t>(blocks.size());
+            blocks.push_back({Message{4, entity.guid, {}}});
         }
-        write_trigger(e, guid, enter, exit, &out->entities);
-        out->controller_trigger_guids.emplace_back(e.guid, guid);
+        while (candidate <= kToolCreatedGuidLast && used.count(candidate)) ++candidate;
+        if (candidate > kToolCreatedGuidLast) return fail(err, "No free GUID remains for a sound trigger.");
+        const uint32_t guid = candidate++;
+        used.insert(guid);
+        write_trigger(entity, guid, enter, exit, &out->entities);
     }
-    out->replace_message_set_zero = true;
-    write_blocks(blocks, &out->messages);
+    if (!blocks.empty()) write_blocks(blocks, &out->messages);
     return true;
 }
-
 void import_sound_triggers(const ChunkList& source, Document* doc) {
     Blocks blocks; bool found = false;
     for (uint32_t i = 0; i < source.count; ++i) if (message_set(source.chunks[i]) == 0) {
@@ -244,11 +187,6 @@ void import_sound_triggers(const ChunkList& source, Document* doc) {
     }
 }
 
-bool replaces_sound_trigger_chunk(const ChunkRef& c, const SoundTriggerExport& out) {
-    if (out.replace_message_set_zero && message_set(c) == 0) return true;
-    return c.cid == ASURA_CHUNK_ENTITY && c.size >= 24 &&
-           std::find(out.replaced_guids.begin(), out.replaced_guids.end(), read_u32(c.data+16)) != out.replaced_guids.end();
-}
 bool append_sound_trigger_export(Buffer* out, const SoundTriggerExport& prepared, Error* err) {
     if (!prepared.messages.empty()) buffer_append(out, prepared.messages.data(), prepared.messages.size(), err);
     if (!prepared.entities.empty()) buffer_append(out, prepared.entities.data(), prepared.entities.size(), err);

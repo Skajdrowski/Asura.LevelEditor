@@ -557,6 +557,16 @@ bool load_project(Document* document, const char* path, std::string* why) {
         if (project_version >= 13 && kind == static_cast<uint32_t>(EntityKind::StaticObject)) {
             entity.static_object_has_template = reader.u32() != 0;
             reader.raw(entity.static_object_body.data(), entity.static_object_body.size());
+            // v13+ already stores these IDs in the physical-object template.
+            // Restore the derived fields as well: leaving them at zero made
+            // the next export turn an animated static object into an empty one.
+            if (reader.ok && entity.static_object_has_template) {
+                Snipe_ServerEntity_StaticObject_ChunkDataV0 body{};
+                memcpy(&body, entity.static_object_body.data(), sizeof(body));
+                entity.pickup_skin_id = body.m_xPhysicalObject.m_uSkinID;
+                entity.pickup_anim_id = body.m_xPhysicalObject.m_uAnimID;
+                entity.pickup_anim_file_id = body.m_xPhysicalObject.m_uAnimFileID;
+            }
         }
         if (supported)
             next.entities.push_back(std::move(entity));

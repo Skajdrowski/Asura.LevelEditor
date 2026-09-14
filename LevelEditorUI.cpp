@@ -3068,9 +3068,7 @@ void command_export() {
     }
     g.document.output_path = path;
     commit_history_transaction();
-    set_status(g.document.source_pc_path.empty()
-                   ? "Export complete: the .PC contains the environment and editor-authored entities."
-                   : "Export complete: source chunks were preserved and editable PC records were updated.");
+    set_status("Export complete.");
     MessageBoxA(g.window, path.c_str(), "Exported .PC", MB_ICONINFORMATION);
 }
 
@@ -4073,14 +4071,6 @@ void delete_selected() {
     normalize_selection_state();
     if (g.selected_entities.empty())
         return;
-    for (int index : g.selected_entities) {
-        if (g.document.entities[index].source_entity_record &&
-            g.document.entities[index].kind != EntityKind::Pickup &&
-            g.document.entities[index].kind != EntityKind::StaticObject) {
-            set_status("Imported target/marker/volume records remain source-preserved and cannot be deleted yet.");
-            return;
-        }
-    }
     stop_sound_preview();
     if (!g.history.begin(g.document, g.selected))
         return;
@@ -4196,7 +4186,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             request_redraw();
         } else if (wparam == 2 &&
                    ((g.document.skybox.draw_clouds && gpu_has_skybox_cloud()) ||
-                    (g.document.rain_enabled && gpu_has_rain_texture()))) {
+                    (g.document.rain_enabled && gpu_has_rain_texture()) || gpu_has_animated_models())) {
             request_redraw();
         }
         return 0;
