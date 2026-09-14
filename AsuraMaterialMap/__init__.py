@@ -5,7 +5,7 @@ import re
 import bpy
 from bpy.app.handlers import persistent
 from bpy.props import BoolProperty, CollectionProperty, IntProperty, StringProperty
-from bpy_extras.io_utils import ExportHelper
+from bpy_extras.io_utils import ExportHelper, ImportHelper
 
 
 UNASSIGNED_INDEX = -1
@@ -534,6 +534,111 @@ class ASURA_OT_clear_material_index(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class ASURA_OT_load_material_map(bpy.types.Operator, ImportHelper):
+    bl_idname = "import_scene.asura_material_map"
+    bl_label = "Load Asura Material Map"
+    bl_description = "Load Asura material indices, texture names, surface types, and flags from JSON"
+    bl_options = {"REGISTER", "UNDO"}
+
+    filename_ext = ".json"
+    filter_glob: StringProperty(default="*.json", options={"HIDDEN"})
+
+    def execute(self, context):
+        global _AUTO_REFRESH_RUNNING
+
+        try:
+            input_path = Path(bpy.path.abspath(self.filepath))
+            with input_path.open("r", encoding="utf-8") as source:
+                material_map = json.load(source)
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            self.report({"ERROR"}, f"Could not load material map: {exc}")
+            return {"CANCELLED"}
+
+        if not isinstance(material_map, dict):
+            self.report({"ERROR"}, "Material map root must be a JSON object")
+            return {"CANCELLED"}
+
+        texture_by_index = material_map.get("texture_by_material_index", {})
+        surface_by_index = material_map.get("surface_type_by_material_index", {})
+        blending_by_index = material_map.get("transparency_flag_by_material_index", {})
+        collision_by_index = material_map.get("collision_flags", {})
+        sections = (
+            texture_by_index,
+            surface_by_index,
+            blending_by_index,
+            collision_by_index,
+        )
+        if not all(isinstance(section, dict) for section in sections):
+            self.report({"ERROR"}, "Material-map metadata sections must be JSON objects")
+            return {"CANCELLED"}
+
+        reserved_keys = {
+            "texture_by_material_index",
+            "surface_type_by_material_index",
+            "transparency_flag_by_material_index",
+            "collision_flags",
+            "orig_to_handle",
+            "handle_to_texname",
+        }
+        direct_map = {
+            key.casefold(): value
+            for key, value in material_map.items()
+            if isinstance(key, str)
+            and key not in reserved_keys
+            and isinstance(value, int)
+            and not isinstance(value, bool)
+        }
+
+        materials = scene_used_materials(context.scene)
+        loaded = 0
+        unmatched = 0
+        _AUTO_REFRESH_RUNNING = True
+        try:
+            for material in materials:
+                index = direct_map.get(material.name.casefold())
+                if index is None:
+                    # Rich maps exported by the level editor may not contain
+                    # direct name -> index entries.  mat_<index> names still
+                    # give us an unambiguous way to connect them.
+                    index = material_name_index(material.name)
+                if index is None or index < 0 or index > MAX_BLENDER_INT:
+                    unmatched += 1
+                    continue
+
+                material.asura_skip_auto_assign = False
+                material.asura_material_index = index
+                key = str(index)
+
+                texture_name = texture_by_index.get(key)
+                if isinstance(texture_name, str):
+                    material.asura_texture_name = texture_name
+
+                surface_type = surface_by_index.get(key)
+                if isinstance(surface_type, int) and not isinstance(surface_type, bool):
+                    material.asura_surface_type = max(0, min(surface_type, MAX_BLENDER_INT))
+
+                blending_flags = blending_by_index.get(key)
+                if isinstance(blending_flags, int) and not isinstance(blending_flags, bool):
+                    material.asura_blending_flags = max(0, min(blending_flags, MAX_BLENDER_INT))
+
+                collision_flags = collision_by_index.get(key)
+                if isinstance(collision_flags, int) and not isinstance(collision_flags, bool):
+                    material.asura_collision_flags = max(0, min(collision_flags, MAX_BLENDER_INT))
+
+                loaded += 1
+        finally:
+            _AUTO_REFRESH_RUNNING = False
+
+        tag_asura_ui_redraw()
+        if not loaded:
+            self.report({"WARNING"}, "No used scene materials matched this material map")
+            return {"FINISHED"}
+
+        suffix = f"; {unmatched} used material(s) unmatched" if unmatched else ""
+        self.report({"INFO"}, f"Loaded Asura data for {loaded} material(s){suffix}")
+        return {"FINISHED"}
+
+
 class ASURA_OT_export_material_map(bpy.types.Operator, ExportHelper):
     bl_idname = "export_scene.asura_material_map"
     bl_label = "Export Asura Material Map"
@@ -669,7 +774,9 @@ class ASURA_PT_material_properties(bpy.types.Panel):
         row = layout.row(align=True)
         row.operator(ASURA_OT_set_material_index.bl_idname, text="Set...")
         row.operator(ASURA_OT_clear_material_index.bl_idname, text="Clear")
-        layout.operator(ASURA_OT_export_material_map.bl_idname, text="Export Material Map...")
+        row = layout.row(align=True)
+        row.operator(ASURA_OT_load_material_map.bl_idname, text="Load Material Map...")
+        row.operator(ASURA_OT_export_material_map.bl_idname, text="Export Material Map...")
 
 
 class ASURA_PT_view3d_sidebar(bpy.types.Panel):
@@ -695,7 +802,9 @@ class ASURA_PT_view3d_sidebar(bpy.types.Panel):
             row.operator(ASURA_OT_clear_material_index.bl_idname, text="Clear")
 
         layout.separator()
-        layout.operator(ASURA_OT_export_material_map.bl_idname, text="Export Material Map...")
+        row = layout.row(align=True)
+        row.operator(ASURA_OT_load_material_map.bl_idname, text="Load Map...")
+        row.operator(ASURA_OT_export_material_map.bl_idname, text="Export Map...")
 
 
 def draw_asura_material_menu(layout, context):
@@ -712,6 +821,7 @@ def draw_asura_material_menu(layout, context):
     layout.operator(ASURA_OT_set_material_index.bl_idname, text="Set Asura Material Index...")
     if index != UNASSIGNED_INDEX:
         layout.operator(ASURA_OT_clear_material_index.bl_idname, text="Clear Asura Material Index")
+    layout.operator(ASURA_OT_load_material_map.bl_idname, text="Load Asura Material Map...")
     layout.operator(ASURA_OT_export_material_map.bl_idname, text="Export Asura Material Map...")
 
 
@@ -730,6 +840,13 @@ def draw_file_export(self, context):
     )
 
 
+def draw_file_import(self, context):
+    self.layout.operator(
+        ASURA_OT_load_material_map.bl_idname,
+        text="Asura Material Map (.json)",
+    )
+
+
 CLASSES = (
     ASURA_PG_reference_item,
     ASURA_OT_set_surface_type,
@@ -740,6 +857,7 @@ CLASSES = (
     ASURA_UL_collision_flags,
     ASURA_OT_set_material_index,
     ASURA_OT_clear_material_index,
+    ASURA_OT_load_material_map,
     ASURA_OT_export_material_map,
     ASURA_PT_material_properties,
     ASURA_PT_view3d_sidebar,
@@ -805,6 +923,7 @@ def register():
 
     bpy.types.MATERIAL_MT_context_menu.append(draw_material_context_menu)
     bpy.types.VIEW3D_MT_object_context_menu.append(draw_object_context_menu)
+    bpy.types.TOPBAR_MT_file_import.append(draw_file_import)
     bpy.types.TOPBAR_MT_file_export.append(draw_file_export)
 
     if asura_load_post not in bpy.app.handlers.load_post:
@@ -823,6 +942,7 @@ def unregister():
         bpy.app.handlers.load_post.remove(asura_load_post)
 
     bpy.types.TOPBAR_MT_file_export.remove(draw_file_export)
+    bpy.types.TOPBAR_MT_file_import.remove(draw_file_import)
     bpy.types.VIEW3D_MT_object_context_menu.remove(draw_object_context_menu)
     bpy.types.MATERIAL_MT_context_menu.remove(draw_material_context_menu)
 

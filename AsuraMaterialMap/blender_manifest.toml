@@ -14,4 +14,4 @@ license = [
 ]
 
 [permissions]
-files = "Export Asura Level Editor material map JSON files"
+files = "Load and export Asura Level Editor material map JSON files"
