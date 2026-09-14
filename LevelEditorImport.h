@@ -46,7 +46,6 @@ uint32_t allocate_editor_guid(Document* document);
 bool normalise_editor_guids(Document* document, std::string* why);
 
 struct PcSkyboxInfo {
-    uint32_t chunk_version = 7;
     float red = 255.0f;
     float green = 255.0f;
     float blue = 255.0f;

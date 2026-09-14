@@ -1619,7 +1619,6 @@ bool pc_skybox_info(const ChunkList& chunks, PcSkyboxInfo* info, Error* err) {
         const uint32_t payload_size = chunk.size - sizeof(Asura_Chunk_Header);
         Asura_Chunk_SkyBox_PayloadPrefixV7 prefix{};
         memcpy(&prefix, payload, sizeof(prefix));
-        info->chunk_version = chunk.version;
         info->red = prefix.m_fRed;
         info->green = prefix.m_fGreen;
         info->blue = prefix.m_fBlue;
@@ -1652,7 +1651,6 @@ bool pc_skybox_info(const ChunkList& chunks, PcSkyboxInfo* info, Error* err) {
 }
 
 void import_pc_skybox_settings(const PcSkyboxInfo& info, SkyboxSettings* skybox) {
-    skybox->chunk_version = info.chunk_version;
     skybox->red = info.red;
     skybox->green = info.green;
     skybox->blue = info.blue;

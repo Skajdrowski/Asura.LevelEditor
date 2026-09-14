@@ -117,8 +117,7 @@ bool equal(const std::vector<std::string>& a, const std::vector<std::string>& b)
 }
 
 bool equal(const SkyboxSettings& a, const SkyboxSettings& b) {
-    return a.chunk_version == b.chunk_version && equal(a.red, b.red) &&
-           equal(a.green, b.green) && equal(a.blue, b.blue) &&
+    return equal(a.red, b.red) && equal(a.green, b.green) && equal(a.blue, b.blue) &&
            equal(a.orientation_radians, b.orientation_radians) &&
            equal(a.texture_paths, b.texture_paths) && a.draw_clouds == b.draw_clouds &&
            a.back_texture_is_front_upside_down == b.back_texture_is_front_upside_down &&

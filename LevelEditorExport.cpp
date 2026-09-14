@@ -41,14 +41,10 @@ bool append_editor_lights(Buffer* out, const Document& doc, Error* err) {
 }
 
 bool append_editor_skybox(Buffer* out, const SkyboxSettings& skybox, Error* err) {
-    if (skybox.chunk_version < 6 || skybox.chunk_version > 7)
-        return fail(err, "SKYB chunk version must be 6 or 7");
-    if (skybox.chunk_version < 7 && skybox.right_texture_is_left_upside_down)
-        return fail(err, "the right-face compatibility flag requires SKYB version 7");
     if (!isfinite(skybox.red) || !isfinite(skybox.green) || !isfinite(skybox.blue) ||
         !isfinite(skybox.orientation_radians))
         return fail(err, "SKYB colour and orientation values must be finite");
-    ChunkMark chunk = begin_chunk(out, ASURA_CHUNK_SKYBOX, skybox.chunk_version, 0, err);
+    ChunkMark chunk = begin_chunk(out, ASURA_CHUNK_SKYBOX, 7, 0, err);
     const Asura_Chunk_SkyBox_PayloadPrefixV7 prefix{
         skybox.red, skybox.green, skybox.blue, skybox.orientation_radians};
     buffer_append(out, &prefix, sizeof(prefix), err);
@@ -61,8 +57,7 @@ bool append_editor_skybox(Buffer* out, const SkyboxSettings& skybox, Error* err)
         skybox.draw_clouds ? 1u : 0u,
         skybox.back_texture_is_front_upside_down ? 1u : 0u,
         skybox.right_texture_is_left_upside_down ? 1u : 0u};
-    const size_t flag_bytes = skybox.chunk_version == 7 ? sizeof(flags) : sizeof(flags) - sizeof(uint32_t);
-    return buffer_append(out, &flags, flag_bytes, err) != ~0ull && end_chunk(out, chunk, err);
+    return buffer_append(out, &flags, sizeof(flags), err) != ~0ull && end_chunk(out, chunk, err);
 }
 
 bool append_editor_weather(Buffer* out, const Document& document, Error* err) {

@@ -959,7 +959,7 @@ void create_light_properties_controls(LightPropertiesState* state) {
     for (int index : {0, 1, 3, 4}) EnableWindow(state->flag_checks[index], FALSE);
     make_dialog_control(state->window, "STATIC",
         "'Affects entities' enables lighting\r\n'Use bounding box' lightens only entities inside of it.\r\n"
-        "'Shadow strength' controls darkness; it does not cast shadows.\r\n"
+        "'Shadow volume' turns light into darkness; it does not cast shadows.\r\n"
         "Greyed options do not affect static entity lighting. Their values are preserved only.",
         SS_LEFT, 0, 14, 342, 728, 70);
 
@@ -2827,8 +2827,7 @@ bool reload_skybox_preview(bool show_warning) {
 }
 
 bool same_skybox_settings(const SkyboxSettings& a, const SkyboxSettings& b) {
-    return a.chunk_version == b.chunk_version && a.red == b.red &&
-           a.green == b.green && a.blue == b.blue &&
+    return a.red == b.red && a.green == b.green && a.blue == b.blue &&
            a.orientation_radians == b.orientation_radians && a.texture_paths == b.texture_paths &&
            a.draw_clouds == b.draw_clouds &&
            a.back_texture_is_front_upside_down == b.back_texture_is_front_upside_down &&
@@ -3850,9 +3849,6 @@ enum SkyboxPropertiesId : int {
     ID_SKYBOX_ORIENTATION,
     ID_SKYBOX_PATH_FIRST,
     ID_SKYBOX_PATH_LAST = ID_SKYBOX_PATH_FIRST + ASURA_SKYBOX_V5_V7_TEXTURE_PATH_COUNT - 1,
-    ID_SKYBOX_DRAW_CLOUDS,
-    ID_SKYBOX_VERSION_6,
-    ID_SKYBOX_VERSION_7,
     ID_SKYBOX_BACK_FLIPPED,
     ID_SKYBOX_RIGHT_FLIPPED,
     ID_SKYBOX_PREVIEW_FOLDER,
@@ -3866,8 +3862,6 @@ struct SkyboxPropertiesState {
     HWND blue = nullptr;
     HWND orientation = nullptr;
     HWND paths[ASURA_SKYBOX_V5_V7_TEXTURE_PATH_COUNT]{};
-    HWND version_6 = nullptr;
-    HWND version_7 = nullptr;
     HWND back_flipped = nullptr;
     HWND right_flipped = nullptr;
     HWND preview_folder = nullptr;
@@ -3886,20 +3880,12 @@ void refresh_skybox_path_text(SkyboxPropertiesState* state) {
         SetWindowTextA(state->paths[slot], state->value.texture_paths[slot].c_str());
 }
 
-void refresh_skybox_version_controls(SkyboxPropertiesState* state) {
-    const bool version_7 =
-        SendMessageA(state->version_7, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    EnableWindow(state->right_flipped, version_7);
-    if (!version_7)
-        SendMessageA(state->right_flipped, BM_SETCHECK, BST_UNCHECKED, 0);
-}
-
 void create_skybox_properties_controls(SkyboxPropertiesState* state) {
     make_dialog_control(state->window, "STATIC", "RGB tint", SS_LEFT, 0, 14, 19, 82, 22);
     constexpr const char* colour_labels[] = {"R", "G", "B"};
     HWND* colours[] = {&state->red, &state->green, &state->blue};
     constexpr int colour_ids[] = {ID_SKYBOX_RED, ID_SKYBOX_GREEN, ID_SKYBOX_BLUE};
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < 3; i++) {
         const int x = 100 + i * 150;
         make_dialog_control(state->window, "STATIC", colour_labels[i], SS_LEFT, 0, x, 19, 18, 22);
         *colours[i] = make_dialog_control(state->window, "EDIT", "", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP,
@@ -3912,7 +3898,7 @@ void create_skybox_properties_controls(SkyboxPropertiesState* state) {
     constexpr const char* path_labels[] = {"Path 0 (lower)", "Path 1 (front)", "Path 2 (left)",
                                             "Path 3 (back)", "Path 4 (right)", "Path 5 (upper)",
                                             "Path 6 (cloud A)", "Path 7 (cloud B)"};
-    for (int i = 0; i < static_cast<int>(_countof(path_labels)); ++i) {
+    for (int i = 0; i < static_cast<int>(_countof(path_labels)); i++) {
         const int y = 58 + i * 36;
         make_dialog_control(state->window, "STATIC", path_labels[i], SS_LEFT, 0, 14, y + 3, 112, 22);
         state->paths[i] = make_dialog_control(state->window, "EDIT", "", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP,
@@ -3921,38 +3907,30 @@ void create_skybox_properties_controls(SkyboxPropertiesState* state) {
     }
 
     make_dialog_control(state->window, "STATIC", "Clearing cloud paths disables clouds animation.", SS_LEFT,
-                        0, 14, 359, 332, 22);
+                        0, 14, 340, 332, 22);
     constexpr const char* option_text[] = {
-        "SKYB format version 6", "SKYB format version 7",
         "Back texture is front upside down", "Right texture is left upside down"};
     constexpr DWORD option_style[] = {
-        BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP, BS_AUTORADIOBUTTON | WS_TABSTOP,
         BS_AUTOCHECKBOX | WS_TABSTOP, BS_AUTOCHECKBOX | WS_TABSTOP};
-    constexpr int option_ids[] = {ID_SKYBOX_VERSION_6, ID_SKYBOX_VERSION_7,
-                                  ID_SKYBOX_BACK_FLIPPED, ID_SKYBOX_RIGHT_FLIPPED};
-    constexpr int option_x[] = {366, 538, 14, 366};
-    constexpr int option_y[] = {356, 356, 386, 386};
-    constexpr int option_width[] = {166, 204, 332, 346};
-    HWND* option_outputs[] = {&state->version_6, &state->version_7, &state->back_flipped,
-                              &state->right_flipped};
-    for (size_t i = 0; i < _countof(option_ids); ++i)
+    constexpr int option_ids[] = {ID_SKYBOX_BACK_FLIPPED, ID_SKYBOX_RIGHT_FLIPPED};
+    constexpr int option_x[] = {366, 14};
+    constexpr int option_width[] = {332, 346};
+    HWND* option_outputs[] = {&state->back_flipped, &state->right_flipped};
+    for (size_t i = 0; i < _countof(option_ids); i++)
         *option_outputs[i] = make_dialog_control(state->window, "BUTTON", option_text[i], option_style[i],
-                                                 option_ids[i], option_x[i], option_y[i], option_width[i], 24);
-    make_dialog_control(state->window, "STATIC",
-                        "Both target SKYB versions render the same skybox; v7 only adds the right-face mapping flag.",
-                        SS_LEFT, 0, 14, 414, 760, 20);
-    make_dialog_control(state->window, "STATIC", "Preview resources", SS_LEFT, 0, 14, 438, 112, 22);
+                                                 option_ids[i], option_x[i], 386, option_width[i], 24);
+    make_dialog_control(state->window, "STATIC", "Preview resources", SS_LEFT, 0, 14, 416, 112, 22);
     state->preview_folder = make_dialog_control(state->window, "EDIT", "", ES_AUTOHSCROLL | WS_BORDER | ES_READONLY,
-                                                0, 130, 435, 414, 24);
+                                                0, 130, 413, 414, 24);
     constexpr const char* action_text[] = {"Choose folder...", "Use embedded", "Apply", "Cancel"};
     constexpr DWORD action_style[] = {BS_PUSHBUTTON | WS_TABSTOP, BS_PUSHBUTTON | WS_TABSTOP,
                                       BS_DEFPUSHBUTTON | WS_TABSTOP, BS_PUSHBUTTON | WS_TABSTOP};
     constexpr int action_ids[] = {ID_SKYBOX_PREVIEW_FOLDER, ID_SKYBOX_USE_EMBEDDED, IDOK, IDCANCEL};
     constexpr int action_x[] = {552, 676, 566, 682};
-    constexpr int action_y[] = {434, 434, 473, 473};
+    constexpr int action_y[] = {412, 412, 451, 451};
     constexpr int action_width[] = {116, 118, 104, 112};
     constexpr int action_height[] = {27, 27, 30, 30};
-    for (size_t i = 0; i < _countof(action_ids); ++i)
+    for (size_t i = 0; i < _countof(action_ids); i++)
         make_dialog_control(state->window, "BUTTON", action_text[i], action_style[i], action_ids[i],
                             action_x[i], action_y[i], action_width[i], action_height[i]);
 
@@ -3961,15 +3939,10 @@ void create_skybox_properties_controls(SkyboxPropertiesState* state) {
     set_float(state->blue, state->value.blue);
     set_float(state->orientation, state->value.orientation_radians);
     refresh_skybox_path_text(state);
-    SendMessageA(state->version_6, BM_SETCHECK,
-                 state->value.chunk_version == 6 ? BST_CHECKED : BST_UNCHECKED, 0);
-    SendMessageA(state->version_7, BM_SETCHECK,
-                 state->value.chunk_version == 7 ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageA(state->back_flipped, BM_SETCHECK,
                  state->value.back_texture_is_front_upside_down ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageA(state->right_flipped, BM_SETCHECK,
                  state->value.right_texture_is_left_upside_down ? BST_CHECKED : BST_UNCHECKED, 0);
-    refresh_skybox_version_controls(state);
     refresh_skybox_folder_text(state);
 }
 
@@ -3978,17 +3951,14 @@ void apply_skybox_properties(SkyboxPropertiesState* state) {
     state->value.green = get_float(state->green, state->value.green);
     state->value.blue = get_float(state->blue, state->value.blue);
     state->value.orientation_radians = get_float(state->orientation, state->value.orientation_radians);
-    for (int i = 0; i < static_cast<int>(_countof(state->paths)); ++i) {
+    for (int i = 0; i < static_cast<int>(_countof(state->paths)); i++) {
         char path[4097]{};
         GetWindowTextA(state->paths[i], path, sizeof(path));
         state->value.texture_paths[i] = path;
     }
-    state->value.chunk_version =
-        SendMessageA(state->version_6, BM_GETCHECK, 0, 0) == BST_CHECKED ? 6u : 7u;
     state->value.back_texture_is_front_upside_down =
         SendMessageA(state->back_flipped, BM_GETCHECK, 0, 0) == BST_CHECKED;
     state->value.right_texture_is_left_upside_down =
-        state->value.chunk_version == 7 &&
         SendMessageA(state->right_flipped, BM_GETCHECK, 0, 0) == BST_CHECKED;
 }
 
@@ -4006,10 +3976,7 @@ LRESULT CALLBACK skybox_properties_proc(HWND hwnd, UINT message, WPARAM wparam, 
         create_skybox_properties_controls(state);
         return 0;
     case WM_COMMAND:
-        if (LOWORD(wparam) == ID_SKYBOX_VERSION_6 ||
-            LOWORD(wparam) == ID_SKYBOX_VERSION_7) {
-            refresh_skybox_version_controls(state);
-        } else if (LOWORD(wparam) == ID_SKYBOX_PREVIEW_FOLDER) {
+        if (LOWORD(wparam) == ID_SKYBOX_PREVIEW_FOLDER) {
             std::string path = state->texture_directory;
             if (choose_directory(hwnd, "Choose skybox texture folder", &path)) {
                 SkyboxTextureScan scan{};
@@ -4045,7 +4012,7 @@ void command_skybox_textures() {
     SkyboxPropertiesState state{};
     state.value = g.document.skybox;
     state.texture_directory = g.document.sky_texture_dir;
-    if (!run_centered_modal("Asura2005SkyboxProperties", "SKYB version and properties", 830, 565, &state))
+    if (!run_centered_modal("Asura2005SkyboxProperties", "Skybox properties", 830, 535, &state))
         return;
     if (!state.accepted)
         return;
@@ -4063,8 +4030,8 @@ void command_skybox_textures() {
         gpu_set_skybox_tint(g.document.skybox);
         request_redraw();
     }
-    set_status(loaded ? "SKYB version and properties applied."
-                      : "SKYB version and properties saved; preview unavailable.");
+    set_status(loaded ? "Skybox properties applied."
+                      : "Skybox properties saved; preview unavailable.");
 }
 
 void delete_selected() {

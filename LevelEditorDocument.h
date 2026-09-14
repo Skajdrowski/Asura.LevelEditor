@@ -90,7 +90,6 @@ struct PickupTemplate {
 };
 
 struct SkyboxSettings {
-    uint32_t chunk_version = 7;
     float red = 255.0f;
     float green = 230.0f;
     float blue = 200.0f;

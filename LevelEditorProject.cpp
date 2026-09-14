@@ -255,10 +255,10 @@ bool save_project(const Document& document, const char* path, std::string* why) 
     writer.f32(document.skybox.orientation_radians);
     for (const std::string& texture_path : document.skybox.texture_paths)
         writer.str(texture_path);
-    writer.u32(document.skybox.draw_clouds ? 1u : 0u);
+    writer.u32(1u); // Cloud toggle v11+
     writer.u32(document.skybox.back_texture_is_front_upside_down ? 1u : 0u);
     writer.u32(document.skybox.right_texture_is_left_upside_down ? 1u : 0u);
-    writer.u32(document.skybox.chunk_version);
+    writer.u32(7u); // Skybox version v11+
     writer.u32(document.rain_enabled ? 1u : 0u);
     writer.u32(document.weather_source_record ? 1u : 0u);
     writer.str(document.ambient_stream_path);
@@ -427,10 +427,10 @@ bool load_project(Document* document, const char* path, std::string* why) {
             next.skybox.back_texture_is_front_upside_down = reader.u32() != 0;
             next.skybox.right_texture_is_left_upside_down = reader.u32() != 0;
             if (project_version >= 11) {
-                next.skybox.chunk_version = reader.u32();
+                const uint32_t source_skybox_version = reader.u32();
                 next.rain_enabled = reader.u32() != 0;
                 next.weather_source_record = reader.u32() != 0;
-                if (next.skybox.chunk_version < 6 || next.skybox.chunk_version > 7)
+                if (source_skybox_version < 6 || source_skybox_version > 7)
                     reader.ok = false;
                 if (project_version >= 12) {
                     next.ambient_stream_path = reader.str();

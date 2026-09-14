@@ -101,7 +101,7 @@ In skybox properties, user can define:
 
 - Color tint in RGB
 - Orientation (Rotation) around the level
-- Skybox internal chunk versioning (This might get obsoleted in the future)
+- Face placement
 
 User can specify his own skybox textures via specifying their folder or use imported internal .PC skybox.
 
