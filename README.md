@@ -56,9 +56,9 @@ Objects can be exported to **Wavefront OBJ** when selected, so they can be separ
 
 **Pickup** entities are collectible inventory items, such as:
 
-- Medkits
+- Med-kits
 - Rifle ammunition
-- PPSH submachine guns
+- PPSH submachine gun
 
 ## Sound
 
@@ -78,7 +78,7 @@ Each controller can play single imported **PCM `.wav`** audio within a defined r
 
 ## Indoor zone
 
-A invislbe **Bounding Box** which upon player's contact, triggers a movement speed limit inside the box. Recommended for tight areas.
+A invisible **Bounding Box** which upon player's contact, triggers a movement speed limit inside the box. Recommended for tight areas.
 
 ## Light
 
@@ -110,8 +110,14 @@ User can specify his own skybox textures via specifying their folder or use impo
 > Skybox texture paths by default need to be internally placed inside 'graphics\sky' directory. 
 > Level Editor already takes care of it, but removing '\sky\' from their path will make Asura Engine omit Skybox textures.
 
+# Weather
+
+'Rain' checkmark toggles rain particles. Their texture gets loaded from game's directory, depending on which level the game loader takes. (mp_01a uses rain_01a.dds etc.)
+
+To get level geometry react to rain droplets, it's material needs to have assigned blending flag 'Affected by rain (0x4000)' in material map.
+
 # Editing original levels
 
 **Asura Level Editor** offers availability of importing stock .PC levels from game's root folder, which allows preview and modification of their content Level Editor can parse.
 
-> Level Editor is mainly designed for multiplayer levels, so some in-game stuff from singleplayer ones might be missing in editor itself.
+> Level Editor is mainly designed for multiplayer levels, so some in-game stuff from single-player ones might be missing in editor itself.
