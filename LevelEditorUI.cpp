@@ -826,25 +826,25 @@ LRESULT CALLBACK sound_properties_proc(HWND hwnd, UINT message, WPARAM wparam, L
         make_dialog_control(hwnd, "STATIC", "With a bounding box, playback starts when one of the players enter the box.",
                             SS_LEFT, 0, 18, 154, 510, 42);
         constexpr const char* axes[] = {"X", "Y", "Z"};
-        for (int row = 0; row < 2; ++row) {
+        for (int row = 0; row < 2; row++) {
             make_dialog_control(hwnd, "STATIC", row ? "Box size" : "Offset from sound", SS_LEFT,
-                                0, 18, 216 + row * 38, 132, 24);
-            for (int axis = 0; axis < 3; ++axis) {
+                                0, 18, 212 + row * 38, 132, 24);
+            for (int axis = 0; axis < 3; axis++) {
                 const int x = 158 + axis * 118, y = 212 + row * 38;
-                make_dialog_control(hwnd, "STATIC", axes[axis], SS_LEFT, 0, x, y + 3, 18, 24);
+                make_dialog_control(hwnd, "STATIC", axes[axis], SS_LEFT, 0, x, y, 18, 24);
                 HWND field = make_dialog_control(hwnd, "EDIT", "", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP,
                     (row ? ID_SOUND_TRIGGER_SIZE : ID_SOUND_TRIGGER_OFFSET) + axis, x + 20, y, 84, 24);
                 (row ? state->size : state->offset)[axis] = field;
             }
         }
-        const auto& e = state->value;
+        const editor::Entity& e = state->value;
         SendMessageA(state->start, BM_SETCHECK, e.sound_controller_active ? BST_CHECKED : BST_UNCHECKED, 0);
         SendMessageA(state->trigger, BM_SETCHECK, e.sound_trigger_enabled ? BST_CHECKED : BST_UNCHECKED, 0);
         SendMessageA(state->once, BM_SETCHECK, e.sound_trigger_once ? BST_CHECKED : BST_UNCHECKED, 0);
         SendMessageA(state->stop, BM_SETCHECK, e.sound_stop_on_exit ? BST_CHECKED : BST_UNCHECKED, 0);
         const float offset[] = {e.sound_trigger_offset.x, e.sound_trigger_offset.y, e.sound_trigger_offset.z};
         const float size[] = {e.sound_trigger_size.x, e.sound_trigger_size.y, e.sound_trigger_size.z};
-        for (int axis = 0; axis < 3; ++axis) {
+        for (int axis = 0; axis < 3; axis++) {
             set_float(state->offset[axis], offset[axis]); set_float(state->size[axis], size[axis]);
         }
         make_dialog_control(hwnd, "BUTTON", "Apply", BS_DEFPUSHBUTTON | WS_TABSTOP, IDOK, 310, 354, 104, 30);
@@ -900,53 +900,61 @@ void command_sound_properties() {
     refresh_inspector(); request_redraw();
 }
 
-void make_light_vector_row(LightPropertiesState* state, const char* label, int y, int first_id, HWND fields[3]) {
-    make_dialog_control(state->window, "STATIC", label, SS_LEFT, 0, 14, y + 3, 94, 22);
-    constexpr const char* axes[] = {"X", "Y", "Z"};
+void make_light_vector_row(LightPropertiesState* state, const char* label, int y, int first_id, HWND fields[3], bool isRGB = false) {
+    make_dialog_control(state->window, "STATIC", label, SS_LEFT, 0, 14, y, 94, 22);
+    const char* valueTypes[3] = {"X", "Y", "Z"};
+
+    if (isRGB) {
+        valueTypes[0] = "R";
+        valueTypes[1] = "G";
+        valueTypes[2] = "B";
+    }
+
     constexpr int xs[] = {130, 334, 538};
-    for (int i = 0; i < 3; ++i) {
-        make_dialog_control(state->window, "STATIC", axes[i], SS_LEFT, 0, xs[i] - 18, y + 3, 16, 22);
+    for (int i = 0; i < 3; i++) {
+        make_dialog_control(state->window, "STATIC", valueTypes[i], SS_LEFT, 0, xs[i] - 18, y, 16, 22);
         fields[i] = make_dialog_control(state->window, "EDIT", "", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP,
-                                       first_id + i, xs[i], y, 142, 24);
+                                       first_id + i, xs[i], y, 142, 22);
     }
 }
 
 void make_light_scalar(LightPropertiesState* state, const char* label, int id, int x, int y, HWND* field) {
-    make_dialog_control(state->window, "STATIC", label, SS_LEFT, 0, x, y + 3, 112, 22);
+    make_dialog_control(state->window, "STATIC", label, SS_LEFT, 0, x, y, 92, 22);
     *field = make_dialog_control(state->window, "EDIT", "", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP, id,
-                                x + 116, y, 104, 24);
+                                x + 96, y, 104, 22);
 }
 
 void create_light_properties_controls(LightPropertiesState* state) {
     make_light_vector_row(state, "Position", 16, ID_LIGHT_POSITION_X, state->position);
-    make_light_vector_row(state, "Colour (RGB255)", 50, ID_LIGHT_R, state->colour);
+    make_light_vector_row(state, "Colour", 50, ID_LIGHT_R, state->colour, true);
 
     constexpr const char* scalar_labels[] = {"Brightness", "Range", "Inner range", "Shadow strength"};
     constexpr int scalar_ids[] = {ID_LIGHT_BRIGHTNESS, ID_LIGHT_RANGE, ID_LIGHT_INNER_RANGE,
                                   ID_LIGHT_SHADOW_STRENGTH};
-    constexpr int scalar_x[] = {14, 262, 510, 14};
+    constexpr int scalar_x[] = {14, 316, 520, 14};
     constexpr int scalar_y[] = {88, 88, 88, 122};
     HWND* scalar_outputs[] = {&state->brightness, &state->range, &state->inner_range,
                               &state->shadow_strength};
-    for (size_t i = 0; i < _countof(scalar_ids); ++i)
+    for (size_t i = 0; i < _countof(scalar_ids); i++)
         make_light_scalar(state, scalar_labels[i], scalar_ids[i], scalar_x[i], scalar_y[i], scalar_outputs[i]);
 
-    make_dialog_control(state->window, "STATIC", "World-axis bounding box", SS_LEFT, 0, 14, 164, 150, 22);
+    make_dialog_control(state->window, "STATIC", "World-axis bounding box", SS_LEFT, 0, 14, 160, 140, 22);
     constexpr const char* bound_labels[] = {"Min X", "Max X", "Min Y", "Max Y", "Min Z", "Max Z"};
     constexpr int bound_ids[] = {ID_LIGHT_BOUND_MIN_X, ID_LIGHT_BOUND_MAX_X, ID_LIGHT_BOUND_MIN_Y,
                                  ID_LIGHT_BOUND_MAX_Y, ID_LIGHT_BOUND_MIN_Z, ID_LIGHT_BOUND_MAX_Z};
-    for (int i = 0; i < 6; ++i) {
+    for (int i = 0; i < 6; i++) {
         const int column = i % 3, row = i / 3;
-        const int x = 130 + column * 204, y = 160 + row * 34;
-        make_dialog_control(state->window, "STATIC", bound_labels[i], SS_LEFT, 0, x, y + 3, 48, 22);
+        const int x = 160 + column * 204, y = 160 + row * 34;
+        make_dialog_control(state->window, "STATIC", bound_labels[i], SS_LEFT, 0, x, y, 48, 22);
         state->bounds[i] = make_dialog_control(state->window, "EDIT", "", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP,
-                                              bound_ids[i], x + 52, y, 90, 24);
+                                              bound_ids[i], x + 52, y, 90, 22);
     }
 
-    make_dialog_control(state->window, "STATIC", "Raw flags", SS_LEFT, 0, 14, 236, 94, 22);
+    make_dialog_control(state->window, "STATIC", "Raw flags", SS_LEFT, 0, 14, 233, 64, 22);
     state->flags = make_dialog_control(state->window, "EDIT", "", ES_AUTOHSCROLL | ES_READONLY | WS_BORDER | WS_TABSTOP,
-                                      ID_LIGHT_FLAGS, 130, 233, 142, 24);
-    for (int i = 0; i < static_cast<int>(_countof(kLightFlagControls)); ++i) {
+                                      ID_LIGHT_FLAGS, 84, 233, 142, 22);
+    EnableWindow(state->flags, FALSE);
+    for (int i = 0; i < static_cast<int>(_countof(kLightFlagControls)); i++) {
         const int column = i % 4, row = i / 4;
         state->flag_checks[i] = make_dialog_control(
             state->window, "BUTTON", kLightFlagControls[i].label, BS_AUTOCHECKBOX | WS_TABSTOP,
@@ -3573,14 +3581,14 @@ std::string ambience_stream_label(const std::string& path) {
 }
 
 void create_ambience_properties_controls(AmbiencePropertiesState* state) {
-    make_dialog_control(state->window, "STATIC", "Default stream", SS_LEFT, -1, 18, 22, 104, 22);
+    make_dialog_control(state->window, "STATIC", "Default stream", SS_LEFT, -1, 18, 18, 104, 22);
     state->stream = make_dialog_control(state->window, "COMBOBOX", "",
                                           CBS_DROPDOWNLIST | CBS_AUTOHSCROLL | WS_VSCROLL,
                                           ID_AMBIENCE_STREAM, 126, 18, 380, 260);
-    make_dialog_control(state->window, "STATIC", "Volume (0-1)", SS_LEFT, -1, 18, 62, 104, 22);
+    make_dialog_control(state->window, "STATIC", "Volume (0-1)", SS_LEFT, -1, 18, 58, 104, 22);
     state->volume = make_dialog_control(state->window, "EDIT", "",
                                           ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP,
-                                          ID_AMBIENCE_VOLUME, 126, 58, 100, 24);
+                                          ID_AMBIENCE_VOLUME, 126, 58, 100, 22);
     make_dialog_control(
         state->window, "STATIC",
         "Ambience sound names come from game's root Sounds\\Streams",
@@ -3881,28 +3889,28 @@ void refresh_skybox_path_text(SkyboxPropertiesState* state) {
 }
 
 void create_skybox_properties_controls(SkyboxPropertiesState* state) {
-    make_dialog_control(state->window, "STATIC", "RGB tint", SS_LEFT, 0, 14, 19, 82, 22);
+    make_dialog_control(state->window, "STATIC", "RGB tint", SS_LEFT, 0, 14, 16, 82, 22);
     constexpr const char* colour_labels[] = {"R", "G", "B"};
     HWND* colours[] = {&state->red, &state->green, &state->blue};
     constexpr int colour_ids[] = {ID_SKYBOX_RED, ID_SKYBOX_GREEN, ID_SKYBOX_BLUE};
     for (int i = 0; i < 3; i++) {
         const int x = 100 + i * 150;
-        make_dialog_control(state->window, "STATIC", colour_labels[i], SS_LEFT, 0, x, 19, 18, 22);
+        make_dialog_control(state->window, "STATIC", colour_labels[i], SS_LEFT, 0, x, 16, 18, 22);
         *colours[i] = make_dialog_control(state->window, "EDIT", "", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP,
-                                          colour_ids[i], x + 20, 16, 118, 24);
+                                          colour_ids[i], x + 20, 16, 118, 22);
     }
-    make_dialog_control(state->window, "STATIC", "Orientation (radians)", SS_LEFT, 0, 556, 19, 126, 22);
+    make_dialog_control(state->window, "STATIC", "Orientation (radians)", SS_LEFT, 0, 550, 16, 126, 22);
     state->orientation = make_dialog_control(state->window, "EDIT", "", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP,
-                                             ID_SKYBOX_ORIENTATION, 682, 16, 112, 24);
+                                             ID_SKYBOX_ORIENTATION, 682, 16, 112, 22);
 
     constexpr const char* path_labels[] = {"Path 0 (lower)", "Path 1 (front)", "Path 2 (left)",
                                             "Path 3 (back)", "Path 4 (right)", "Path 5 (upper)",
                                             "Path 6 (cloud A)", "Path 7 (cloud B)"};
     for (int i = 0; i < static_cast<int>(_countof(path_labels)); i++) {
         const int y = 58 + i * 36;
-        make_dialog_control(state->window, "STATIC", path_labels[i], SS_LEFT, 0, 14, y + 3, 112, 22);
+        make_dialog_control(state->window, "STATIC", path_labels[i], SS_LEFT, 0, 14, y, 112, 22);
         state->paths[i] = make_dialog_control(state->window, "EDIT", "", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP,
-                                              ID_SKYBOX_PATH_FIRST + i, 130, y, 664, 24);
+                                              ID_SKYBOX_PATH_FIRST + i, 130, y, 664, 22);
         SendMessageA(state->paths[i], EM_SETLIMITTEXT, 4096, 0);
     }
 
@@ -3919,9 +3927,9 @@ void create_skybox_properties_controls(SkyboxPropertiesState* state) {
     for (size_t i = 0; i < _countof(option_ids); i++)
         *option_outputs[i] = make_dialog_control(state->window, "BUTTON", option_text[i], option_style[i],
                                                  option_ids[i], option_x[i], 386, option_width[i], 24);
-    make_dialog_control(state->window, "STATIC", "Preview resources", SS_LEFT, 0, 14, 416, 112, 22);
+    make_dialog_control(state->window, "STATIC", "Preview resources", SS_LEFT, 0, 14, 413, 112, 22);
     state->preview_folder = make_dialog_control(state->window, "EDIT", "", ES_AUTOHSCROLL | WS_BORDER | ES_READONLY,
-                                                0, 130, 413, 414, 24);
+                                                0, 130, 413, 414, 22);
     constexpr const char* action_text[] = {"Choose folder...", "Use embedded", "Apply", "Cancel"};
     constexpr DWORD action_style[] = {BS_PUSHBUTTON | WS_TABSTOP, BS_PUSHBUTTON | WS_TABSTOP,
                                       BS_DEFPUSHBUTTON | WS_TABSTOP, BS_PUSHBUTTON | WS_TABSTOP};
