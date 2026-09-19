@@ -164,6 +164,7 @@ struct GpuEntitySnapshot {
     Asura_Vector_3 spawn_direction{};
     Asura_Bounding_Box source_bounds{};
     Asura_Bounding_Box light_bounds{};
+    Asura_Bounding_Box ambience_inner_bounds{}, ambience_outer_bounds{};
     Asura_Vector_3 sound_trigger_offset{};
     Asura_Vector_3 sound_trigger_size{};
     bool sound_trigger_enabled = false;
@@ -196,6 +197,8 @@ bool same_entity_snapshot(const GpuEntitySnapshot& a, const GpuEntitySnapshot& b
     return a.model == b.model && a.kind == b.kind && same_vec3(a.position, b.position) &&
            same_vec3(a.rotation, b.rotation) && same_vec3(a.spawn_direction, b.spawn_direction) &&
            same_bounds(a.source_bounds, b.source_bounds) && same_bounds(a.light_bounds, b.light_bounds) &&
+           same_bounds(a.ambience_inner_bounds, b.ambience_inner_bounds) &&
+           same_bounds(a.ambience_outer_bounds, b.ambience_outer_bounds) &&
            a.sound_trigger_enabled == b.sound_trigger_enabled &&
            same_vec3(a.sound_trigger_offset, b.sound_trigger_offset) &&
            same_vec3(a.sound_trigger_size, b.sound_trigger_size) &&
@@ -2100,6 +2103,8 @@ GpuEntitySnapshot gpu_entity_snapshot(const Entity& entity, const EntityModel* m
     snapshot.rotation = entity.rotation;
     snapshot.spawn_direction = entity.spawn_direction;
     snapshot.source_bounds = entity.source_bounds;
+    snapshot.ambience_inner_bounds = entity.ambience_inner_bounds;
+    snapshot.ambience_outer_bounds = entity.ambience_outer_bounds;
     snapshot.sound_range = entity.value_b;
     snapshot.value_u32_a = entity.value_u32_a;
     snapshot.selection_order = selection_order;
@@ -2350,6 +2355,7 @@ DirectX::XMFLOAT4 gpu_overlay_entity_color(EntityKind kind, bool selected) {
     case EntityKind::AssassinationTarget: return {1, .15f, .25f, 1};
     case EntityKind::PositionMarker: return {.75f, .35f, 1, 1};
     case EntityKind::BuildingVolume: return {.15f, .88f, 1, 1};
+    case EntityKind::SoundRegion: return {.78f, .53f, 1, 1};
     default: return {1, .45f, .25f, 1};
     }
 }
@@ -2806,6 +2812,12 @@ void gpu_render() {
                 if (entity.kind == EntityKind::BuildingVolume) {
                     entity_gizmo.clear();
                     append_oriented_bounds_gizmo(entity, &entity_gizmo);
+                    append_gpu_gizmo(&overlay, entity_gizmo, color);
+                    continue;
+                }
+                if (entity.kind == EntityKind::SoundRegion) {
+                    entity_gizmo.clear();
+                    append_sound_gizmo(entity, &entity_gizmo);
                     append_gpu_gizmo(&overlay, entity_gizmo, color);
                     continue;
                 }

@@ -20,6 +20,7 @@ enum class EntityKind : uint32_t {
     PositionMarker,
     StaticObject,
     BuildingVolume,
+    SoundRegion,
 };
 
 struct Entity {
@@ -47,6 +48,10 @@ struct Entity {
     bool sound_controller_active = true;
     uint16_t sound_controller_padding = 0x4974;
     Asura_Chunk_Phonons_PhononDataV9 sound_phonon{};
+    // SBSN boxes are axis-aligned offsets from position, including asymmetric fades.
+    // sound_file is the stream path and value_a is the regional volume.
+    Asura_Bounding_Box ambience_inner_bounds{-5, 5, -2.5f, 2.5f, -5, 5};
+    Asura_Bounding_Box ambience_outer_bounds{-7, 7, -4.5f, 4.5f, -7, 7};
     // A server-side player-entry trigger; bounds move with the sound but stay
     // aligned to world axes. Source GUID identifies the imported trigger.
     bool sound_trigger_enabled = false;
@@ -129,10 +134,11 @@ struct Document {
     bool weather_source_record = false;
     // Target path consumed by the independent SBSN streaming ambience system,
     // for example "Sounds\\Streams\\m1_karl1.wav".  An empty path disables
-    // the default stream. Regional sound records are not represented or exported.
+    // the default stream. SoundRegion entities contain the regional streams.
     std::string ambient_stream_path;
-    float ambient_volume = .85f;
+    float ambient_volume = .8f;
     bool ambient_source_record = false;
+    bool sound_regions_loaded = true; // False only for projects predating region support.
     // Legacy project import metadata. Export always uses the current entities.
     bool source_pickup_inventory_complete = false;
     bool source_static_object_inventory_complete = false;

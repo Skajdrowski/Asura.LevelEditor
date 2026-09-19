@@ -2,6 +2,7 @@
 #include "LevelEditorGeometry.h"
 #include "LevelEditorSoundTriggers.h"
 #include "LevelEditorAnimation.h"
+#include "LevelEditorExport.h"
 
 #include <algorithm>
 #include <set>
@@ -1663,8 +1664,58 @@ void import_pc_skybox_settings(const PcSkyboxInfo& info, SkyboxSettings* skybox)
     skybox->source_record = true;
 }
 
-bool source_ambience_info(const ChunkRef& chunk, std::string* path, float* volume,
-                          uint32_t* tail_offset, Error* err);
+bool source_ambience_info(const ChunkRef& chunk, Document* document, Error* err) {
+    if (chunk.cid != ASURA_CHUNK_STREAMINGBACKGROUNDSOUND || chunk.version > 1 || chunk.size < 32)
+        return fail(err, "the source SBSN is truncated or unsupported");
+    const uint32_t count = read_u32(chunk.data + 16);
+    if (count > 4000) return fail(err, "SBSN has too many sound regions");
+    uint64_t at = 28;
+    const auto read_path = [&](std::string* path) {
+        if (at >= chunk.size) return false;
+        const Str value = padded_string_at(chunk.data, chunk.size, static_cast<uint32_t>(at));
+        if (!value.data || value.size > 4096) return false;
+        at = align_up(at + value.size + 1, 4);
+        if (at > chunk.size) return false;
+        path->assign(value.data, value.size);
+        return true;
+    };
+    const float volume = read_f32(chunk.data + 24);
+    std::string default_path;
+    if (!read_path(&default_path) || !isfinite(volume) || volume < 0 || volume > 1)
+        return fail(err, "the SBSN default stream or volume is invalid");
+    std::vector<Entity> regions;
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint32_t legacy = chunk.version == 0 ? 4 : 0;
+        if (at + legacy + 52 > chunk.size) return fail(err, "SBSN region %u is truncated", i);
+        at += legacy;
+        Entity region;
+        region.kind = EntityKind::SoundRegion;
+        region.name = "Sound region " + std::to_string(i + 1);
+        region.value_a = read_f32(chunk.data + at);
+        memcpy(&region.ambience_inner_bounds, chunk.data + at + 4, 24);
+        memcpy(&region.ambience_outer_bounds, chunk.data + at + 28, 24);
+        at += 52;
+        if (!read_path(&region.sound_file)) return fail(err, "SBSN region %u has an invalid stream path", i);
+        if (!valid_sound_region(region, err)) return false;
+        const auto& b = region.ambience_inner_bounds;
+        region.position = {(b.MinX + b.MaxX) * .5f, (b.MinY + b.MaxY) * .5f, (b.MinZ + b.MaxZ) * .5f};
+        for (auto* box : {&region.ambience_inner_bounds, &region.ambience_outer_bounds}) {
+            box->MinX -= region.position.x; box->MaxX -= region.position.x;
+            box->MinY -= region.position.y; box->MaxY -= region.position.y;
+            box->MinZ -= region.position.z; box->MaxZ -= region.position.z;
+        }
+        regions.push_back(std::move(region));
+    }
+    // The tree is derived from editable bounds on export; never retain an opaque tail.
+    if (count && at + 24 + uint64_t(count - 1) * 12 > chunk.size)
+        return fail(err, "the SBSN region tree is truncated");
+    document->ambient_source_record = true;
+    document->sound_regions_loaded = true;
+    document->ambient_stream_path = std::move(default_path);
+    document->ambient_volume = volume;
+    document->entities.insert(document->entities.end(), regions.begin(), regions.end());
+    return true;
+}
 
 bool load_pc_level(const std::string& path, Document* document, Mesh* mesh, std::string* why,
                    std::vector<PickupModel>* pickup_models,
@@ -1693,15 +1744,7 @@ bool load_pc_level(const std::string& path, Document* document, Mesh* mesh, std:
             next_document.rain_enabled = chunk.data[21] != 0;
         } else if (chunk.cid == ASURA_CHUNK_STREAMINGBACKGROUNDSOUND &&
                    !next_document.ambient_source_record) {
-            std::string stream_path;
-            float volume = 1.0f;
-            if (!source_ambience_info(chunk, &stream_path, &volume, nullptr, &err)) {
-                ok = false;
-            } else {
-                next_document.ambient_source_record = true;
-                next_document.ambient_stream_path = std::move(stream_path);
-                next_document.ambient_volume = volume;
-            }
+            ok = source_ambience_info(chunk, &next_document, &err);
         }
     }
     RscfInfo environment{};

@@ -32,6 +32,7 @@ enum ControlId : int {
     ID_ADD_PICKUP,
     ID_ADD_STATIC_OBJECT,
     ID_ADD_BUILDING_VOLUME,
+    ID_ADD_SOUND_REGION,
     ID_DELETE_ENTITY,
     ID_UNDO,
     ID_REDO,

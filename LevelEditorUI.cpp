@@ -302,6 +302,11 @@ void append_camera_spawn_arrow(const Entity& entity, float marker, std::vector<L
 }
 
 void append_sound_gizmo(const Entity& entity, std::vector<LightGizmoLine>* lines) {
+    if (entity.kind == EntityKind::SoundRegion) {
+        append_light_bounding_box(sound_region_bounds(entity, false), lines);
+        append_light_bounding_box(sound_region_bounds(entity, true), lines);
+        return;
+    }
     if (entity.kind != EntityKind::Sound)
         return;
     const float range = fabsf(entity.value_b);
@@ -1207,6 +1212,7 @@ const char* entity_type_label(EntityKind kind) {
     case EntityKind::PositionMarker: return "Marker";
     case EntityKind::StaticObject: return "Object";
     case EntityKind::BuildingVolume: return "Building volume";
+    case EntityKind::SoundRegion: return "Ambience region";
     }
     return "Entity";
 }
@@ -1457,7 +1463,7 @@ void refresh_inspector() {
     set_float(g.pos[0], e.position.x);
     set_float(g.pos[1], e.position.y);
     set_float(g.pos[2], e.position.z);
-    if (e.kind == EntityKind::Light) {
+    if (e.kind == EntityKind::Light || e.kind == EntityKind::SoundRegion) {
         for (int i = 0; i < 3; ++i) {
             ShowWindow(GetDlgItem(g.window, 914 + i), SW_HIDE);
             ShowWindow(g.rot[i], SW_HIDE);
@@ -1509,6 +1515,14 @@ void refresh_inspector() {
         ShowWindow(g.sound_loop, SW_SHOW);
         ShowWindow(g.sound_browse, SW_SHOW);
         ShowWindow(g.sound_preview, SW_SHOW);
+        ShowWindow(g.sound_properties, SW_SHOW);
+        SetWindowTextA(g.sound_properties, "Sound properties");
+    } else if (e.kind == EntityKind::SoundRegion) {
+        set_control_text(g.value_label[0], "Volume (0-1)");
+        set_float(g.value[0], e.value_a);
+        ShowWindow(g.value_label[1], SW_HIDE);
+        ShowWindow(g.value[1], SW_HIDE);
+        SetWindowTextA(g.sound_properties, "Region stream and bounds");
         ShowWindow(g.sound_properties, SW_SHOW);
     } else if (e.kind == EntityKind::Pickup) {
         set_control_text(g.value_label[0], "Item type");
@@ -1605,10 +1619,11 @@ void focus_camera_on_entity(int index) {
         if (isfinite(model_radius) && model_radius > .01f)
             radius = model_radius;
     } else if (entity.kind == EntityKind::PositionMarker ||
-               entity.kind == EntityKind::BuildingVolume) {
-        const float width = entity.source_bounds.MaxX - entity.source_bounds.MinX;
-        const float height = entity.source_bounds.MaxY - entity.source_bounds.MinY;
-        const float depth = entity.source_bounds.MaxZ - entity.source_bounds.MinZ;
+               entity.kind == EntityKind::BuildingVolume || entity.kind == EntityKind::SoundRegion) {
+        const auto& bounds = entity.kind == EntityKind::SoundRegion ? entity.ambience_outer_bounds : entity.source_bounds;
+        const float width = bounds.MaxX - bounds.MinX;
+        const float height = bounds.MaxY - bounds.MinY;
+        const float depth = bounds.MaxZ - bounds.MinZ;
         const float marker_radius = .5f * sqrtf(width * width + height * height + depth * depth);
         if (isfinite(marker_radius) && marker_radius > .01f)
             radius = marker_radius;
@@ -1653,7 +1668,7 @@ void apply_inspector() {
                 e.rotation.y = get_float(g.rot[1], e.rotation.y);
             if (apply_all)
                 e.rotation.z = 0.0f;
-        } else {
+        } else if (e.kind != EntityKind::SoundRegion) {
             if (changed(kInspectorDirtyRotX))
                 e.rotation.x = get_float(g.rot[0], e.rotation.x);
             if (changed(kInspectorDirtyRotY))
@@ -1712,6 +1727,9 @@ void apply_inspector() {
                 e.sound_phonon.m_uFlags = e.sound_loop ? (e.sound_phonon.m_uFlags | 1u)
                                                        : (e.sound_phonon.m_uFlags & ~1u);
             }
+        } else if (e.kind == EntityKind::SoundRegion) {
+            if (changed(kInspectorDirtyValueA))
+                e.value_a = std::clamp(get_float(g.value[0], e.value_a), 0.0f, 1.0f);
         } else if (e.kind == EntityKind::Pickup) {
             const LRESULT selected_item = SendMessageA(g.pickup_item, CB_GETCURSEL, 0, 0);
             const uint32_t requested_item = !changed(kInspectorDirtyPickup) || selected_item == CB_ERR
@@ -1911,6 +1929,10 @@ void add_entity_at(EntityKind kind, const Asura_Vector_3& p) {
                            p.z - size.z * .5f, p.z + size.z * .5f};
         e.value_a = size.x;
         e.value_b = size.z;
+    } else if (kind == EntityKind::SoundRegion) {
+        snprintf(name, sizeof(name), "Sound region %zu", g.document.entities.size() + 1);
+        e.value_a = g.document.ambient_volume;
+        e.sound_file = g.document.ambient_stream_path;
     }
     e.name = name;
     stop_sound_preview();
@@ -2022,13 +2044,14 @@ int hit_entity(int x, int y) {
             }
             continue;
         }
-        if (entity.kind != EntityKind::BuildingVolume && !entity_is_selected(i) &&
+        if (entity.kind != EntityKind::BuildingVolume && entity.kind != EntityKind::SoundRegion && !entity_is_selected(i) &&
             environment_occludes_view_position(entity_view_position(entity.position)))
             continue;
-        if (entity.kind == EntityKind::BuildingVolume) {
+        if (entity.kind == EntityKind::BuildingVolume || entity.kind == EntityKind::SoundRegion) {
             std::vector<LightGizmoLine> lines;
             lines.reserve(kLightBoundingBoxLines);
-            append_oriented_bounds_gizmo(entity, &lines);
+            if (entity.kind == EntityKind::SoundRegion) append_sound_gizmo(entity, &lines);
+            else append_oriented_bounds_gizmo(entity, &lines);
             const int edge_radius = 10;
             const int edge_distance_limit = edge_radius * edge_radius;
             for (const LightGizmoLine& line : lines) {
@@ -2084,6 +2107,7 @@ COLORREF entity_color(EntityKind kind) {
     case EntityKind::AssassinationTarget: return RGB(255, 38, 64);
     case EntityKind::PositionMarker: return RGB(190, 88, 255);
     case EntityKind::BuildingVolume: return RGB(38, 224, 255);
+    case EntityKind::SoundRegion: return RGB(200, 135, 255);
     default: return RGB(255, 120, 80);
     }
 }
@@ -2332,7 +2356,7 @@ void draw_entities(HDC dc) {
     for (int i = 0; i < static_cast<int>(g.document.entities.size()); ++i) {
         const Entity& e = g.document.entities[i];
         const bool selected = entity_is_selected(i);
-        if (e.kind != EntityKind::BuildingVolume && !selected &&
+        if (e.kind != EntityKind::BuildingVolume && e.kind != EntityKind::SoundRegion && !selected &&
             environment_occludes_view_position(entity_view_position(e.position)))
             continue;
         POINT p{};
@@ -2343,10 +2367,11 @@ void draw_entities(HDC dc) {
             draw_light_gizmo(dc, e, true);
         else if (e.kind == EntityKind::Sound && selected)
             draw_sound_gizmo(dc, e);
-        if (e.kind == EntityKind::BuildingVolume) {
+        if (e.kind == EntityKind::BuildingVolume || e.kind == EntityKind::SoundRegion) {
             std::vector<LightGizmoLine> lines;
             lines.reserve(kLightBoundingBoxLines);
-            append_oriented_bounds_gizmo(e, &lines);
+            if (e.kind == EntityKind::SoundRegion) append_sound_gizmo(e, &lines);
+            else append_oriented_bounds_gizmo(e, &lines);
             draw_gizmo_lines(dc, lines, selected ? 2 : 1,
                              selected ? RGB(255, 255, 255) : color);
             if (selected)
@@ -2450,7 +2475,7 @@ void layout_controls() {
                    ui_px(28), TRUE);
     MoveWindow(g.ambience_properties, right, ui_px(6), ui_px(252), ui_px(28), TRUE);
     const int list_top = ui_px(78);
-    int y = std::max(ui_px(172), static_cast<int>(r.bottom) - ui_px(245));
+    int y = std::max(ui_px(172), static_cast<int>(r.bottom) - ui_px(276));
     MoveWindow(g.list, ui_px(8), list_top, ui_px(220),
                std::max(ui_px(80), y - list_top - ui_px(8)), TRUE);
     const int bw = ui_px(106);
@@ -2462,6 +2487,8 @@ void layout_controls() {
     y += ui_px(31);
     MoveWindow(GetDlgItem(g.window, ID_ADD_SOUND), ui_px(8), y, bw, ui_px(27), TRUE);
     MoveWindow(GetDlgItem(g.window, ID_ADD_BUILDING_VOLUME), ui_px(120), y, bw, ui_px(27), TRUE);
+    y += ui_px(31);
+    MoveWindow(GetDlgItem(g.window, ID_ADD_SOUND_REGION), ui_px(8), y, ui_px(218), ui_px(27), TRUE);
     y += ui_px(31);
     MoveWindow(GetDlgItem(g.window, ID_DELETE_ENTITY), ui_px(8), y, ui_px(218), ui_px(27), TRUE);
     y += ui_px(38);
@@ -2544,10 +2571,10 @@ void create_controls() {
     g.list = make_control("LISTBOX", "", LBS_NOTIFY | LBS_EXTENDEDSEL | WS_VSCROLL | WS_BORDER,
                           ID_ENTITY_LIST);
     constexpr const char* entity_button_text[] = {
-        "+ Spawn", "+ Light", "+ Pickup", "+ Object", "+ Sound", "+ Indoor zone", "Delete selected"};
+        "+ Spawn", "+ Light", "+ Pickup", "+ Object", "+ Sound", "+ Indoor zone", "+ Ambience region", "Delete selected"};
     constexpr int entity_button_ids[] = {
         ID_ADD_SPAWN, ID_ADD_LIGHT, ID_ADD_PICKUP, ID_ADD_STATIC_OBJECT, ID_ADD_SOUND,
-        ID_ADD_BUILDING_VOLUME, ID_DELETE_ENTITY};
+        ID_ADD_BUILDING_VOLUME, ID_ADD_SOUND_REGION, ID_DELETE_ENTITY};
     for (size_t i = 0; i < _countof(entity_button_ids); ++i)
         make_control("BUTTON", entity_button_text[i], BS_PUSHBUTTON, entity_button_ids[i]);
     make_control("STATIC",
@@ -2717,6 +2744,11 @@ bool load_document_preview(Document* document, Mesh* mesh, std::string* why,
             document->ambient_source_record = true;
             document->ambient_stream_path = imported.ambient_stream_path;
             document->ambient_volume = imported.ambient_volume;
+        }
+        if (!document->sound_regions_loaded) {
+            for (const Entity& entity : imported.entities)
+                if (entity.kind == EntityKind::SoundRegion) document->entities.push_back(entity);
+            document->sound_regions_loaded = true;
         }
         enrich_project_pickup_templates(document, imported);
         enrich_project_static_object_templates(document, imported);
@@ -3494,6 +3526,9 @@ struct AmbiencePropertiesState {
     std::string selected_path;
     float selected_volume = 1.0f;
     bool accepted = false;
+    bool editing_region = false;
+    Entity region;
+    HWND bounds[2][6]{};
 };
 
 constexpr const char* kAmbienceSoundNames[] = {
@@ -3581,7 +3616,7 @@ std::string ambience_stream_label(const std::string& path) {
 }
 
 void create_ambience_properties_controls(AmbiencePropertiesState* state) {
-    make_dialog_control(state->window, "STATIC", "Default stream", SS_LEFT, -1, 18, 18, 104, 22);
+    make_dialog_control(state->window, "STATIC", state->editing_region ? "Region stream" : "Default stream", SS_LEFT, -1, 18, 18, 104, 22);
     state->stream = make_dialog_control(state->window, "COMBOBOX", "",
                                           CBS_DROPDOWNLIST | CBS_AUTOHSCROLL | WS_VSCROLL,
                                           ID_AMBIENCE_STREAM, 126, 18, 380, 260);
@@ -3589,14 +3624,35 @@ void create_ambience_properties_controls(AmbiencePropertiesState* state) {
     state->volume = make_dialog_control(state->window, "EDIT", "",
                                           ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP,
                                           ID_AMBIENCE_VOLUME, 126, 58, 100, 22);
-    make_dialog_control(
+    if (state->editing_region) {
+        make_dialog_control(state->window, "STATIC", "Bounds relative to region position (world axes)", SS_LEFT, -1, 18, 96, 490, 22);
+        const char* headings[]{"Inner min", "Inner max", "Outer min", "Outer max"};
+        for (int col = 0; col < 4; ++col)
+            make_dialog_control(state->window, "STATIC", headings[col], SS_LEFT, -1, 62 + col * 112, 122, 108, 22);
+        float boxes[2][6];
+        memcpy(boxes[0], &state->region.ambience_inner_bounds, 24);
+        memcpy(boxes[1], &state->region.ambience_outer_bounds, 24);
+        const char* axes[]{"X", "Y", "Z"};
+        for (int axis = 0; axis < 3; ++axis) {
+            make_dialog_control(state->window, "STATIC", axes[axis], SS_LEFT, -1, 18, 148 + axis * 30, 32, 22);
+            for (int col = 0; col < 4; ++col) {
+                const int box = col / 2, field = axis * 2 + col % 2;
+                state->bounds[box][field] = make_dialog_control(state->window, "EDIT", "",
+                    ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP, 3410 + box * 6 + field,
+                    62 + col * 112, 148 + axis * 30, 108, 22);
+                set_float(state->bounds[box][field], boxes[box][field]);
+            }
+        }
+        make_dialog_control(state->window, "STATIC", "Inner box: full volume. Outer box: fade boundary.",
+                            SS_LEFT, -1, 18, 248, 490, 40);
+    } else make_dialog_control(
         state->window, "STATIC",
         "Ambience sound names come from game's root Sounds\\Streams",
         SS_LEFT, -1, 18, 98, 355, 17);
     make_dialog_control(state->window, "BUTTON", "OK", BS_DEFPUSHBUTTON | WS_TABSTOP,
-                          IDOK, 290, 158, 104, 30);
+                          IDOK, 290, state->editing_region ? 300 : 158, 104, 30);
     make_dialog_control(state->window, "BUTTON", "Cancel", BS_PUSHBUTTON | WS_TABSTOP,
-                          IDCANCEL, 402, 158, 104, 30);
+                          IDCANCEL, 402, state->editing_region ? 300 : 158, 104, 30);
 
     SendMessageA(state->stream, CB_ADDSTRING, 0,
                  reinterpret_cast<LPARAM>("(None - No ambience sound)"));
@@ -3638,6 +3694,23 @@ LRESULT CALLBACK ambience_properties_proc(HWND hwnd, UINT message, WPARAM wparam
             }
             state->selected_path = selection == 0 ? std::string{} : state->paths[selection - 1];
             state->selected_volume = volume;
+            if (state->editing_region) {
+                Entity draft = state->region;
+                draft.sound_file = state->selected_path;
+                draft.value_a = volume;
+                float boxes[2][6];
+                for (int box = 0; box < 2; ++box)
+                    for (int field = 0; field < 6; ++field)
+                        boxes[box][field] = get_float(state->bounds[box][field], NAN);
+                memcpy(&draft.ambience_inner_bounds, boxes[0], 24);
+                memcpy(&draft.ambience_outer_bounds, boxes[1], 24);
+                Error error{};
+                if (!valid_sound_region(draft, &error)) {
+                    MessageBoxA(hwnd, error.message, "Invalid sound region", MB_ICONWARNING);
+                    return 0;
+                }
+                state->region = std::move(draft);
+            }
             state->accepted = true;
             DestroyWindow(hwnd);
         } else if (LOWORD(wparam) == IDCANCEL) {
@@ -3651,12 +3724,17 @@ LRESULT CALLBACK ambience_properties_proc(HWND hwnd, UINT message, WPARAM wparam
     return DefWindowProcA(hwnd, message, wparam, lparam);
 }
 
-void command_ambience_properties() {
+void command_ambience_properties(bool editing_region = false) {
     if (g.document.source_pc_path.empty() && g.document.obj_path.empty())
         return;
     AmbiencePropertiesState state{};
-    state.selected_path = g.document.ambient_stream_path;
-    state.selected_volume = g.document.ambient_volume;
+    state.editing_region = editing_region;
+    if (editing_region) {
+        if (!valid_entity_index(g.selected) || g.document.entities[g.selected].kind != EntityKind::SoundRegion) return;
+        state.region = g.document.entities[g.selected];
+    }
+    state.selected_path = editing_region ? state.region.sound_file : g.document.ambient_stream_path;
+    state.selected_volume = editing_region ? state.region.value_a : g.document.ambient_volume;
     state.paths = available_ambience_streams();
     bool current_present = state.selected_path.empty();
     for (const std::string& path : state.paths)
@@ -3664,12 +3742,22 @@ void command_ambience_properties() {
     if (!current_present)
         state.paths.push_back(state.selected_path);
 
-    if (!run_centered_modal("Asura2005AmbienceProperties", "Streaming ambience", 540, 235, &state))
+    if (!run_centered_modal("Asura2005AmbienceProperties", editing_region ? "Ambience region" : "Streaming ambience",
+                           540, editing_region ? 378 : 235, &state))
         return;
     if (!state.accepted)
         return;
     if (!g.history.begin(g.document, g.selected))
         return;
+    if (editing_region) {
+        g.document.entities[g.selected] = std::move(state.region);
+        commit_history_transaction();
+        refresh_list();
+        refresh_inspector();
+        request_redraw();
+        set_status("Ambience region stream, volume and fade bounds updated.");
+        return;
+    }
     g.document.ambient_stream_path = std::move(state.selected_path);
     g.document.ambient_volume = state.selected_volume;
     commit_history_transaction();
@@ -4215,6 +4303,8 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             begin_place(EntityKind::StaticObject);
         else if (id == ID_ADD_BUILDING_VOLUME)
             begin_place(EntityKind::BuildingVolume);
+        else if (id == ID_ADD_SOUND_REGION)
+            begin_place(EntityKind::SoundRegion);
         else if (id == ID_UNDO)
             command_undo();
         else if (id == ID_REDO)
@@ -4231,8 +4321,11 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             command_browse_sound();
         else if (id == ID_SOUND_PREVIEW)
             command_sound_preview();
-        else if (id == ID_SOUND_PROPERTIES)
-            command_sound_properties();
+        else if (id == ID_SOUND_PROPERTIES) {
+            if (valid_entity_index(g.selected) && g.document.entities[g.selected].kind == EntityKind::SoundRegion)
+                command_ambience_properties(true);
+            else command_sound_properties();
+        }
         else if (id == ID_LIGHT_PROPERTIES)
             command_light_properties();
         else if (id == ID_ENTITY_LIST) {

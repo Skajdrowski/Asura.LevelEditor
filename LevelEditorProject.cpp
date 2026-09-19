@@ -1,4 +1,5 @@
 #include "LevelEditorProject.h"
+#include "LevelEditorExport.h"
 
 #include <cmath>
 #include <cstring>
@@ -12,7 +13,7 @@ namespace editor {
 namespace {
 
 constexpr char kProjectMagic[8] = {'A', 'L', 'E', 'V', '2', '0', '0', '5'};
-constexpr uint32_t kProjectVersion = 15;
+constexpr uint32_t kProjectVersion = 16;
 
 struct BinaryWriter {
     std::vector<uint8_t> bytes;
@@ -278,6 +279,13 @@ bool save_project(const Document& document, const char* path, std::string* why) 
     }
     writer.u32(static_cast<uint32_t>(document.entities.size()));
     for (const Entity& entity : document.entities) {
+        if (entity.kind == EntityKind::SoundRegion) {
+            Error error{};
+            if (!valid_sound_region(entity, &error)) {
+                if (why) *why = error.message;
+                return false;
+            }
+        }
         writer.u32(static_cast<uint32_t>(entity.kind));
         writer.str(entity.name);
         write_vec3(writer, entity.position);
@@ -340,6 +348,10 @@ bool save_project(const Document& document, const char* path, std::string* why) 
             writer.u32(entity.static_object_has_template ? 1u : 0u);
             writer.raw(entity.static_object_body.data(), entity.static_object_body.size());
         }
+        if (entity.kind == EntityKind::SoundRegion) {
+            writer.raw(&entity.ambience_inner_bounds, sizeof(entity.ambience_inner_bounds));
+            writer.raw(&entity.ambience_outer_bounds, sizeof(entity.ambience_outer_bounds));
+        }
     }
 
     Error error{};
@@ -379,6 +391,7 @@ bool load_project(Document* document, const char* path, std::string* why) {
     }
 
     Document next;
+    next.sound_regions_loaded = project_version >= 16;
     next.project_path = path;
     next.obj_path = reader.str();
     if (project_version >= 7)
@@ -486,7 +499,9 @@ bool load_project(Document* document, const char* path, std::string* why) {
                                                       ? static_cast<uint32_t>(EntityKind::PositionMarker)
                                                       : project_version <= 13
                                                             ? static_cast<uint32_t>(EntityKind::StaticObject)
-                                                            : static_cast<uint32_t>(EntityKind::BuildingVolume);
+                                                            : project_version <= 15
+                                                                  ? static_cast<uint32_t>(EntityKind::BuildingVolume)
+                                                                  : static_cast<uint32_t>(EntityKind::SoundRegion);
         if (kind > maximum_kind)
             reader.ok = false;
         const bool supported = kind <= (project_version <= 7
@@ -495,7 +510,9 @@ bool load_project(Document* document, const char* path, std::string* why) {
                                                    ? static_cast<uint32_t>(EntityKind::PositionMarker)
                                                    : project_version <= 13
                                                          ? static_cast<uint32_t>(EntityKind::StaticObject)
-                                                         : static_cast<uint32_t>(EntityKind::BuildingVolume));
+                                                         : project_version <= 15
+                                                               ? static_cast<uint32_t>(EntityKind::BuildingVolume)
+                                                               : static_cast<uint32_t>(EntityKind::SoundRegion));
         if (supported)
             entity.kind = static_cast<EntityKind>(kind);
         entity.name = reader.str();
@@ -537,7 +554,8 @@ bool load_project(Document* document, const char* path, std::string* why) {
                 entity.sound_trigger_source_guid = reader.u32();
             }
         }
-        if (project_version >= 8 && kind >= static_cast<uint32_t>(EntityKind::Pickup)) {
+        if (project_version >= 8 && kind >= static_cast<uint32_t>(EntityKind::Pickup) &&
+            kind <= static_cast<uint32_t>(EntityKind::BuildingVolume)) {
             entity.source_entity_record = reader.u32() != 0;
             entity.source_entity_classification = static_cast<uint16_t>(reader.u32());
             entity.source_bounds.MinX = reader.f32();
@@ -567,6 +585,12 @@ bool load_project(Document* document, const char* path, std::string* why) {
                 entity.pickup_anim_id = body.m_xPhysicalObject.m_uAnimID;
                 entity.pickup_anim_file_id = body.m_xPhysicalObject.m_uAnimFileID;
             }
+        }
+        if (project_version >= 16 && entity.kind == EntityKind::SoundRegion) {
+            reader.raw(&entity.ambience_inner_bounds, sizeof(entity.ambience_inner_bounds));
+            reader.raw(&entity.ambience_outer_bounds, sizeof(entity.ambience_outer_bounds));
+            Error error{};
+            if (!valid_sound_region(entity, &error)) reader.ok = false;
         }
         if (supported)
             next.entities.push_back(std::move(entity));

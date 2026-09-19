@@ -15,8 +15,9 @@ struct PcEnvironmentMaterialBinding {
     uint32_t surface_type = 0;
 };
 
-bool source_ambience_info(const asura::level::ChunkRef& chunk, std::string* path, float* volume,
-                          uint32_t* tail_offset, asura::Error* err);
+bool source_ambience_info(const asura::level::ChunkRef& chunk, Document* document, asura::Error* err);
+bool valid_sound_region(const Entity& entity, asura::Error* err);
+Asura_Bounding_Box sound_region_bounds(const Entity& entity, bool outer);
 
 bool pc_environment_material_bindings(
     const asura::level::ChunkList& chunks,

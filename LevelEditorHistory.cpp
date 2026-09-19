@@ -69,6 +69,8 @@ bool equal(const Entity& a, const Entity& b) {
            a.sound_controller_active == b.sound_controller_active &&
            a.sound_controller_padding == b.sound_controller_padding &&
            equal(a.sound_phonon, b.sound_phonon) &&
+           equal(a.ambience_inner_bounds, b.ambience_inner_bounds) &&
+           equal(a.ambience_outer_bounds, b.ambience_outer_bounds) &&
            a.sound_trigger_enabled == b.sound_trigger_enabled &&
            a.sound_trigger_once == b.sound_trigger_once &&
            a.sound_stop_on_exit == b.sound_stop_on_exit &&
@@ -169,6 +171,7 @@ bool equal_document_content(const Document& a, const Document& b) {
            a.ambient_stream_path == b.ambient_stream_path &&
            equal(a.ambient_volume, b.ambient_volume) &&
            a.ambient_source_record == b.ambient_source_record &&
+           a.sound_regions_loaded == b.sound_regions_loaded &&
            a.source_pickup_inventory_complete == b.source_pickup_inventory_complete &&
            a.source_static_object_inventory_complete == b.source_static_object_inventory_complete;
 }
@@ -176,7 +179,8 @@ bool equal_document_content(const Document& a, const Document& b) {
 bool authorable(EntityKind kind) {
     return kind == EntityKind::SpawnPoint || kind == EntityKind::Light ||
            kind == EntityKind::Sound || kind == EntityKind::Pickup ||
-           kind == EntityKind::StaticObject || kind == EntityKind::BuildingVolume;
+           kind == EntityKind::StaticObject || kind == EntityKind::BuildingVolume ||
+           kind == EntityKind::SoundRegion;
 }
 
 void set_error(std::string* error, const char* message) {
@@ -272,6 +276,7 @@ void canonicalize_clone(Entity* entity) {
             entity->position.z - bounds_size.z * .5f, entity->position.z + bounds_size.z * .5f};
         break;
     case EntityKind::Light:
+    case EntityKind::SoundRegion:
     case EntityKind::AssassinationTarget:
     case EntityKind::PositionMarker:
         break;

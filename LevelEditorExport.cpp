@@ -69,26 +69,29 @@ bool append_editor_weather(Buffer* out, const Document& document, Error* err) {
     return buffer_patch(out, start + 21, enabled, sizeof(enabled), err);
 }
 
-constexpr uint32_t kStreamingBackgroundSoundDefaultVolumeOffset = 0x18u;
-constexpr uint32_t kStreamingBackgroundSoundDefaultPathOffset = 0x1cu;
+Asura_Bounding_Box sound_region_bounds(const Entity& entity, bool outer) {
+    const auto& b = outer ? entity.ambience_outer_bounds : entity.ambience_inner_bounds;
+    return {b.MinX + entity.position.x, b.MaxX + entity.position.x,
+            b.MinY + entity.position.y, b.MaxY + entity.position.y,
+            b.MinZ + entity.position.z, b.MaxZ + entity.position.z};
+}
 
-bool source_ambience_info(const ChunkRef& chunk, std::string* path, float* volume,
-                          uint32_t* tail_offset, Error* err) {
-    if (chunk.cid != ASURA_CHUNK_STREAMINGBACKGROUNDSOUND || chunk.version > 1 ||
-        chunk.size <= kStreamingBackgroundSoundDefaultPathOffset)
-        return fail(err, "the source SBSN default sound is truncated or unsupported");
-    const Str source_path = padded_string_at(chunk.data, chunk.size,
-                                             kStreamingBackgroundSoundDefaultPathOffset);
-    if (!source_path.data)
-        return fail(err, "the source SBSN default sound path is truncated");
-    const uint64_t tail = align_up(
-        static_cast<uint64_t>(kStreamingBackgroundSoundDefaultPathOffset) + source_path.size + 1, 4);
-    if (tail > chunk.size)
-        return fail(err, "the source SBSN default sound path is invalid");
-    path->assign(source_path.data, source_path.size);
-    memcpy(volume, chunk.data + kStreamingBackgroundSoundDefaultVolumeOffset, sizeof(*volume));
-    if (tail_offset)
-        *tail_offset = static_cast<uint32_t>(tail);
+bool valid_sound_region(const Entity& entity, Error* err) {
+    if (entity.sound_file.size() > 4096 || entity.sound_file.find('\0') != std::string::npos ||
+        !isfinite(entity.value_a) || entity.value_a < 0 || entity.value_a > 1)
+        return fail(err, "sound region '%s' needs a valid stream path and volume from 0 to 1", entity.name.c_str());
+    const auto inner = sound_region_bounds(entity, false);
+    const auto outer = sound_region_bounds(entity, true);
+    float a[6], b[6];
+    memcpy(a, &inner, sizeof(a));
+    memcpy(b, &outer, sizeof(b));
+    for (int axis = 0; axis < 6; axis += 2) {
+        if (!isfinite(a[axis]) || !isfinite(a[axis + 1]) ||
+            !isfinite(b[axis]) || !isfinite(b[axis + 1]) ||
+            a[axis] > a[axis + 1] || b[axis] > a[axis] || b[axis + 1] < a[axis + 1] ||
+            fabsf(b[axis]) > 1.0e6f || fabsf(b[axis + 1]) > 1.0e6f)
+            return fail(err, "sound region '%s' needs finite inner bounds contained by its outer bounds", entity.name.c_str());
+    }
     return true;
 }
 
@@ -105,8 +108,19 @@ bool valid_ambience_settings(const Document& document, Error* err) {
 bool append_editor_ambience(Buffer* out, const Document& document, Error* err) {
     if (!valid_ambience_settings(document, err))
         return false;
+    std::vector<const Entity*> regions;
+    for (const Entity& entity : document.entities) {
+        if (entity.kind != EntityKind::SoundRegion) continue;
+        if (!valid_sound_region(entity, err)) return false;
+        regions.push_back(&entity);
+    }
+    // MCP2 0x4836C0 shares 16 KiB between results and the traversal stack.
+    // This cap also covers the worst case where every balanced-tree leaf overlaps.
+    if (regions.size() > 4000)
+        return fail(err, "SBSN supports at most 4000 overlapping sound regions");
+    if (regions.empty() && document.ambient_stream_path.empty()) return true;
     ChunkMark chunk = begin_chunk(out, ASURA_CHUNK_STREAMINGBACKGROUNDSOUND, 1, 0, err);
-    append_u32(out, 0, err); // regional sound count
+    append_u32(out, static_cast<uint32_t>(regions.size()), err);
     append_u32(out, 0, err); // SBSN flags (unused by the 2005 target reader)
     append_f32(out, document.ambient_volume, err);
     if (!append_padded_cstr(out,
@@ -114,6 +128,80 @@ bool append_editor_ambience(Buffer* out, const Document& document, Error* err) {
                              static_cast<uint32_t>(document.ambient_stream_path.size())},
                             err))
         return false;
+    std::vector<std::array<float, 6>> boxes;
+    std::vector<uint16_t> order;
+    for (const Entity* entity : regions) {
+        const auto inner = sound_region_bounds(*entity, false);
+        const auto outer = sound_region_bounds(*entity, true);
+        append_f32(out, entity->value_a, err);
+        buffer_append(out, &inner, sizeof(inner), err);
+        buffer_append(out, &outer, sizeof(outer), err);
+        append_padded_cstr(out, {entity->sound_file.data(), static_cast<uint32_t>(entity->sound_file.size())}, err);
+        std::array<float, 6> box;
+        memcpy(box.data(), &outer, sizeof(outer));
+        // Tree tests use strict intersections. Padding keeps exact region edges reachable.
+        for (int axis = 0; axis < 6; axis += 2) { box[axis] -= .5f; box[axis + 1] += .5f; }
+        order.push_back(static_cast<uint16_t>(boxes.size()));
+        boxes.push_back(box);
+    }
+    if (!regions.empty()) {
+        const auto bounds = [&](size_t first, size_t last) {
+            auto box = boxes[order[first]];
+            for (size_t i = first + 1; i < last; ++i)
+                for (int axis = 0; axis < 6; axis += 2) {
+                    box[axis] = std::min(box[axis], boxes[order[i]][axis]);
+                    box[axis + 1] = std::max(box[axis + 1], boxes[order[i]][axis + 1]);
+                }
+            return box;
+        };
+        const auto root = bounds(0, order.size());
+        buffer_append(out, root.data(), sizeof(root), err);
+        std::vector<std::array<uint8_t, 12>> nodes(regions.size() - 1);
+        uint16_t next_node = 0;
+        const auto build = [&](auto&& self, size_t first, size_t last,
+                               const std::array<float, 6>& parent) -> uint16_t {
+            if (last - first == 1) return order[first];
+            const uint16_t index = next_node++;
+            auto& node = nodes[index];
+            int split = 0;
+            for (int axis = 2; axis < 6; axis += 2)
+                if (parent[axis + 1] - parent[axis] > parent[split + 1] - parent[split]) split = axis;
+            const size_t middle = first + (last - first) / 2;
+            std::nth_element(order.begin() + first, order.begin() + middle, order.begin() + last,
+                [&](uint16_t a, uint16_t b) {
+                    const float ca = boxes[a][split] + boxes[a][split + 1];
+                    const float cb = boxes[b][split] + boxes[b][split + 1];
+                    return ca != cb ? ca < cb : a < b;
+                });
+            const auto left = bounds(first, middle), right = bounds(middle, last);
+            auto decoded_left = parent, decoded_right = parent;
+            // MCP2 0x402A00: six 1/128 offsets; each side tightens one child.
+            for (int axis = 0; axis < 3; ++axis) {
+                const float step = (parent[axis * 2 + 1] - parent[axis * 2]) / 128.0f;
+                for (int side = 0; side < 2; ++side) {
+                    const int field = axis * 2 + side, bit = axis + side * 3;
+                    const bool choose_left = side ? left[field] < right[field] : left[field] > right[field];
+                    const float value = choose_left ? left[field] : right[field];
+                    const float distance = side ? parent[field] - value : value - parent[field];
+                    int q = std::clamp(static_cast<int>(floorf(distance / step)), 0, 128);
+                    // Leave a quantization step of slack for x87/SSE rounding differences.
+                    if (q) --q;
+                    node[bit] = static_cast<uint8_t>(q);
+                    if (choose_left) node[10] |= 1u << bit;
+                    (choose_left ? decoded_left : decoded_right)[field] =
+                        parent[field] + (side ? -q : q) * step;
+                }
+            }
+            if (middle - first == 1) node[10] |= 0x40;
+            if (last - middle == 1) node[10] |= 0x80;
+            const uint16_t children[]{self(self, first, middle, decoded_left),
+                                      self(self, middle, last, decoded_right)};
+            memcpy(node.data() + 6, children, sizeof(children));
+            return index;
+        };
+        if (regions.size() > 1) build(build, 0, order.size(), root);
+        buffer_append(out, nodes.data(), nodes.size() * 12, err);
+    }
     return end_chunk(out, chunk, err);
 }
 
@@ -1179,7 +1267,7 @@ bool pack_document(Document& doc, const char* output_path, std::string* why) {
                          static_cast<uint32_t>(env_payload.size), &err) &&
              append_sound_resources(&output, sounds, &scratch, &err) &&
              (!from_pc || append_pc_sound_resources(&output, source, sounds, &err)) &&
-             (doc.ambient_stream_path.empty() || append_editor_ambience(&output, doc, &err)) &&
+             append_editor_ambience(&output, doc, &err) &&
              append_editor_lights(&output, doc, &err) &&
              append_phon(&output, sounds, &err) &&
              append_emod(&output, view, view.module_count, cfg, material_map,
