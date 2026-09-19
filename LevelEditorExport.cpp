@@ -1160,14 +1160,14 @@ bool pack_document(Document& doc, const char* output_path, std::string* why) {
             *why = "Open an OBJ or PC level before exporting.";
         return false;
     }
-    bool has_pickups = false, has_static_objects = false;
+    bool has_static_objects = false;
     for (const Entity& entity : doc.entities) {
-        has_pickups |= entity.kind == EntityKind::Pickup;
         has_static_objects |= entity.kind == EntityKind::StaticObject;
     }
-    if (has_pickups && !from_pc && doc.weapons_donor.empty()) {
+    // Equipped weapons need their resources even without placed pickups.
+    if (!from_pc && doc.weapons_donor.empty()) {
         if (why)
-            *why = "Choose a Weapons donor .PC before exporting pickups from a custom level.";
+            *why = "Choose a Weapons donor .PC before exporting a custom level.";
         return false;
     }
     if (has_static_objects && !from_pc && doc.object_donors.empty()) {
@@ -1185,7 +1185,7 @@ bool pack_document(Document& doc, const char* output_path, std::string* why) {
     cfg.material_map = doc.material_map.empty() ? nullptr : doc.material_map.c_str();
     cfg.texture_dir = doc.texture_dir.empty() ? nullptr : doc.texture_dir.c_str();
     cfg.weapon_from_pc = doc.weapons_donor.empty() ? nullptr : doc.weapons_donor.c_str();
-    if (from_pc && has_pickups && !cfg.weapon_from_pc)
+    if (from_pc && !cfg.weapon_from_pc)
         cfg.weapon_from_pc = doc.source_pc_path.c_str();
     if (from_pc) cfg.flip_z = false; // The PC importer has already converted Y to editor space.
     cfg.sky_texture_dir = doc.sky_texture_dir.empty() ? nullptr : doc.sky_texture_dir.c_str();

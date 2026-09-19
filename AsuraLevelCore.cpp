@@ -1440,10 +1440,6 @@ bool append_rsfl(Buffer* out, Error* err) {
     append_u32(out, 0, err);
     return end_chunk(out, chunk, err);
 }
-bool bytes_contains_i(const uint8_t* data, uint32_t size, const char* needle) {
-    Str n = str_from_c(needle);
-    return str_contains_i({reinterpret_cast<const char*>(data), size}, n);
-}
 bool path_name_ieq(Str a, Str b) {
     if (a.size != b.size)
         return false;
@@ -1498,7 +1494,7 @@ bool text_chunk_references(const ChunkRef& ch, Str resource) {
     }
     return false;
 }
-constexpr const char* kWeaponHsknNames[] = {"Binoculars",   "FaustRocket",   "Knife",
+constexpr const char* kWeaponResourceNames[] = {"Binoculars",   "FaustRocket",   "Knife",
                                             "Luger",        "MG42",          "Panzerfaust",
                                             "Pineapple",    "Rock",          "ammo_belt",
                                             "ammo_dp28",    "ammo_drum",     "ammo_mp40",
@@ -1509,9 +1505,13 @@ constexpr const char* kWeaponHsknNames[] = {"Binoculars",   "FaustRocket",   "Kn
                                             "p38",          "panzerschreck", "schreckrocket",
                                             "smallmedkit",  "smokegrenade",  "springfield",
                                             "stickgrenade", "tbomb",         "tnt",
-                                            "tripbomb",     "tripbomb_stake"};
+                                            "tripbomb",     "tripbomb_stake",
+                                            // Runtime projectile/casing objects (MCP2 0x538F70,
+                                            // 0x5553D0 and bullet camera 0x5804B0).
+                                            "Shell",        "machbullet",    "pistolbullet",
+                                            "riflebullet",  "bullet"};
 bool is_weapon_name(Str name) {
-    for (const char* w : kWeaponHsknNames)
+    for (const char* w : kWeaponResourceNames)
         if (str_ieq_c(name, w))
             return true;
     return false;
@@ -1519,7 +1519,7 @@ bool is_weapon_name(Str name) {
 bool is_weapon_name_or_variant(Str name) {
     if (is_weapon_name(name))
         return true;
-    for (const char* w : kWeaponHsknNames) {
+    for (const char* w : kWeaponResourceNames) {
         Str base = str_lit(w);
         if (name.size > base.size && name.data[base.size] == '_' && str_ieq({name.data, base.size}, base))
             return true;
@@ -1543,7 +1543,7 @@ bool path_has_component_i(Str path, Str token) {
     return false;
 }
 bool has_weapon_token(Str text, bool path_component) {
-    for (const char* w : kWeaponHsknNames) {
+    for (const char* w : kWeaponResourceNames) {
         Str name = str_lit(w);
         if (path_component ? path_has_component_i(text, name) : str_contains_i(text, name))
             return true;
@@ -1584,9 +1584,6 @@ bool append_weapon_support(Buffer* out, const Config& cfg, Arena* scratch, Error
         return str_ieq_c(name, "mp_russiandogtag") || str_ieq_c(name, "mp_germandogtag") ||
                str_ieq_c(name, "mp_dedcross");
     };
-    auto is_pickup_support = [&](uint32_t c) {
-        return is_support(c) || c == fourcc('S', 'H', 'P', 'D') || c == fourcc('S', 'H', 'A', 'P');
-    };
     for (uint32_t i = 0; i < d.count; ++i)
         if (d.chunks[i].cid == fourcc('H', 'S', 'K', 'N')) {
             Str name = padded_string_at(d.chunks[i].data, d.chunks[i].size, 24);
@@ -1595,8 +1592,6 @@ bool append_weapon_support(Buffer* out, const Config& cfg, Arena* scratch, Error
             want[i] = 1;
             int32_t j = static_cast<int32_t>(i) - 1;
             while (j >= 0 && is_support(d.chunks[j].cid))
-                want[j--] = 1;
-            while (j >= 0 && d.chunks[j].cid == fourcc('H', 'C', 'A', 'N'))
                 want[j--] = 1;
             uint32_t k = i + 1;
             while (k < d.count &&
@@ -1610,11 +1605,6 @@ bool append_weapon_support(Buffer* out, const Config& cfg, Arena* scratch, Error
     for (uint32_t i = 0; i < d.count; ++i) {
         RscfInfo r{};
         if (rscf_info(d.chunks[i], &r)) {
-            if (r.type == ASURA_RESOURCEFILE_TYPE_PLATFORMSPECIFIC && is_pickup_name(r.name)) {
-                want[i] = 1;
-                for (int32_t j = static_cast<int32_t>(i) - 1; j >= 0 && is_pickup_support(d.chunks[j].cid); --j)
-                    want[j] = 1;
-            }
             if (is_weapon_name(r.name) ||
                 (r.type == ASURA_RESOURCEFILE_TYPE_TEXTURE &&
                  str_starts_i(r.name, str_lit("\\graphics\\characters\\")) && has_weapon_token(r.name, true)) ||
@@ -1625,28 +1615,45 @@ bool append_weapon_support(Buffer* out, const Config& cfg, Arena* scratch, Error
                 str_ieq_c(r.name, "\\graphics\\objects\\gore\\gore.bmp"))
                 want[i] = 1;
         }
-        if (d.chunks[i].cid == fourcc('S', 'H', 'A', 'P') &&
-            (bytes_contains_i(d.chunks[i].data, d.chunks[i].size, "mp_russiandogtag") ||
-             bytes_contains_i(d.chunks[i].data, d.chunks[i].size, "mp_germandogtag") ||
-             bytes_contains_i(d.chunks[i].data, d.chunks[i].size, "mp_dedcross"))) {
-            want[i] = 1;
-            if (i + 1 < d.count && d.chunks[i + 1].cid == fourcc('S', 'H', 'P', 'D'))
-                want[i + 1] = 1;
+        // Animations are named resources, not a contiguous part of an HSKN
+        // bundle. level01a stores several weapon rest poses among human HCANs.
+        if (d.chunks[i].cid == ASURA_CHUNK_HIERARCHY_COMPRESSEDANIM) {
+            const Str name = padded_string_at(d.chunks[i].data, d.chunks[i].size, 44);
+            if (name.data && is_weapon_name_or_variant(name))
+                want[i] = 1;
         }
     }
     // A selected model may share a non-adjacent material table with an omitted
     // resource. Retain the table active at each model, including LOD variants.
+    bool has_weapon_model = false;
     for (uint32_t i = 0; i < d.count; ++i) {
         RscfInfo resource{};
-        if (want[i] && rscf_info(d.chunks[i], &resource) &&
-            resource.type == ASURA_RESOURCEFILE_TYPE_PLATFORMSPECIFIC &&
-            (resource.subtype == ASURA_RESOURCEFILE_TYPE_PC_OBJECT ||
-             resource.subtype == ASURA_RESOURCEFILE_TYPE_PC_OBJECTHIERARCHY) &&
-            !mark_material_support(d, i, want, err)) {
+        if (!want[i] || !rscf_info(d.chunks[i], &resource) ||
+            resource.type != ASURA_RESOURCEFILE_TYPE_PLATFORMSPECIFIC ||
+            (resource.subtype != ASURA_RESOURCEFILE_TYPE_PC_OBJECT &&
+             resource.subtype != ASURA_RESOURCEFILE_TYPE_PC_OBJECTHIERARCHY &&
+             resource.subtype != ASURA_RESOURCEFILE_TYPE_PC_CHARACTER))
+            continue;
+        has_weapon_model |= resource.subtype != ASURA_RESOURCEFILE_TYPE_PC_OBJECT && is_weapon_name(resource.name);
+        if (!mark_material_support(d, i, want, err)) {
             unmap_file(&d.file);
             arena_reset(scratch, mark);
             return false;
         }
+        if (resource.subtype == ASURA_RESOURCEFILE_TYPE_PC_OBJECT && resource.payload_size >= 4) {
+            const uint32_t id = read_u32(resource.payload);
+            for (uint32_t j = 0; j < d.count; ++j) {
+                const ChunkRef& shape = d.chunks[j];
+                if ((shape.cid == ASURA_CHUNK_SHAPE || shape.cid == ASURA_CHUNK_SHAPEDATA) &&
+                    shape.size >= 24 && read_u32(shape.data + 16) == id)
+                    want[j] = 1;
+            }
+        }
+    }
+    if (!has_weapon_model) {
+        unmap_file(&d.file);
+        arena_reset(scratch, mark);
+        return fail(err, "the Weapons donor .PC contains no weapon models");
     }
     // Pickup/weapon TEXT chunks name texture resources without the leading
     // "\\graphics" component. Import every matching type-2 RSCF as well.
