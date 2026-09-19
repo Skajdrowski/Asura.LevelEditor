@@ -1209,9 +1209,9 @@ const char* entity_type_label(EntityKind kind) {
     case EntityKind::Sound: return "Sound";
     case EntityKind::Pickup: return "Pickup";
     case EntityKind::AssassinationTarget: return "Target";
-    case EntityKind::PositionMarker: return "Marker";
+    case EntityKind::PositionMarker: return "Extraction zone";
     case EntityKind::StaticObject: return "Object";
-    case EntityKind::BuildingVolume: return "Building volume";
+    case EntityKind::BuildingVolume: return "Indoor zone";
     case EntityKind::SoundRegion: return "Ambience region";
     }
     return "Entity";
