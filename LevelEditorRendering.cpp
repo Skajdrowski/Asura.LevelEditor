@@ -1508,7 +1508,7 @@ float4 PSMain(VSOutput input) : SV_TARGET {
     if (input.color.a > 0.5)
         return input.color;
     float4 albedo = modelTexture.Sample(modelSampler, input.uv);
-    if (albedo.a <= 10.0 / 255.0)
+    if (input.color.a < 0.0 && albedo.a <= 10.0 / 255.0)
         discard;
     float light = 0.28 + 0.72 * abs(dot(normalize(input.normal), normalize(float3(-0.35, 0.8, -0.45))));
     float3 baseColor = dot(abs(input.color.rgb), float3(1.0, 1.0, 1.0)) > 0.001
@@ -2325,6 +2325,12 @@ void append_gpu_entity_model(const Entity& entity, const EntityModel* model, boo
         else if (selected)
             color = entity.kind == EntityKind::StaticObject ? DirectX::XMFLOAT4{.42f, 1.0f, .82f, 0}
                                                              : DirectX::XMFLOAT4{1.0f, .68f, .22f, 0};
+        // Negative alpha enables the target's alpha test. Opaque materials may
+        // contain unused texture alpha (zis5); Character never alpha-tests.
+        if (textured && model->resource_subtype != ASURA_RESOURCEFILE_TYPE_PC_CHARACTER &&
+            !(material->flags & 1u) && ((material->flags & 2u) ||
+                (model->resource_subtype == ASURA_RESOURCEFILE_TYPE_PC_OBJECT && (material->flags & 0x1000u))))
+            color.w = -1.0f;
         const uint32_t start_vertex = static_cast<uint32_t>(output->size());
         for (uint16_t index : face)
             output->push_back(gpu_model_vertex(posed_vertices ? (*posed_vertices)[index] : model->vertices[index], entity, color));
@@ -2471,14 +2477,16 @@ void gpu_draw_entity_model_ranges(const std::vector<GpuEntityModelRange>& ranges
     std::stable_sort(transparent.begin(), transparent.end(),
                      [](const auto& a, const auto& b) { return a.depth > b.depth; });
     if (!transparent.empty()) {
-        // skybox_depth is LESS_EQUAL with depth writes disabled.
-        gpu.context->OMSetDepthStencilState(gpu.skybox_depth, 0);
         ID3D11BlendState* bound_blend = nullptr;
         for (const auto& entry : transparent) {
             ID3D11BlendState* blend = gpu_entity_blend(*entry.range) == GpuEntityBlend::Additive
                                           ? gpu.additive_blend : gpu.alpha_blend;
             if (blend != bound_blend) {
                 gpu.context->OMSetBlendState(blend, nullptr, 0xffffffffu);
+                // MCP2 0x48E760/0x489C30 keep depth writes for alpha materials.
+                // Only additive light shafts use the read-only depth state.
+                gpu.context->OMSetDepthStencilState(
+                    blend == gpu.additive_blend ? gpu.skybox_depth : gpu.depth_enabled, 0);
                 bound_blend = blend;
             }
             draw_range(*entry.range);
