@@ -618,7 +618,7 @@ bool append_static_object_support(Buffer* out, const Document& document,
     if (required_roots.empty())
         return true;
 
-    std::vector<uint32_t> present_objects, present_shapes, present_hierarchies;
+    std::vector<uint32_t> present_objects, present_shapes, present_hierarchies, present_fragments;
     std::vector<std::string> present_textures;
     Arena scratch{};
     if (!arena_init(&scratch, 128 * MiB, err))
@@ -680,6 +680,65 @@ bool append_static_object_support(Buffer* out, const Document& document,
                         read_u32(shape.data + sizeof(Asura_Chunk_Header)) != id)
                         continue;
                     wanted[i] = 1;
+                    // SHAP's fragment ID is separate from its model/file ID.
+                    // MCP2 0x47C020 reads it after the optional LOS mesh and
+                    // 260-byte render record. 0x465910 uses FRAG's replacement
+                    // entry on death; without it the intact model stays visible.
+                    if (shape.version != 0 || shape.size < 24) {
+                        fail(err, "Object %08X has an unsupported or truncated SHAP", id);
+                        break;
+                    }
+                    const uint32_t components = read_u32(shape.data + 20);
+                    if (components & 4u) {
+                        uint64_t at = 24;
+                        if (components & 1u) {
+                            if (at + 4 > shape.size) {
+                                fail(err, "Object %08X has a truncated SHAP collision mesh", id);
+                                break;
+                            }
+                            const uint32_t version = read_u32(shape.data + at);
+                            const uint32_t header_size = version < 2 ? 48u : version == 2 ? 56u : 52u;
+                            if (version > 3 || at + header_size > shape.size) {
+                                fail(err, "Object %08X has an unsupported or truncated SHAP collision mesh", id);
+                                break;
+                            }
+                            const uint8_t* mesh = shape.data + at;
+                            const uint64_t vertices = read_u32(mesh + 4), polygons = read_u32(mesh + 8);
+                            const uint32_t flags = read_u32(mesh + 12), materials = read_u32(mesh + 16);
+                            at += header_size + vertices * 12 + polygons * 8;
+                            // Collision mesh v0 stores normals and a shared flag
+                            // table; v1-v3 store optional arrays per polygon.
+                            if (!version)
+                                at += static_cast<uint64_t>(flags) * (12 + (materials ? 4 : 0));
+                            else
+                                at += polygons * (version == 3 ? 2 : 4) *
+                                      ((flags ? 1 : 0) + (version >= 2 && materials ? 1 : 0));
+                        }
+                        if (components & 2u) at += 260;
+                        if (at + 4 > shape.size) {
+                            fail(err, "Object %08X has a truncated SHAP fragment reference", id);
+                            break;
+                        }
+                        const uint32_t fragment_id = read_u32(shape.data + at);
+                        for (uint32_t j = 0; fragment_id && j < donor.count; ++j) {
+                            const ChunkRef& fragment = donor.chunks[j];
+                            if (fragment.cid != ASURA_CHUNK_FRAGMENT || fragment.size < 20 ||
+                                read_u32(fragment.data + 16) != fragment_id) continue;
+                            // MCP2 0x43CD50 / MCP1 Asura_Chunk_Fragment::Process:
+                            // ID, count, then {file ID, position, flags, quantity}.
+                            if (fragment.version != 0 || fragment.size < 24 ||
+                                24ull + 24ull * read_u32(fragment.data + 20) != fragment.size) {
+                                fail(err, "Object %08X has an unsupported or truncated FRAG", id);
+                                break;
+                            }
+                            wanted[j] = 1;
+                            for (uint32_t k = 0; k < read_u32(fragment.data + 20); ++k) {
+                                const uint32_t child = read_u32(fragment.data + 24 + k * 24);
+                                if (child && !contains_u32(donor_ids, child)) donor_ids.push_back(child);
+                            }
+                            break;
+                        }
+                    }
                     break;
                 }
             }
@@ -730,6 +789,10 @@ bool append_static_object_support(Buffer* out, const Document& document,
                 if (contains_u32(present_shapes, id))
                     continue;
                 present_shapes.push_back(id);
+            } else if (donor.chunks[i].cid == ASURA_CHUNK_FRAGMENT) {
+                const uint32_t id = read_u32(donor.chunks[i].data + 16);
+                if (contains_u32(present_fragments, id)) continue;
+                present_fragments.push_back(id);
             }
             append_chunk_copy(out, donor.chunks[i], err);
         }
