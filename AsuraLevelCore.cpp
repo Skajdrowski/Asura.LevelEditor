@@ -1042,7 +1042,9 @@ bool append_module_collision_v3(Buffer* out, const EnvView& env, uint32_t module
         mx.z = fmax(mx.z, p.z);
     }
     Asura_Vector_3 c{(mn.x + mx.x) * .5f, (mn.y + mx.y) * .5f, (mn.z + mx.z) * .5f};
-    const float bounds[6] = {mn.x - c.x, mx.x - c.x, mn.y - c.y,
+    // EMOD bounds also seed the target's camera/module query (0x4125B0).
+    // Keep headroom above flat geometry; the game's up direction is negative Y.
+    const float bounds[6] = {mn.x - c.x, mx.x - c.x, mn.y - c.y - 20.0f,
                              mx.y - c.y, mn.z - c.z, mx.z - c.z};
     const float rx = bounds[1] - bounds[0], ry = bounds[3] - bounds[2], rz = bounds[5] - bounds[4];
     const float radius = .5f * sqrt(rx * rx + ry * ry + rz * rz);
