@@ -29,7 +29,8 @@ You can save your work into Level Editor's own **.alev** project format and come
 
 # Asura entities
 
-There are 5 server-side entities: Spawn, Object, Pickup, Sound, Indoor Zone and 1 client-side entity Light.
+Level Editor supports 5 server-side entities: Spawn, Object, Pickup, Sound, Indoor Zone
+and 2 client-side entities: Light and Ambience region
 
 ## Spawn
 
@@ -48,9 +49,9 @@ Spawns also have their **Game mode gate**, which allows to create game mode excl
 
 ## Object
 
-Static geometry objects. They get affected by **Light** entities and they do not participate in prebaked vertex lighting. They can be used as a collision hotfix for remote players who play on outdated level.
+Static geometry objects. They get affected by **Light** entities and they **do not** participate in level's prebaked vertex lighting. They can be used as a collision hotfix for remote players who play on an outdated level.
 
-Objects can be exported to **Wavefront OBJ** when selected, so they can be separated from Entities and set up into level geometry with their lighting baked.
+Objects can be exported to **Wavefront OBJ** when selected, so they can be separated from Entities and pasted into level geometry.
 
 ## Pickup
 
@@ -88,12 +89,25 @@ In light properties, user can define:
 
 - Color in RGB
 - Range
-- Brightness/Shadow strength
-- **Affects entities:** Enables static entity lighting with linear attenuation to Range.
-- **Use Bounding Box:** Tests overlap with entity's bounds.
-- **Shadow Volume:** Makes **Light** emit darkness instead.
+- Brightness or Shadow strength
+- **Affects entities:** Enables static entity lighting with linear attenuation to **Range**
+- **Use Bounding Box:** Tests overlap with entity's bounds against **Bounding Box**
+- **Shadow Volume:** Makes **Light** emit darkness instead
 
 <img width="766" height="543" alt="Light properties" src="https://github.com/user-attachments/assets/d336cc4b-4d7c-4b7f-af85-a52bc69ee59d" />
+
+## Ambience
+
+A sound stream of level's environment. Sniper Elite fetches ambience sound files from game's root in **Bink audio (`.bik`)** format.
+
+<img width="526" height="228" alt="Ambience properties" src="https://github.com/user-attachments/assets/27711479-9a8e-455d-9b00-ed56521cf299" />
+
+In levels you can specify default ambience played everywhere with it's default volume or their predefined **Ambience region** bounding boxes.
+
+<img width="526" height="371" alt="Ambience region properties" src="https://github.com/user-attachments/assets/68faec36-7dca-40f9-a27d-c9cbc6d69fbb" />
+
+Regions affect default ambience by either changing it's sound stream or volume when player's camera overlap one of them. Their outer box defines volume fade size.
+Both inner and outer box the same size means **no fade**
 
 # Asura Skybox
 
