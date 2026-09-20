@@ -170,6 +170,7 @@ struct EntityModelMaterial {
     std::string texture_name;
     uint32_t flags = 0;
     uint32_t texture_flags = 0;
+    uint32_t surface_type = 0;
     uint64_t texture_fingerprint = 0;
     // Preview-only copy of the embedded DDS RSCF. Models are derived runtime
     // data and are never serialized into an editor project.

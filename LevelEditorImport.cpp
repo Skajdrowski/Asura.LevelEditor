@@ -460,6 +460,7 @@ bool decode_pc_model_materials(const ChunkList& chunks, uint32_t before_chunk,
     std::vector<uint32_t> texture_flags;
     std::vector<int32_t> material_texture_indices;
     std::vector<uint32_t> material_flags;
+    std::vector<uint32_t> material_surface_types;
     for (uint32_t chunk_index = 0; chunk_index < before_chunk; ++chunk_index) {
         const ChunkRef& chunk = chunks.chunks[chunk_index];
         if (chunk.cid == ASURA_CHUNK_TEXTURENAMES) {
@@ -482,6 +483,7 @@ bool decode_pc_model_materials(const ChunkList& chunks, uint32_t before_chunk,
             if (chunk.version < 3) {
                 material_texture_indices.assign(count, -1);
                 material_flags.assign(count, 0);
+                material_surface_types.assign(count, 0);
                 for (uint32_t texture_index = 0; texture_index < count; ++texture_index)
                     material_texture_indices[texture_index] = static_cast<int32_t>(texture_index);
             }
@@ -511,10 +513,12 @@ bool decode_pc_model_materials(const ChunkList& chunks, uint32_t before_chunk,
                 return fail(err, "Object preview MTRL table is truncated");
             material_texture_indices.assign(count, -1);
             material_flags.assign(count, 0);
+            material_surface_types.assign(count, 0);
             for (uint32_t material_index = 0; material_index < count; ++material_index) {
                 const uint8_t* record = chunk.data + records_at + static_cast<uint64_t>(material_index) * stride;
                 material_texture_indices[material_index] = static_cast<int32_t>(read_u32(record));
                 material_flags[material_index] = read_u32(record + 4);
+                material_surface_types[material_index] = chunk.version ? read_u32(record + 8) : 0;
             }
         }
     }
@@ -524,6 +528,7 @@ bool decode_pc_model_materials(const ChunkList& chunks, uint32_t before_chunk,
         const int32_t texture_index = material_texture_indices[material_index];
         EntityModelMaterial& material = (*output)[material_index];
         material.flags = material_flags[material_index];
+        material.surface_type = material_surface_types[material_index];
         if (texture_index < 0 || static_cast<uint32_t>(texture_index) >= texture_names.size())
             continue;
         material.texture_name = texture_names[texture_index];

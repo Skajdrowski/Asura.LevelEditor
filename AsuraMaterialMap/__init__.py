@@ -31,7 +31,7 @@ BLENDING_FLAGS = (
     (4, "?Detail mapping via detail.dds"),
     (0x80, "Spheremap1.dds reflection"),
     (0x400, "Scrolling texture"),
-    (0x1000, "?Depth writing in special/secondary pass"),
+    (0x1000, "Light shaft depth"),
     (0x4000, "Affected by rain"),
 )
 

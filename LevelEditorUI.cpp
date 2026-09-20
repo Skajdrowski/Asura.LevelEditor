@@ -3163,7 +3163,7 @@ void command_export_obj() {
                          "Wavefront OBJ\0*.obj\0All files\0*.*\0", "obj", &path))
             return;
 
-        set_status("Exporting selected Object geometry, materials, and embedded textures...");
+        set_status("Exporting selected Object geometry, material map, and embedded textures...");
         UpdateWindow(g.window);
         SetCursor(LoadCursor(nullptr, IDC_WAIT));
         std::string result;

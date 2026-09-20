@@ -1686,6 +1686,7 @@ bool export_static_object_obj(const Entity& entity, const EntityModel& model,
     const std::string folder = obj_export_folder(obj_path);
     const std::string stem = obj_export_stem(obj_path);
     const std::string mtl_name = stem + ".mtl";
+    const std::string material_map_name = stem + "_materials.json";
     const std::string texture_folder_name = "textures";
     const std::string mtl_path = obj_export_join(folder, mtl_name);
     const std::string texture_folder = obj_export_join(folder, texture_folder_name);
@@ -1766,6 +1767,58 @@ bool export_static_object_obj(const Entity& entity, const EntityModel& model,
     }
     mtl.close();
 
+    if (ok) {
+        std::string out = "{\n";
+        for (int32_t material_index : material_indices)
+            if (material_index >= 0)
+                out += "  \"" + obj_material_name(material_index) + "\": " +
+                       std::to_string(material_index) + ",\n";
+        const char* sections[] = {"texture_by_material_index",
+                                  "transparency_flag_by_material_index",
+                                  "surface_type_by_material_index"};
+        for (size_t section = 0; section < std::size(sections); ++section) {
+            out += "  \"" + std::string(sections[section]) + "\": {";
+            bool first = true;
+            for (int32_t material_index : material_indices) {
+                if (material_index < 0 || static_cast<size_t>(material_index) >= model.materials.size())
+                    continue;
+                const EntityModelMaterial& material = model.materials[material_index];
+                out += first ? "\n" : ",\n";
+                first = false;
+                out += "    \"" + std::to_string(material_index) + "\": ";
+                if (section == 0) {
+                    std::string source_key = obj_texture_identity(
+                        {material.texture_name.data(), static_cast<uint32_t>(material.texture_name.size())});
+                    if (source_key.empty())
+                        source_key = obj_material_name(material_index);
+                    const std::string* extracted = obj_extracted_texture_name(extracted_texture_names, source_key);
+                    // Match the DDS filename, including any sanitizing or collision suffix.
+                    const std::string& texture_name = extracted ? *extracted : material.texture_name;
+                    out += '"';
+                    for (unsigned char c : texture_name) {
+                        if (c < 32) {
+                            char escaped[7];
+                            snprintf(escaped, sizeof(escaped), "\\u%04x", static_cast<unsigned int>(c));
+                            out += escaped;
+                        } else {
+                            if (c == '\\' || c == '"')
+                                out += '\\';
+                            out += static_cast<char>(c);
+                        }
+                    }
+                    out += '"';
+                } else {
+                    out += std::to_string(section == 1 ? material.flags : material.surface_type);
+                }
+            }
+            out += "\n  }";
+            out += section + 1 == std::size(sections) ? "\n" : ",\n";
+        }
+        out += "}\n";
+        const std::string material_map_path = obj_export_join(folder, material_map_name);
+        ok = write_entire_file(material_map_path.c_str(), out.data(), out.size(), &err);
+    }
+
     std::ofstream obj;
     if (ok) {
         obj.open(obj_path, std::ios::binary | std::ios::trunc);
@@ -1822,6 +1875,7 @@ bool export_static_object_obj(const Entity& entity, const EntityModel& model,
                " vertices, " + std::to_string(model.faces.size()) + " triangles, " +
                std::to_string(material_indices.size()) + " material groups, and " +
                std::to_string(texture_count) + " DDS textures to " + texture_folder_name + ".";
+        *why += " Material map saved as " + material_map_name + ".";
         if (missing_texture_count)
             *why += " " + std::to_string(missing_texture_count) +
                     " referenced textures were not loaded with the Object model.";
