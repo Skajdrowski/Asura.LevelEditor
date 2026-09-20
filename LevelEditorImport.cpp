@@ -553,9 +553,12 @@ bool decode_pc_preview_vertex(const uint8_t* source, EntityModelVertex* vertex) 
     vertex->normal = {read_f32(source + 12), read_f32(source + 16), read_f32(source + 20)};
     vertex->texcoord = {read_f32(source + 24), read_f32(source + 28)};
     if (!isfinite(vertex->position.x) || !isfinite(vertex->position.y) || !isfinite(vertex->position.z) ||
-        !isfinite(vertex->normal.x) || !isfinite(vertex->normal.y) || !isfinite(vertex->normal.z) ||
-        !isfinite(vertex->texcoord.x) || !isfinite(vertex->texcoord.y))
+        !isfinite(vertex->normal.x) || !isfinite(vertex->normal.y) || !isfinite(vertex->normal.z))
         return false;
+    // Some objects can have NaN UVs; MCP2 0x49E810 uploads them unchanged.
+    // Keep geometry usable in the preview without passing NaNs to the shader.
+    if (!isfinite(vertex->texcoord.x)) vertex->texcoord.x = 0;
+    if (!isfinite(vertex->texcoord.y)) vertex->texcoord.y = 0;
     const float normal_length = sqrtf(vertex->normal.x * vertex->normal.x +
                                       vertex->normal.y * vertex->normal.y +
                                       vertex->normal.z * vertex->normal.z);
