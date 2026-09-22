@@ -3906,8 +3906,7 @@ constexpr struct { const char* label; uint32_t mask; bool collision; } kObjectFl
     {"Additive (0x1)", 1, false}, {"Alpha texture (0x2)", 2, false},
     {"Detail mapping (0x4)", 4, false}, {"Reflection (0x80)", 0x80, false},
     {"Scrolling texture (0x400)", 0x400, false}, {"Light shaft depth (0x1000)", 0x1000, false},
-    {"Ignore entities (0x20)", 0x20, true}, {"Ignore bullets (0x40)", 0x40, true},
-    {"Ignore bullets / grenades (0x200)", 0x200, true}, {"Include backface (0x400)", 0x400, true}
+    {"Ignore entities (0x20)", 0x20, true}, {"Ignore bullets / explosions (0x40)", 0x40, true}, {"Include backface (0x400)", 0x400, true}
 };
 
 struct ObjectPropertiesState {
