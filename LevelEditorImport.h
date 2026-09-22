@@ -17,6 +17,22 @@ Asura_Vector_3 matrix_euler(const float* matrix);
 
 bool load_preview_mesh(const std::string& path, const std::string& material_map_path,
                        Mesh* mesh, std::string* why);
+bool load_static_object_obj(const std::string& path, ImportedStaticObject* object, std::string* why);
+bool prepare_imported_static_object(ImportedStaticObject* object, std::string* why);
+bool decode_pc_model_materials(const asura::level::ChunkList& chunks, uint32_t before_chunk,
+                               std::vector<EntityModelMaterial>* output, asura::Error* err,
+                               bool load_textures = true);
+
+struct ObjectCollisionMesh {
+    uint32_t offset = 0, size = 0, version = 0;
+    uint32_t flags = 0, materials = 0; // absolute offsets of overall values; zero if absent
+    uint32_t flag_table = 0, flag_count = 0, material_table = 0, material_count = 0;
+    uint32_t stride = 0;
+};
+bool object_collision_meshes(const asura::level::ChunkRef& chunk,
+                             std::vector<ObjectCollisionMesh>* meshes, asura::Error* err);
+bool load_static_object_collision_flags(const StaticObjectTemplate& object, uint16_t* flags,
+                                        std::string* why);
 
 std::string edited_pc_path(const std::string& path);
 

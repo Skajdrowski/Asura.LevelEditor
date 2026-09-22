@@ -14,11 +14,12 @@ _AUTO_REFRESH_RUNNING = False
 
 SURFACE_TYPES = (
     (1, "Concrete"),
+    (2, "Glass"),
     (4, "Metal"),
     (5, "Water"),
     (6, "Wood"),
     (7, "Human body"),
-    (8, "?Wrecked car"),
+    (8, "Wrecked car"),
     (10, "Dirt"),
     (11, "Grass"),
     (12, "Gravel"),
@@ -36,7 +37,7 @@ BLENDING_FLAGS = (
 )
 
 COLLISION_FLAGS = (
-    (0x20, "Ignore dynamic objects only"),
+    (0x20, "Ignore entities only"),
     (0x40, "Ignore bullets only"),
     (0x200, "Ignore bullets & grenades only"),
     (0x400, "Include backface"),

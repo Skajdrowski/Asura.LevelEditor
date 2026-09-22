@@ -3,6 +3,7 @@
 #include "AsuraLevelCore.h"
 
 #include <array>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -75,12 +76,26 @@ struct Entity {
     std::array<uint8_t, kStaticObjectBodySize> static_object_body{};
 };
 
+struct ImportedStaticObject;
+
+struct StaticObjectProperties {
+    // Only changed fields override the source asset's per-material/per-face values.
+    uint32_t fields = 0; // surface = 1, blending = 2, collision = 4
+    uint32_t surface_type = 0;
+    uint32_t blending_flags = 0;
+    uint16_t collision_flags = 0;
+    bool operator==(const StaticObjectProperties&) const = default;
+};
+
 struct StaticObjectTemplate {
     uint32_t file_id = 0;
     std::string resource_name;
     std::string donor_path;
     uint16_t entity_padding = 0;
     std::array<uint8_t, kStaticObjectBodySize> body{};
+    StaticObjectProperties properties;
+    // Immutable embedded asset, shared by instances and undo snapshots.
+    std::shared_ptr<const ImportedStaticObject> imported;
 };
 
 struct PickupTemplate {
@@ -228,6 +243,11 @@ struct PickupModel {
 struct StaticObjectModel {
     uint32_t file_id = 0;
     EntityModel mesh;
+};
+
+struct ImportedStaticObject {
+    EntityModel mesh;
+    uint16_t collision_flags = 0;
 };
 
 } // namespace editor

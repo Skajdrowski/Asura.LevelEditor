@@ -5,6 +5,7 @@
 #include "LevelEditorExport.h"
 
 #include <algorithm>
+#include <map>
 #include <set>
 
 using namespace asura;
@@ -78,6 +79,110 @@ bool load_preview_mesh(const std::string& path, const std::string& material_map_
     if (ok)
         *mesh = std::move(next);
     return ok;
+}
+
+bool prepare_imported_static_object(ImportedStaticObject* object, std::string* why) {
+    EntityModel& mesh = object->mesh;
+    const auto invalid = [&](const char* message) {
+        if (why) *why = message;
+        return false;
+    };
+    if (mesh.vertices.empty() || mesh.vertices.size() > 65535 || mesh.faces.empty() ||
+        mesh.faces.size() > 1000000 || mesh.materials.size() != 1)
+        return invalid("An imported Object needs 1-65535 vertices, 1-1000000 triangles and one material.");
+    mesh.min = mesh.max = mesh.vertices.front().position;
+    for (const auto& vertex : mesh.vertices) {
+        const float values[] = {vertex.position.x, vertex.position.y, vertex.position.z,
+                                vertex.normal.x, vertex.normal.y, vertex.normal.z,
+                                vertex.texcoord.x, vertex.texcoord.y};
+        for (float value : values)
+            if (!isfinite(value)) return invalid("The Object contains non-finite vertex data.");
+        mesh.min.x = fminf(mesh.min.x, vertex.position.x);
+        mesh.min.y = fminf(mesh.min.y, vertex.position.y);
+        mesh.min.z = fminf(mesh.min.z, vertex.position.z);
+        mesh.max.x = fmaxf(mesh.max.x, vertex.position.x);
+        mesh.max.y = fmaxf(mesh.max.y, vertex.position.y);
+        mesh.max.z = fmaxf(mesh.max.z, vertex.position.z);
+    }
+    for (const auto& face : mesh.faces)
+        for (uint16_t index : face)
+            if (index >= mesh.vertices.size()) return invalid("The Object contains an invalid triangle index.");
+    auto& material = mesh.materials.front();
+    if (material.surface_type > 255)
+        return invalid("The surface type must fit in one byte (0-255).");
+    if (!material.texture_bytes.empty() &&
+        (material.texture_bytes.size() < 128 || material.texture_bytes.size() > 64 * MiB ||
+         memcmp(material.texture_bytes.data(), "DDS ", 4) != 0 ||
+         read_u32(material.texture_bytes.data() + 4) != 124))
+        return invalid("The Object texture must be a DDS file (at most 64 MiB).");
+    material.texture_fingerprint = 1469598103934665603ull;
+    for (uint8_t byte : material.texture_bytes) {
+        material.texture_fingerprint ^= byte;
+        material.texture_fingerprint *= 1099511628211ull;
+    }
+    mesh.face_materials.assign(mesh.faces.size(), 0);
+    return true;
+}
+
+bool load_static_object_obj(const std::string& path, ImportedStaticObject* object, std::string* why) {
+    Mesh source;
+    if (!load_preview_mesh(path, {}, &source, why)) return false;
+    ImportedStaticObject next;
+    next.mesh.materials.resize(1);
+    next.mesh.materials.front().surface_type = 1;
+    next.mesh.materials.front().texture_flags = 8;
+    // PC_OBJECT has one material and 16-bit indices. Share identical complete
+    // vertices without merging UV seams or authored split normals.
+    std::map<std::array<float, 8>, uint16_t> vertices;
+    for (const auto& face : source.faces) {
+        const auto a = source.positions[face[0]], b = source.positions[face[1]], c = source.positions[face[2]];
+        const Asura_Vector_3 ab{b.x - a.x, b.y - a.y, b.z - a.z};
+        const Asura_Vector_3 ac{c.x - a.x, c.y - a.y, c.z - a.z};
+        Asura_Vector_3 normal{ab.y * ac.z - ab.z * ac.y, ab.z * ac.x - ab.x * ac.z,
+                              ab.x * ac.y - ab.y * ac.x};
+        const float length = sqrtf(normal.x * normal.x + normal.y * normal.y + normal.z * normal.z);
+        if (!isfinite(length) || length <= 1e-12f) {
+            if (why) *why = "The OBJ contains a degenerate or non-finite triangle.";
+            return false;
+        }
+        normal = {normal.x / length, normal.y / length, normal.z / length};
+        std::array<uint16_t, 3> indices{};
+        for (size_t corner = 0; corner < 3; ++corner) {
+            const uint32_t index = face[corner];
+            EntityModelVertex vertex{source.positions[index], source.normals[index], source.texcoords[index]};
+            const float n = sqrtf(vertex.normal.x * vertex.normal.x + vertex.normal.y * vertex.normal.y +
+                                  vertex.normal.z * vertex.normal.z);
+            vertex.normal = n > 1e-8f ? Asura_Vector_3{vertex.normal.x / n, vertex.normal.y / n,
+                                                      vertex.normal.z / n} : normal;
+            // Preview OBJ geometry is in editor space; entity vertices use game space.
+            vertex.position.y = -vertex.position.y;
+            vertex.normal.y = -vertex.normal.y;
+            const std::array<float, 8> key{vertex.position.x, vertex.position.y, vertex.position.z,
+                                           vertex.normal.x, vertex.normal.y, vertex.normal.z,
+                                           vertex.texcoord.x, vertex.texcoord.y};
+            for (float value : key) {
+                if (!isfinite(value)) {
+                    if (why) *why = "The OBJ contains non-finite vertex data.";
+                    return false;
+                }
+            }
+            const auto found = vertices.find(key);
+            if (found != vertices.end()) indices[corner] = found->second;
+            else {
+                if (next.mesh.vertices.size() == 65535) {
+                    if (why) *why = "The Object exceeds 65535 vertices after splitting UVs and normals.";
+                    return false;
+                }
+                indices[corner] = static_cast<uint16_t>(next.mesh.vertices.size());
+                vertices.emplace(key, indices[corner]);
+                next.mesh.vertices.push_back(vertex);
+            }
+        }
+        next.mesh.faces.push_back(indices);
+    }
+    if (!prepare_imported_static_object(&next, why)) return false;
+    *object = std::move(next);
+    return true;
 }
 
 Asura_Quat euler_quaternion(const Asura_Vector_3& degrees) {
@@ -454,10 +559,111 @@ void note_static_object_template(Document* document, const Entity& entity, const
     document->static_object_templates.push_back(static_object_template_from_entity(entity, donor_path));
 }
 
+bool object_collision_meshes(const ChunkRef& chunk, std::vector<ObjectCollisionMesh>* meshes, Error* err) {
+    meshes->clear();
+    uint64_t at = 24;
+    auto read_mesh = [&](uint32_t limit) {
+        ObjectCollisionMesh view;
+        view.offset = static_cast<uint32_t>(at);
+        if (at + 4 > limit) return fail(err, "Truncated object collision mesh");
+        view.version = read_u32(chunk.data + at);
+        const uint32_t header = view.version < 2 ? 48 : view.version == 2 ? 56 : 52;
+        if (view.version > 3 || at + header > limit)
+            return fail(err, "Unsupported or truncated object collision mesh");
+        const uint8_t* data = chunk.data + at;
+        const uint64_t vertices = read_u32(data + 4), faces = read_u32(data + 8);
+        const uint32_t flags = read_u32(data + 12), materials = read_u32(data + 16);
+        view.stride = view.version == 3 ? 2 : 4;
+        at += header + vertices * 12 + faces * 8;
+        if (view.version == 0) {
+            at += uint64_t(flags) * 12; // v0 normals and shared polygon flag table
+            if (materials) { view.flag_table = static_cast<uint32_t>(at); view.flag_count = flags; at += uint64_t(flags) * 4; }
+        } else {
+            view.flags = view.offset + (view.version == 1 ? 16 : 20);
+            if (view.version >= 2) view.materials = view.flags + view.stride;
+            if (flags) { view.flag_table = static_cast<uint32_t>(at); view.flag_count = static_cast<uint32_t>(faces); at += faces * view.stride; }
+            if (view.version >= 2 && materials) { view.material_table = static_cast<uint32_t>(at); view.material_count = static_cast<uint32_t>(faces); at += faces * view.stride; }
+        }
+        if (at > limit) return fail(err, "Truncated object collision arrays");
+        view.size = static_cast<uint32_t>(at - view.offset);
+        meshes->push_back(view);
+        return true;
+    };
+    if (chunk.cid == ASURA_CHUNK_SHAPE) {
+        if (chunk.version || chunk.size < 24) return fail(err, "Unsupported or truncated SHAP");
+        const uint32_t parts = read_u32(chunk.data + 20);
+        if ((parts & 1) && !read_mesh(chunk.size)) return false;
+        if (parts & 2) at += 260;
+        if (parts & 4) at += 4;
+        if ((parts & 8) && !read_mesh(chunk.size)) return false;
+    } else if (chunk.cid == ASURA_CHUNK_HIERARCHY_SKIN) {
+        // MCP2 0x43D390: bind data, named per-bone collision blobs, optional
+        // bounds, then the v6 movement collision blob. Keep all surrounding data.
+        const Str name = padded_string_at(chunk.data, chunk.size, 24);
+        if (chunk.version < 3 || chunk.version > 6 || !name.data)
+            return fail(err, "Unsupported or truncated HSKN");
+        const uint32_t bones = read_u32(chunk.data + 20);
+        at = align_up(25ull + name.size, 4) + uint64_t(read_u32(chunk.data + 16)) *
+             (chunk.version < 4 ? 160 : 72) + uint64_t(bones) * 32;
+        auto blob = [&]() {
+            if (at + 4 > chunk.size) return fail(err, "Truncated HSKN collision size");
+            const uint32_t size = read_u32(chunk.data + at);
+            at += 4;
+            const uint64_t end = at + size;
+            if (end > chunk.size) return fail(err, "Truncated HSKN '%.*s' collision blob at %llu (size %u, chunk %u)", name.size, name.data, at - 4, size, chunk.size);
+            if (size && !read_mesh(static_cast<uint32_t>(end))) return false;
+            at = end;
+            return true;
+        };
+        if (chunk.flags & 1) {
+            for (uint32_t bone = 0; bone < bones; ++bone) {
+                if (at >= chunk.size) return fail(err, "Truncated HSKN bone collision name");
+                const Str bone_name = padded_string_at(chunk.data, chunk.size, static_cast<uint32_t>(at));
+                if (!bone_name.data) return fail(err, "Unterminated HSKN bone collision name");
+                at += align_up(uint64_t(bone_name.size) + 1, 4);
+                if (!blob()) return false;
+            }
+        }
+        if (chunk.version >= 5 && (chunk.flags & 2)) at += 24;
+        if (chunk.version >= 6 && (chunk.flags & 4) && !blob()) return false;
+    }
+    return at <= chunk.size || fail(err, "Truncated object collision data");
+}
+
+bool load_static_object_collision_flags(const StaticObjectTemplate& object, uint16_t* flags, std::string* why) {
+    *flags = object.imported ? object.imported->collision_flags : 0;
+    if (object.properties.fields & 4) { *flags = object.properties.collision_flags; return true; }
+    if (object.imported) return true;
+    Arena arena{}; Error err{}; ChunkList chunks{};
+    bool ok = arena_init(&arena, 64 * MiB, &err) && parse_chunks(object.donor_path.c_str(), &chunks, &arena, &err);
+    Snipe_ServerEntity_StaticObject_ChunkDataV0 body{};
+    memcpy(&body, object.body.data(), sizeof(body));
+    for (uint32_t i = 0; ok && i < chunks.count; ++i) {
+        const auto& c = chunks.chunks[i];
+        const bool shape = c.cid == ASURA_CHUNK_SHAPE && c.size >= 24 && read_u32(c.data + 16) == object.file_id;
+        const bool skin = c.cid == ASURA_CHUNK_HIERARCHY_SKIN &&
+            asura_lower_name_hash(padded_string_at(c.data, c.size, 24)) == body.m_xPhysicalObject.m_uSkinID;
+        if (!shape && !skin) continue;
+        std::vector<ObjectCollisionMesh> meshes;
+        ok = object_collision_meshes(c, &meshes, &err);
+        if (!ok) break;
+        for (const auto& mesh : meshes) {
+            const uint32_t at = mesh.flag_count ? mesh.flag_table : mesh.flags;
+            if (at) { *flags = read_u16(c.data + at); break; }
+        }
+        if (!meshes.empty()) break;
+    }
+    unmap_file(&chunks.file); arena_release(&arena);
+    if (!ok && why) *why = err.message;
+    return ok;
+}
+
 bool decode_pc_model_materials(const ChunkList& chunks, uint32_t before_chunk,
-                               std::vector<EntityModelMaterial>* output, Error* err) {
+                               std::vector<EntityModelMaterial>* output, Error* err, bool load_textures) {
     std::vector<std::string> texture_names;
     std::vector<uint32_t> texture_flags;
+    std::vector<std::string> material_texture_names;
+    std::vector<uint32_t> material_texture_flags;
     std::vector<int32_t> material_texture_indices;
     std::vector<uint32_t> material_flags;
     std::vector<uint32_t> material_surface_types;
@@ -481,6 +687,8 @@ bool decode_pc_model_materials(const ChunkList& chunks, uint32_t before_chunk,
                 at = align_up(at + name.size + 1, 4);
             }
             if (chunk.version < 3) {
+                material_texture_names = texture_names;
+                material_texture_flags = texture_flags;
                 material_texture_indices.assign(count, -1);
                 material_flags.assign(count, 0);
                 material_surface_types.assign(count, 0);
@@ -502,8 +710,14 @@ bool decode_pc_model_materials(const ChunkList& chunks, uint32_t before_chunk,
                     value &= 0xFFFF2178u;
                 }
                 texture_flags[texture_index] |= value;
+                for (size_t m = 0; m < material_texture_names.size(); ++m)
+                    if (material_texture_names[m] == texture_names[texture_index]) material_texture_flags[m] |= value;
             }
         } else if (chunk.cid == ASURA_CHUNK_MATERIAL) {
+            // MTRL resolves its texture indices now. A later TEXT v3 only
+            // replaces the texture conversion list, not existing materials.
+            material_texture_names = texture_names;
+            material_texture_flags = texture_flags;
             if (chunk.version > 1 || chunk.size < sizeof(Asura_Chunk_Header) + sizeof(uint32_t))
                 return fail(err, "Object preview encountered an unsupported or truncated MTRL chunk");
             const uint32_t count = read_u32(chunk.data + sizeof(Asura_Chunk_Header));
@@ -529,13 +743,13 @@ bool decode_pc_model_materials(const ChunkList& chunks, uint32_t before_chunk,
         EntityModelMaterial& material = (*output)[material_index];
         material.flags = material_flags[material_index];
         material.surface_type = material_surface_types[material_index];
-        if (texture_index < 0 || static_cast<uint32_t>(texture_index) >= texture_names.size())
+        if (texture_index < 0 || static_cast<uint32_t>(texture_index) >= material_texture_names.size())
             continue;
-        material.texture_name = texture_names[texture_index];
-        if (static_cast<uint32_t>(texture_index) < texture_flags.size())
-            material.texture_flags = texture_flags[texture_index];
+        material.texture_name = material_texture_names[texture_index];
+        if (static_cast<uint32_t>(texture_index) < material_texture_flags.size())
+            material.texture_flags = material_texture_flags[texture_index];
         const Str wanted{material.texture_name.data(), static_cast<uint32_t>(material.texture_name.size())};
-        for (uint32_t resource_index = 0; resource_index < chunks.count; ++resource_index) {
+        for (uint32_t resource_index = 0; load_textures && resource_index < chunks.count; ++resource_index) {
             RscfInfo texture{};
             if (!rscf_info(chunks.chunks[resource_index], &texture) ||
                 texture.type != ASURA_RESOURCEFILE_TYPE_TEXTURE ||

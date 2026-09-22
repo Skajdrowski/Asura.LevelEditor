@@ -49,9 +49,18 @@ Spawns also have their **Game mode gate**, which allows to create game mode excl
 
 ## Object
 
-Static geometry objects. They get affected by **Light** entities and they **do not** participate in level's prebaked vertex lighting. They can be used as a collision hotfix for remote players who play on an outdated level.
+Physical geometry objects hold only one material for their entire geometry.
 
-Objects can be exported to **Wavefront OBJ** when selected, so they can be separated from Entities and pasted into level geometry.
+>Objects **do not** participate in level's prebaked vertex lighting.
+>They receive light only from **Light** entities.
+
+They can be used as a collision hotfix for remote players who play on an outdated level
+and remain invisible if remote players do not posses it's assigned texture in their level.
+
+<img width="666" height="431" alt="Object properties" src="https://github.com/user-attachments/assets/2039c343-5a9d-48b4-836d-7fb6ba666315" />
+
+User can import his own objects from **Wavefront OBJ** and assign their surface type and blending/collision flags, like level geometry.
+And also export to **Wavefront OBJ** when selected with their original level coordinates, so they can be separated from Entities and unified with level geometry.
 
 ## Pickup
 

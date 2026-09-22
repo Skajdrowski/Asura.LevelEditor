@@ -606,6 +606,268 @@ bool static_text_references(const ChunkRef& chunk, Str resource_name) {
 
 bool append_imported_hierarchy_support(Buffer*, const Document&, const ChunkList&, Error*);
 
+bool append_static_object_chunks(Buffer* out, const Document& doc, const ChunkList& source,
+                                 const std::vector<uint8_t>& wanted, Error* err) {
+    std::unordered_map<uint32_t, const StaticObjectTemplate*> objects, skins;
+    for (const auto& object : doc.static_object_templates) {
+        if (object.imported) continue;
+        bool referenced = object.properties.fields != 0;
+        for (const auto& entity : doc.entities)
+            referenced |= entity.kind == EntityKind::StaticObject && entity.value_u32_b == object.file_id;
+        if (!referenced) continue;
+        objects.emplace(object.file_id, &object);
+        Snipe_ServerEntity_StaticObject_ChunkDataV0 body{};
+        memcpy(&body, object.body.data(), sizeof(body));
+        if (body.m_xPhysicalObject.m_uSkinID) {
+            auto [entry, inserted] = skins.emplace(body.m_xPhysicalObject.m_uSkinID, &object);
+            if (!inserted && object.properties.fields) {
+                if (entry->second->properties.fields && entry->second->properties != object.properties)
+                    return fail(err, "Objects sharing skin %08X have conflicting properties", body.m_xPhysicalObject.m_uSkinID);
+                entry->second = &object;
+            }
+        }
+    }
+    // Follow LOD links, retaining each original resource and its geometry.
+    bool added = true;
+    while (added) {
+        added = false;
+        for (uint32_t i = 0; i < source.count; ++i) {
+            const auto& chunk = source.chunks[i];
+            RscfInfo r{};
+            if (rscf_info(chunk, &r) && r.type == 0 && r.subtype == ASURA_RESOURCEFILE_TYPE_PC_OBJECT && r.payload_size >= 20) {
+                const auto owner = objects.find(read_u32(r.payload));
+                const uint64_t at = 20ull + uint64_t(read_u32(r.payload + 8)) * 32 + uint64_t(read_u32(r.payload + 12)) * 2;
+                if (owner != objects.end() && chunk.version && at + 8 <= r.payload_size) {
+                    const uint32_t next = read_u32(r.payload + at + 4);
+                    if (next) added |= objects.emplace(next, owner->second).second;
+                }
+            } else if (chunk.cid == fourcc('H','S','K','L')) {
+                const Str root = padded_string_at(chunk.data, chunk.size, 16);
+                if (!root.data) continue;
+                const auto owner = skins.find(asura_lower_name_hash(root));
+                const Str next = padded_string_at(chunk.data, chunk.size, static_cast<uint32_t>(align_up(17ull + root.size, 4)));
+                if (owner != skins.end() && next.data && next.size)
+                    added |= skins.emplace(asura_lower_name_hash(next), owner->second).second;
+            }
+        }
+    }
+    auto owner_for = [&](const ChunkRef& chunk) -> const StaticObjectTemplate* {
+        uint32_t id = 0; bool hierarchy = false;
+        RscfInfo r{};
+        if (rscf_info(chunk, &r) && r.type == 0) {
+            if (r.subtype == ASURA_RESOURCEFILE_TYPE_PC_OBJECT && r.payload_size >= 20) id = read_u32(r.payload);
+            else if (r.subtype == ASURA_RESOURCEFILE_TYPE_PC_OBJECTHIERARCHY || r.subtype == ASURA_RESOURCEFILE_TYPE_PC_CHARACTER) {
+                id = asura_lower_name_hash(r.name); hierarchy = true;
+            } else return nullptr;
+        } else if (chunk.cid == ASURA_CHUNK_SHAPE && chunk.size >= 24) id = read_u32(chunk.data + 16);
+        else if (chunk.cid == ASURA_CHUNK_HIERARCHY_SKIN) {
+            id = asura_lower_name_hash(padded_string_at(chunk.data, chunk.size, 24)); hierarchy = true;
+        } else return nullptr;
+        const auto& table = hierarchy ? skins : objects;
+        const auto found = table.find(id);
+        return found == table.end() ? nullptr : found->second;
+    };
+    auto is_table = [](const ChunkRef& c) {
+        return c.cid == ASURA_CHUNK_TEXTURENAMES || c.cid == ASURA_CHUNK_TEXTUREFLAGS || c.cid == ASURA_CHUNK_MATERIAL;
+    };
+    for (uint32_t begin = 0; begin < source.count;) {
+        if (is_table(source.chunks[begin])) {
+            if (wanted[begin] && !append_chunk_copy(out, source.chunks[begin], err)) return false;
+            ++begin;
+            continue;
+        }
+        uint32_t end = begin;
+        while (end < source.count && !is_table(source.chunks[end])) ++end;
+        std::vector<std::vector<uint8_t>> replacements(end - begin);
+        std::vector<EntityModelMaterial> materials;
+        std::unordered_map<uint64_t, uint32_t> remapped;
+        uint32_t first_material_edit = end;
+        for (uint32_t i = begin; i < end; ++i) {
+            if (!wanted[i]) continue;
+            const auto& c = source.chunks[i];
+            const auto* owner = owner_for(c);
+            if (!owner || !owner->properties.fields) continue;
+            const auto& p = owner->properties;
+            auto& bytes = replacements[i - begin];
+            bytes.assign(c.data, c.data + c.size);
+            auto material = [&](uint32_t at, uint32_t stride, bool collision) {
+                if (!(p.fields & (collision ? 1u : 3u))) return true;
+                if (uint64_t(at) + stride > bytes.size()) return fail(err, "Truncated Object material index");
+                if (first_material_edit == end) {
+                    if (!decode_pc_model_materials(source, i, &materials, err, false)) return false;
+                    first_material_edit = i;
+                }
+                const uint32_t old = stride == 2 ? read_u16(bytes.data() + at) : read_u32(bytes.data() + at);
+                const bool missing = old == (stride == 2 ? 0xffffu : UINT32_MAX);
+                // SHAP may already contain runtime handles supplied by shared
+                // game files. A surface override needs its own collision material,
+                // not an interpretation of that handle as a local MTRL ordinal.
+                const uint64_t key = (uint64_t(owner->file_id) << 32) | (collision ? UINT32_MAX : old);
+                auto found = remapped.find(key);
+                uint32_t index;
+                if (found == remapped.end()) {
+                    if (!collision && !missing && old >= materials.size()) return fail(err, "Object %08X references missing material %u", owner->file_id, old);
+                    EntityModelMaterial copy = collision || missing ? EntityModelMaterial{} : materials[old];
+                    if (p.fields & 1) copy.surface_type = p.surface_type;
+                    if (p.fields & 2) copy.flags = p.blending_flags;
+                    index = static_cast<uint32_t>(materials.size());
+                    // Collision indices >=1000 are runtime handles in MCP2.
+                    if (index >= 1000) return fail(err, "Object material table exceeds the target's collision index range");
+                    materials.push_back(std::move(copy));
+                    remapped.emplace(key, index);
+                } else index = found->second;
+                memcpy(bytes.data() + at, &index, stride);
+                return true;
+            };
+            RscfInfo r{};
+            if (rscf_info(c, &r)) {
+                const uint32_t payload = static_cast<uint32_t>(r.payload - c.data);
+                if (r.subtype == ASURA_RESOURCEFILE_TYPE_PC_OBJECT) {
+                    if (!material(payload + 16, 4, false)) return false;
+                } else {
+                    const Str name = padded_string_at(r.payload, r.payload_size, 0);
+                    if (!name.data) return fail(err, "Unterminated Object hierarchy name");
+                    const uint32_t at = payload + static_cast<uint32_t>(align_up(uint64_t(name.size) + 1, 4));
+                    if (uint64_t(at) + 16 > c.size) return fail(err, "Truncated Object hierarchy");
+                    if (r.subtype == ASURA_RESOURCEFILE_TYPE_PC_CHARACTER) {
+                        if (!material(at + 12, 4, false)) return false;
+                    } else {
+                        const uint32_t count = read_u32(c.data + at);
+                        if (uint64_t(at) + 12 + uint64_t(count) * 20 > c.size) return fail(err, "Truncated Object hierarchy strips");
+                        for (uint32_t strip = 0; strip < count; ++strip)
+                            if (!material(at + 20 + strip * 20, 4, false)) return false;
+                    }
+                }
+            } else {
+                std::vector<ObjectCollisionMesh> meshes;
+                if (!object_collision_meshes(c, &meshes, err)) return false;
+                for (const auto& mesh : meshes) {
+                    if (p.fields & 4) {
+                        const uint32_t flags = p.collision_flags;
+                        if (!mesh.flags && !mesh.flag_count) return fail(err, "Object %08X has a v0 collision mesh without editable flags", owner->file_id);
+                        if (mesh.flags) memcpy(bytes.data() + mesh.flags, &flags, mesh.stride);
+                        for (uint32_t f = 0; f < mesh.flag_count; ++f)
+                            memcpy(bytes.data() + mesh.flag_table + f * mesh.stride, &flags, mesh.stride);
+                    }
+                    if (mesh.materials && !material(mesh.materials, mesh.stride, true)) return false;
+                    for (uint32_t f = 0; f < mesh.material_count; ++f)
+                        if (!material(mesh.material_table + f * mesh.stride, mesh.stride, true)) return false;
+                }
+            }
+        }
+        for (uint32_t i = begin; i < end; ++i) {
+            if (!wanted[i]) continue;
+            if (i == first_material_edit) {
+                // Append private material records to this conversion table.
+                // Original ordinals keep their meaning for every unedited object.
+                const uint32_t count = static_cast<uint32_t>(materials.size());
+                std::vector<Str> names(count);
+                std::vector<int32_t> textures(count);
+                std::vector<uint32_t> flags(count), surfaces(count);
+                for (uint32_t m = 0; m < count; ++m) {
+                    names[m] = str_from_c(materials[m].texture_name.c_str());
+                    textures[m] = names[m].size ? static_cast<int32_t>(m) : -1;
+                    flags[m] = materials[m].flags; surfaces[m] = materials[m].surface_type;
+                }
+                if (!append_text(out, names.data(), count, err)) return false;
+                const auto txfl = begin_chunk(out, ASURA_CHUNK_TEXTUREFLAGS, 1, 0, err);
+                append_u32(out, count, err);
+                for (const auto& m : materials) append_u32(out, m.texture_flags, err);
+                if (!end_chunk(out, txfl, err) || !append_mtrl(out, textures.data(), flags.data(), surfaces.data(), count, err)) return false;
+            }
+            const auto& bytes = replacements[i - begin];
+            if (bytes.empty()) { if (!append_chunk_copy(out, source.chunks[i], err)) return false; }
+            else if (buffer_append(out, bytes.data(), bytes.size(), err) == ~0ull) return false;
+        }
+        begin = end;
+    }
+    return !err->set;
+}
+
+bool append_obj_static_object(Buffer* out, const StaticObjectTemplate& object, Error* err) {
+    const auto& asset = *object.imported;
+    const auto& mesh = asset.mesh;
+    auto material = mesh.materials.front();
+    if (object.properties.fields & 1) material.surface_type = object.properties.surface_type;
+    if (object.properties.fields & 2) material.flags = object.properties.blending_flags;
+    const int32_t texture_index = material.texture_bytes.empty() ? -1 : 0;
+    if (texture_index == 0) {
+        Str name = str_from_c(material.texture_name.c_str());
+        const std::string resource_name = "\\graphics" + material.texture_name;
+        if (!append_text(out, &name, 1, err) || !append_txfl(out, 1, err) ||
+            !append_rscf(out, str_from_c(resource_name.c_str()), ASURA_RESOURCEFILE_TYPE_TEXTURE, 0,
+                         material.texture_bytes.data(), static_cast<uint32_t>(material.texture_bytes.size()), err))
+            return false;
+    }
+    if (!append_mtrl(out, &texture_index, &material.flags, &material.surface_type, 1, err)) return false;
+
+    // MCP2 0x49E810: PC_OBJECT v1 is a single triangle strip, 32-byte vertices,
+    // a material ordinal, then a LOD distance and lower-strip ID.
+    std::vector<uint16_t> indices;
+    indices.reserve(mesh.faces.size() * 6);
+    for (const auto& face : mesh.faces) {
+        const uint16_t a = face[0], b = face[2], c = face[1]; // editor to game winding
+        if (!indices.empty()) {
+            indices.push_back(indices.back());
+            indices.push_back(a);
+            if (indices.size() & 1) indices.push_back(a);
+        }
+        indices.insert(indices.end(), {a, b, c});
+    }
+    Buffer payload{};
+    const uint64_t payload_size = 28 + mesh.vertices.size() * 32 + indices.size() * 2;
+    if (!buffer_init(&payload, payload_size, err)) return false;
+    append_u32(&payload, object.file_id, err);
+    append_u32(&payload, static_cast<uint32_t>(indices.size() - 2), err);
+    append_u32(&payload, static_cast<uint32_t>(mesh.vertices.size()), err);
+    append_u32(&payload, static_cast<uint32_t>(indices.size()), err);
+    append_u32(&payload, 0, err);
+    static_assert(sizeof(EntityModelVertex) == 32);
+    buffer_append(&payload, mesh.vertices.data(), mesh.vertices.size() * sizeof(EntityModelVertex), err);
+    buffer_append(&payload, indices.data(), indices.size() * sizeof(uint16_t), err);
+    append_f32(&payload, 0, err);
+    append_u32(&payload, 0, err);
+    const bool written = !err->set && append_rscf(out, str_from_c(object.resource_name.c_str()),
+        ASURA_RESOURCEFILE_TYPE_PLATFORMSPECIFIC, ASURA_RESOURCEFILE_TYPE_PC_OBJECT,
+        payload.base, static_cast<uint32_t>(payload.size), err, 1);
+    buffer_release(&payload);
+    if (!written) return false;
+
+    // MCP1 Asura_CollisionMesh::ReadFromChunkStream and MCP2 0x4367C0 agree
+    // on v3: overall u16 flags/material, bounds/radius, vertices and quads
+    // (fourth index 0xffff for triangles). Bind material 0 while this MTRL is active.
+    const ChunkMark shape = begin_chunk(out, ASURA_CHUNK_SHAPE, 0, 0, err);
+    append_u32(out, object.file_id, err);
+    append_u32(out, 11, err); // LOS, render record, movement collision (0x47C020)
+    const Asura_Bounding_Box bounds{mesh.min.x, mesh.max.x, mesh.min.y, mesh.max.y, mesh.min.z, mesh.max.z};
+    float radius = 0;
+    for (const auto& vertex : mesh.vertices) {
+        const auto& p = vertex.position;
+        radius = fmaxf(radius, sqrtf(p.x * p.x + p.y * p.y + p.z * p.z));
+    }
+    for (int collision = 0; collision < 2; ++collision) {
+        if (collision) buffer_append(out, nullptr, 260, err); // target render record
+        append_u32(out, 3, err);
+        append_u32(out, static_cast<uint32_t>(mesh.vertices.size()), err);
+        append_u32(out, static_cast<uint32_t>(mesh.faces.size()), err);
+        append_u32(out, 0, err); // no per-polygon flags
+        append_u32(out, 0, err); // no per-polygon materials
+        append_u16(out, object.properties.fields & 4 ? object.properties.collision_flags : asset.collision_flags, err);
+        append_u16(out, 0, err);
+        buffer_append(out, &bounds, sizeof(bounds), err);
+        append_f32(out, radius, err);
+        for (const auto& vertex : mesh.vertices)
+            buffer_append(out, &vertex.position, sizeof(vertex.position), err);
+        for (const auto& face : mesh.faces) {
+            append_u16(out, face[0], err);
+            append_u16(out, face[2], err);
+            append_u16(out, face[1], err);
+            append_u16(out, 0xffff, err);
+        }
+    }
+    return end_chunk(out, shape, err);
+}
+
 bool append_static_object_support(Buffer* out, const Document& document,
                                   Error* err) {
     std::vector<uint32_t> required_roots;
@@ -681,6 +943,7 @@ bool append_static_object_support(Buffer* out, const Document& document,
                         continue;
                     wanted[i] = 1;
                     // SHAP's fragment ID is separate from its model/file ID.
+                    if (!mark_material_support(donor, i, wanted.data(), err)) break;
                     // MCP2 0x47C020 reads it after the optional LOS mesh and
                     // 260-byte render record. 0x465910 uses FRAG's replacement
                     // entry on death; without it the intact model stays visible.
@@ -692,27 +955,9 @@ bool append_static_object_support(Buffer* out, const Document& document,
                     if (components & 4u) {
                         uint64_t at = 24;
                         if (components & 1u) {
-                            if (at + 4 > shape.size) {
-                                fail(err, "Object %08X has a truncated SHAP collision mesh", id);
-                                break;
-                            }
-                            const uint32_t version = read_u32(shape.data + at);
-                            const uint32_t header_size = version < 2 ? 48u : version == 2 ? 56u : 52u;
-                            if (version > 3 || at + header_size > shape.size) {
-                                fail(err, "Object %08X has an unsupported or truncated SHAP collision mesh", id);
-                                break;
-                            }
-                            const uint8_t* mesh = shape.data + at;
-                            const uint64_t vertices = read_u32(mesh + 4), polygons = read_u32(mesh + 8);
-                            const uint32_t flags = read_u32(mesh + 12), materials = read_u32(mesh + 16);
-                            at += header_size + vertices * 12 + polygons * 8;
-                            // Collision mesh v0 stores normals and a shared flag
-                            // table; v1-v3 store optional arrays per polygon.
-                            if (!version)
-                                at += static_cast<uint64_t>(flags) * (12 + (materials ? 4 : 0));
-                            else
-                                at += polygons * (version == 3 ? 2 : 4) *
-                                      ((flags ? 1 : 0) + (version >= 2 && materials ? 1 : 0));
+                            std::vector<ObjectCollisionMesh> meshes;
+                            if (!object_collision_meshes(shape, &meshes, err)) break;
+                            at += meshes.front().size;
                         }
                         if (components & 2u) at += 260;
                         if (at + 4 > shape.size) {
@@ -774,28 +1019,25 @@ bool append_static_object_support(Buffer* out, const Document& document,
                 if (resource.type == ASURA_RESOURCEFILE_TYPE_PLATFORMSPECIFIC &&
                     resource.subtype == ASURA_RESOURCEFILE_TYPE_PC_OBJECT && resource.payload_size >= 4) {
                     const uint32_t id = read_u32(resource.payload);
-                    if (contains_u32(present_objects, id))
-                        continue;
+                    if (contains_u32(present_objects, id)) { wanted[i] = 0; continue; }
                     present_objects.push_back(id);
                 } else if (resource.type == ASURA_RESOURCEFILE_TYPE_TEXTURE) {
                     const std::string normalized = normalized_resource_path(resource.name);
-                    if (contains_string(present_textures, normalized))
-                        continue;
+                    if (contains_string(present_textures, normalized)) { wanted[i] = 0; continue; }
                     present_textures.push_back(normalized);
                 }
             } else if (donor.chunks[i].cid == ASURA_CHUNK_SHAPE &&
                        donor.chunks[i].size >= sizeof(Asura_Chunk_Header) + 4) {
                 const uint32_t id = read_u32(donor.chunks[i].data + sizeof(Asura_Chunk_Header));
-                if (contains_u32(present_shapes, id))
-                    continue;
+                if (contains_u32(present_shapes, id)) { wanted[i] = 0; continue; }
                 present_shapes.push_back(id);
             } else if (donor.chunks[i].cid == ASURA_CHUNK_FRAGMENT) {
                 const uint32_t id = read_u32(donor.chunks[i].data + 16);
-                if (contains_u32(present_fragments, id)) continue;
+                if (contains_u32(present_fragments, id)) { wanted[i] = 0; continue; }
                 present_fragments.push_back(id);
             }
-            append_chunk_copy(out, donor.chunks[i], err);
         }
+        if (!err->set) append_static_object_chunks(out, document, donor, wanted, err);
         if (!err->set && append_imported_hierarchy_support(out, document, donor, err)) {
             for (const auto& object : document.static_object_templates) {
                 if (object.donor_path != donor_path || !contains_u32(required_roots, object.file_id)) continue;
@@ -821,6 +1063,12 @@ bool append_static_object_support(Buffer* out, const Document& document,
             break;
     }
     if (!err->set) {
+        for (const auto& object : document.static_object_templates) {
+            if (!object.imported || !contains_u32(required_roots, object.file_id)) continue;
+            if (!append_obj_static_object(out, object, err)) break;
+            present_objects.push_back(object.file_id);
+            present_shapes.push_back(object.file_id);
+        }
         for (uint32_t id : required_roots) {
             if (contains_u32(present_hierarchies, id)) continue;
             if (!contains_u32(present_objects, id) || !contains_u32(present_shapes, id)) {
@@ -914,6 +1162,7 @@ bool append_imported_hierarchy_support(Buffer* out, const Document& doc,
             if (chunk.cid != ASURA_CHUNK_HIERARCHY_SKIN ||
                 !str_ieq(padded_string_at(chunk.data, chunk.size, 24), resource.name)) continue;
             wanted[h] = 1;
+            if (!mark_material_support(source, h, wanted.data(), err)) return false;
             // Animation dependencies are resolved by name below, not adjacency.
             break;
         }
@@ -951,9 +1200,7 @@ bool append_imported_hierarchy_support(Buffer* out, const Document& doc,
                 break;
             }
     }
-    for (uint32_t i = 0; i < source.count; ++i)
-        if (wanted[i] && !append_chunk_copy(out, source.chunks[i], err)) return false;
-    return true;
+    return append_static_object_chunks(out, doc, source, wanted, err);
 }
 
 // Convert precisely the renderable triangles decoded by the importer to the
@@ -1018,6 +1265,18 @@ bool make_pc_geometry(const ChunkList& source, ObjData* obj,
 
 bool append_pc_texture(Buffer* out, const ChunkList& source, Str name, Error* err) {
     if (!name.size) return true;
+    for (uint64_t at = sizeof(kAsuraMagic); at + sizeof(Asura_Chunk_Header) <= out->size;) {
+        const uint8_t* bytes = out->base + at;
+        const uint32_t size = read_u32(bytes + 4);
+        if (size < sizeof(Asura_Chunk_Header) || size > out->size - at)
+            return fail(err, "invalid output while checking PC textures");
+        const ChunkRef chunk{bytes, size, read_u32(bytes), read_u32(bytes + 8), read_u32(bytes + 12), 0};
+        RscfInfo existing{};
+        if (rscf_info(chunk, &existing) && existing.type == ASURA_RESOURCEFILE_TYPE_TEXTURE &&
+            text_name_matches_resource(name, existing.name))
+            return true;
+        at += size;
+    }
     for (uint32_t i = 0; i < source.count; ++i) {
         RscfInfo resource{};
         if (rscf_info(source.chunks[i], &resource) &&
@@ -1223,19 +1482,10 @@ bool pack_document(Document& doc, const char* output_path, std::string* why) {
             *why = "Open an OBJ or PC level before exporting.";
         return false;
     }
-    bool has_static_objects = false;
-    for (const Entity& entity : doc.entities) {
-        has_static_objects |= entity.kind == EntityKind::StaticObject;
-    }
     // Equipped weapons need their resources even without placed pickups.
     if (!from_pc && doc.weapons_donor.empty()) {
         if (why)
             *why = "Choose a Weapons donor .PC before exporting a custom level.";
-        return false;
-    }
-    if (has_static_objects && !from_pc && doc.object_donors.empty()) {
-        if (why)
-            *why = "Choose at least one Objects donor .PC before exporting Objects from a custom level.";
         return false;
     }
     Error err{};

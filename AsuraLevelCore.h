@@ -179,7 +179,7 @@ bool append_chunk_copy(Buffer* out, const ChunkRef& chunk, Error* err);
 bool mark_material_support(const ChunkList& chunks, uint32_t before_chunk,
                             uint8_t* wanted, Error* err);
 bool append_rscf(Buffer* out, Str name, uint32_t type, uint32_t subtype, const void* payload,
-                 uint32_t payload_size, Error* err);
+                 uint32_t payload_size, Error* err, uint32_t version = 0);
 bool patch_fnfo_file_size(Buffer* out, Error* err);
 
 bool initialize_editor_config(const char* obj_path, Config* out, Error* err);
@@ -198,6 +198,10 @@ bool build_env(const Config& config, const ObjData& obj, const MaterialMap& mate
 bool env_view(const Buffer& payload, EnvView* out, Arena* arena, Error* err);
 
 bool append_fnfo(Buffer* out, Error* err);
+bool append_text(Buffer* out, Str* names, uint32_t count, Error* err);
+bool append_txfl(Buffer* out, uint32_t count, Error* err);
+bool append_mtrl(Buffer* out, const int32_t* tex, const uint32_t* flags, const uint32_t* surface,
+                 uint32_t count, Error* err);
 bool append_rsfl(Buffer* out, Error* err);
 bool append_weapon_support(Buffer* out, const Config& config, Arena* scratch, Error* err);
 bool append_sky_resources(Buffer* out, const Config& config, Arena* scratch, Error* err);

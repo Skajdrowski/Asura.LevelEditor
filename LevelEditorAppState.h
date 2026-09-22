@@ -58,6 +58,7 @@ struct AppState {
     std::vector<int> selected_entities;
     int selected = -1;
     int pending_kind = -1;
+    uint32_t pending_object_file = 0;
     bool orbiting = false;
     bool panning = false;
     bool moving_entity = false;

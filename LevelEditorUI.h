@@ -31,6 +31,8 @@ enum ControlId : int {
     ID_ADD_SOUND,
     ID_ADD_PICKUP,
     ID_ADD_STATIC_OBJECT,
+    ID_IMPORT_STATIC_OBJECT,
+    ID_OBJECT_PROPERTIES,
     ID_ADD_BUILDING_VOLUME,
     ID_ADD_SOUND_REGION,
     ID_DELETE_ENTITY,
@@ -69,6 +71,7 @@ LRESULT CALLBACK light_properties_proc(HWND hwnd, UINT message, WPARAM wparam, L
 LRESULT CALLBACK sound_properties_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
 LRESULT CALLBACK skybox_properties_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
 LRESULT CALLBACK ambience_properties_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
+LRESULT CALLBACK object_properties_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
 LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
 
 bool open_obj_path(const std::string& path);

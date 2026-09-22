@@ -193,6 +193,8 @@ const EntityModel* pickup_model_for_skin(uint32_t skin_id) {
 }
 
 const EntityModel* static_object_model_for_file(uint32_t file_id) {
+    for (const auto& object : g.document.static_object_templates)
+        if (object.file_id == file_id && object.imported) return &object.imported->mesh;
     for (const StaticObjectModel& model : g.static_object_models)
         if (model.file_id == file_id && !model.mesh.faces.empty())
             return &model.mesh;
@@ -647,14 +649,16 @@ void set_u32_hex(HWND control, uint32_t value) {
     SetWindowTextA(control, text);
 }
 
-uint32_t get_u32(HWND control, uint32_t fallback) {
+uint32_t get_u32(HWND control, uint32_t fallback, bool* valid = nullptr) {
     char text[128]{};
     GetWindowTextA(control, text, sizeof(text));
     char* end = nullptr;
-    const unsigned long value = strtoul(text, &end, 0);
+    const unsigned long long value = strtoull(text, &end, 0);
     while (end && *end == ' ')
         ++end;
-    return end != text && end && !*end && value <= 0xfffffffful ? static_cast<uint32_t>(value) : fallback;
+    const bool ok = end != text && end && !*end && value <= 0xffffffffull && !strchr(text, '-');
+    if (valid) *valid = ok;
+    return ok ? static_cast<uint32_t>(value) : fallback;
 }
 
 struct SpawnMaskControl {
@@ -1427,6 +1431,7 @@ void refresh_inspector() {
     ShowWindow(g.sound_preview, SW_HIDE);
     ShowWindow(g.sound_properties, SW_HIDE);
     ShowWindow(g.light_properties, SW_HIDE);
+    ShowWindow(GetDlgItem(g.window, ID_OBJECT_PROPERTIES), SW_HIDE);
     ShowWindow(g.pickup_item, SW_HIDE);
     ShowWindow(g.spawn_team_label, SW_HIDE);
     ShowWindow(g.spawn_game_mode_label, SW_HIDE);
@@ -1543,6 +1548,8 @@ void refresh_inspector() {
         refresh_static_object_choices(e.value_u32_b);
         EnableWindow(g.pickup_item, SendMessageA(g.pickup_item, CB_GETCOUNT, 0, 0) > 0);
         ShowWindow(g.pickup_item, SW_SHOW);
+        const auto* object = find_static_object_template(g.document, e.value_u32_b, true);
+        if (object) ShowWindow(GetDlgItem(g.window, ID_OBJECT_PROPERTIES), SW_SHOW);
     } else if (e.kind == EntityKind::AssassinationTarget) {
         set_control_text(g.value_label[0], "Health");
         set_control_text(g.value_label[1], "Class ID");
@@ -1872,7 +1879,7 @@ void add_entity_at(EntityKind kind, const Asura_Vector_3& p) {
         e.source_entity_record = false;
         e.source_entity_classification = SnipeEntityClass_Pickup;
     } else if (kind == EntityKind::StaticObject) {
-        const StaticObjectTemplate* object = find_static_object_template(g.document, 0, false);
+        const StaticObjectTemplate* object = find_static_object_template(g.document, g.pending_object_file, false);
         if (!object) {
             g.pending_kind = -1;
             set_status("No Object catalog is loaded. Choose one or more Objects donor .PC levels first.");
@@ -1946,7 +1953,7 @@ void add_entity_at(EntityKind kind, const Asura_Vector_3& p) {
     request_redraw();
 }
 
-void begin_place(EntityKind kind) {
+void begin_place(EntityKind kind, uint32_t object_file = 0) {
     if (g.mesh.positions.empty()) {
         MessageBoxA(g.window, "Open an environment OBJ or .PC first.", "Level Editor", MB_ICONINFORMATION);
         return;
@@ -1957,11 +1964,15 @@ void begin_place(EntityKind kind) {
         return;
     }
     if (kind == EntityKind::StaticObject && !find_static_object_template(g.document, 0, false)) {
-        MessageBoxA(g.window, "Choose one or more Objects donor .PC levels first.",
+        MessageBoxA(g.window, "Import an Object from OBJ or choose Objects donor .PC levels first.",
                     "Cannot create Object", MB_ICONINFORMATION);
         return;
     }
     g.pending_kind = static_cast<int>(kind);
+    g.pending_object_file = object_file;
+    if (!object_file && valid_entity_index(g.selected) &&
+        g.document.entities[g.selected].kind == EntityKind::StaticObject)
+        g.pending_object_file = g.document.entities[g.selected].value_u32_b;
     set_status("Click visible environment geometry to place the entity. Right-drag orbits; wheel zooms.");
 }
 
@@ -2465,6 +2476,7 @@ void layout_controls() {
         {ID_OPEN_OBJ, 8, 6, 78},              {ID_OPEN_PC, 90, 6, 78},
         {ID_OPEN_PROJECT, 172, 6, 98},         {ID_SAVE_PROJECT, 274, 6, 96},
         {ID_EXPORT_PC, 374, 6, 88},            {ID_EXPORT_OBJ, 466, 6, 88},
+        {ID_IMPORT_STATIC_OBJECT, 558, 6, 124},
         {ID_MATERIAL_MAP, 8, 38, 132},         {ID_EXPORT_MATERIAL_MAP, 144, 38, 132},
         {ID_TEXTURE_DIR, 280, 38, 102},        {ID_WEAPONS_DONOR, 386, 38, 112},
         {ID_OBJECT_DONOR, 502, 38, 104},       {ID_SKYBOX_TEXTURES, 610, 38, 120},
@@ -2523,6 +2535,7 @@ void layout_controls() {
     MoveWindow(g.sound_loop, label_x, iy, ui_px(82), ui_px(26), TRUE);
     MoveWindow(g.sound_properties, label_x, iy + ui_px(34), ui_px(252), ui_px(28), TRUE);
     MoveWindow(g.light_properties, edit_x, iy, ew, ui_px(26), TRUE);
+    MoveWindow(GetDlgItem(g.window, ID_OBJECT_PROPERTIES), label_x, iy, ui_px(252), ui_px(28), TRUE);
     MoveWindow(g.spawn_team_label, label_x, iy, ui_px(252), ui_px(22), TRUE);
     for (int i = 0; i < static_cast<int>(_countof(kSpawnTeamControls)); ++i) {
         const int column = i % 2, row = i / 2;
@@ -2553,6 +2566,8 @@ void create_controls() {
         g.viewport = nullptr;
     }
     make_control("BUTTON", "Open .OBJ", BS_DEFPUSHBUTTON, ID_OPEN_OBJ);
+    make_control("BUTTON", "Import Object .OBJ", BS_PUSHBUTTON, ID_IMPORT_STATIC_OBJECT);
+    make_control("BUTTON", "Object properties", BS_PUSHBUTTON, ID_OBJECT_PROPERTIES);
     constexpr const char* file_button_text[] = {
         "Open .PC", "Open project", "Save project", "Export .PC", "Export .OBJ",
         "Import material map", "Export material map", "Texture folder", "Weapons donor",
@@ -2700,6 +2715,31 @@ void enrich_project_static_object_templates(Document* document, const Document& 
         document->source_static_object_inventory_complete = true;
 }
 
+void apply_static_object_preview_properties(const Document& document,
+                                           const std::vector<PickupModel>* pickups,
+                                           std::vector<StaticObjectModel>* models) {
+    if (!models) return;
+    for (const auto& object : document.static_object_templates) {
+        if (!(object.properties.fields & 3) || object.imported) continue;
+        auto model = std::find_if(models->begin(), models->end(), [&](const auto& m) { return m.file_id == object.file_id; });
+        if (model == models->end() && pickups) {
+            Snipe_ServerEntity_StaticObject_ChunkDataV0 body{};
+            memcpy(&body, object.body.data(), sizeof(body));
+            for (const auto& pickup : *pickups) {
+                if (pickup.skin_id != body.m_xPhysicalObject.m_uSkinID) continue;
+                models->push_back({object.file_id, pickup.mesh});
+                model = models->end() - 1;
+                break;
+            }
+        }
+        if (model == models->end()) continue;
+        for (auto& material : model->mesh.materials) {
+            if (object.properties.fields & 1) material.surface_type = object.properties.surface_type;
+            if (object.properties.fields & 2) material.flags = object.properties.blending_flags;
+        }
+    }
+}
+
 bool load_document_preview(Document* document, Mesh* mesh, std::string* why,
                            std::vector<PickupModel>* pickup_models = nullptr,
                            std::vector<StaticObjectModel>* object_models = nullptr) {
@@ -2728,6 +2768,7 @@ bool load_document_preview(Document* document, Mesh* mesh, std::string* why,
             if (object_models)
                 *object_models = std::move(donor_models);
         }
+        apply_static_object_preview_properties(*document, pickup_models, object_models);
         return true;
     }
     if (!document->source_pc_path.empty()) {
@@ -2768,6 +2809,7 @@ bool load_document_preview(Document* document, Mesh* mesh, std::string* why,
                 }
             }
         }
+        apply_static_object_preview_properties(*document, pickup_models, object_models);
         return true;
     }
     if (pickup_models)
@@ -2882,7 +2924,13 @@ bool same_ambience_settings(const Document& a, const Document& b) {
 }
 
 bool refresh_history_derived_resources(const Document& previous, std::string* why) {
-    const bool preview_changed = previous.obj_path != g.document.obj_path ||
+    bool object_properties_changed = false;
+    for (const auto& object : g.document.static_object_templates) {
+        if (object.imported) continue;
+        const auto* old = find_static_object_template(previous, object.file_id, true);
+        object_properties_changed |= old && old->properties != object.properties;
+    }
+    const bool preview_changed = object_properties_changed || previous.obj_path != g.document.obj_path ||
                                  previous.source_pc_path != g.document.source_pc_path ||
                                  previous.material_map != g.document.material_map ||
                                  previous.weapons_donor != g.document.weapons_donor ||
@@ -2937,7 +2985,7 @@ bool refresh_history_derived_resources(const Document& previous, std::string* wh
             if (why)
                 *why = preview_why;
         }
-        frame_mesh();
+        if (!object_properties_changed) frame_mesh();
     } else if (textures_changed) {
         std::string texture_why;
         if (!gpu_reload_environment_textures(&texture_why)) {
@@ -3851,6 +3899,231 @@ void merge_static_object_templates(Document* document,
     }
 }
 
+enum ObjectPropertiesId { ID_OBJECT_TEXTURE = 3600, ID_OBJECT_TEXTURE_CLEAR, ID_OBJECT_SURFACE,
+                          ID_OBJECT_BLEND, ID_OBJECT_COLLISION, ID_OBJECT_FLAG_FIRST };
+
+constexpr struct { const char* label; uint32_t mask; bool collision; } kObjectFlags[] = {
+    {"Additive (0x1)", 1, false}, {"Alpha texture (0x2)", 2, false},
+    {"Detail mapping (0x4)", 4, false}, {"Reflection (0x80)", 0x80, false},
+    {"Scrolling texture (0x400)", 0x400, false}, {"Light shaft depth (0x1000)", 0x1000, false},
+    {"Ignore entities (0x20)", 0x20, true}, {"Ignore bullets (0x40)", 0x40, true},
+    {"Ignore bullets / grenades (0x200)", 0x200, true}, {"Include backface (0x400)", 0x400, true}
+};
+
+struct ObjectPropertiesState {
+    ImportedStaticObject value;
+    bool source_asset = false;
+    HWND surface = nullptr, blend = nullptr, collision = nullptr, texture = nullptr;
+    HWND checks[_countof(kObjectFlags)]{};
+    bool accepted = false;
+};
+
+LRESULT CALLBACK object_properties_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+    if (message == WM_NCCREATE) {
+        SetWindowLongPtrA(hwnd, GWLP_USERDATA,
+            reinterpret_cast<LONG_PTR>(reinterpret_cast<const CREATESTRUCTA*>(lparam)->lpCreateParams));
+        return TRUE;
+    }
+    auto* state = reinterpret_cast<ObjectPropertiesState*>(GetWindowLongPtrA(hwnd, GWLP_USERDATA));
+    switch (message) {
+    case WM_CREATE: {
+        const auto& material = state->value.mesh.materials.front();
+        make_dialog_control(hwnd, "STATIC", "Changes will affect all instances of this imported object type.",
+                            SS_LEFT, -1, 16, 340, 636, 22);
+        state->texture = make_dialog_control(hwnd, "STATIC",
+            material.texture_bytes.empty() ? "No texture" : "Embedded DDS texture", SS_LEFT, -1, 16, 12, 340, 22);
+        make_dialog_control(hwnd, "BUTTON", "Choose DDS...", BS_PUSHBUTTON | WS_TABSTOP,
+                            ID_OBJECT_TEXTURE, 416, 12, 126, 26);
+        make_dialog_control(hwnd, "BUTTON", "Clear", BS_PUSHBUTTON | WS_TABSTOP,
+                            ID_OBJECT_TEXTURE_CLEAR, 552, 12, 100, 26);
+        if (state->source_asset) {
+            SetWindowTextA(state->texture, "Original object textures");
+            EnableWindow(GetDlgItem(hwnd, ID_OBJECT_TEXTURE), FALSE);
+            EnableWindow(GetDlgItem(hwnd, ID_OBJECT_TEXTURE_CLEAR), FALSE);
+        }
+        make_dialog_control(hwnd, "STATIC", "Surface type", SS_LEFT, -1, 16, 42, 116, 22);
+        state->surface = make_dialog_control(hwnd, "COMBOBOX", "", CBS_DROPDOWN | WS_VSCROLL | WS_TABSTOP,
+                                             ID_OBJECT_SURFACE, 138, 42, 246, 250);
+        constexpr struct { uint32_t id; const char* name; } surfaces[] = {
+            {1, "Concrete"}, {2, "Glass"}, {4, "Metal"}, {5, "Water"}, {6, "Wood"}, {7, "Human body"},
+            {8, "Wrecked car"}, {10, "Dirt"}, {11, "Grass"}, {12, "Gravel"}, {13, "Wet"}
+        };
+        set_u32_hex(state->surface, material.surface_type);
+        for (const auto& surface : surfaces) {
+            char label[80];
+            snprintf(label, sizeof(label), "%u - %s", surface.id, surface.name);
+            const LRESULT row = SendMessageA(state->surface, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label));
+            SendMessageA(state->surface, CB_SETITEMDATA, row, surface.id);
+            if (surface.id == material.surface_type) SendMessageA(state->surface, CB_SETCURSEL, row, 0);
+        }
+        make_dialog_control(hwnd, "STATIC", "Or enter surface ID manually (0-255)", SS_LEFT, -1, 400, 42, 252, 22);
+        make_dialog_control(hwnd, "STATIC", "Blending flags", SS_LEFT, -1, 16, 71, 116, 22);
+        make_dialog_control(hwnd, "STATIC", "Collision flags", SS_LEFT, -1, 346, 71, 116, 22);
+        state->blend = make_dialog_control(hwnd, "EDIT", "", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP,
+                                           ID_OBJECT_BLEND, 138, 71, 172, 22);
+        state->collision = make_dialog_control(hwnd, "EDIT", "", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP,
+                                               ID_OBJECT_COLLISION, 474, 71, 178, 22);
+        EnableWindow(state->blend, FALSE); EnableWindow(state->collision, FALSE);
+        for (int i = 0; i < static_cast<int>(_countof(kObjectFlags)); ++i) {
+            const bool collision = kObjectFlags[i].collision;
+            state->checks[i] = make_dialog_control(hwnd, "BUTTON", kObjectFlags[i].label, BS_AUTOCHECKBOX | WS_TABSTOP,
+                ID_OBJECT_FLAG_FIRST + i, collision ? 346 : 16, 106 + (collision ? i - 6 : i) * 26, 306, 22);
+        }
+        set_u32_hex(state->blend, material.flags);
+        set_u32_hex(state->collision, state->value.collision_flags);
+        make_dialog_control(hwnd, "BUTTON", "OK", BS_DEFPUSHBUTTON | WS_TABSTOP, IDOK, 436, 366, 104, 28);
+        make_dialog_control(hwnd, "BUTTON", "Cancel", BS_PUSHBUTTON | WS_TABSTOP, IDCANCEL, 548, 366, 104, 28);
+        return 0;
+    }
+    case WM_COMMAND: {
+        const int id = LOWORD(wparam);
+        if (id == ID_OBJECT_TEXTURE) {
+            std::string path;
+            if (!choose_path(hwnd, false, "Choose Object texture", "DDS texture\0*.dds\0", "dds", &path)) return 0;
+            Error error{};
+            MappedFile file{};
+            if (!map_file(path.c_str(), &file, &error)) {
+                MessageBoxA(hwnd, error.message, "Could not read texture", MB_ICONERROR);
+                return 0;
+            }
+            const bool valid = file.size >= 128 && file.size <= 64 * MiB &&
+                               memcmp(file.data, "DDS ", 4) == 0 && read_u32(file.data + 4) == 124;
+            if (valid) state->value.mesh.materials.front().texture_bytes.assign(file.data, file.data + file.size);
+            unmap_file(&file);
+            if (!valid) MessageBoxA(hwnd, "Choose a valid DDS texture of at most 64 MiB.", "Invalid texture", MB_ICONERROR);
+            else SetWindowTextA(state->texture, path.c_str());
+        } else if (id == ID_OBJECT_TEXTURE_CLEAR) {
+            state->value.mesh.materials.front().texture_bytes.clear();
+            SetWindowTextA(state->texture, "No texture");
+        } else if (id >= ID_OBJECT_FLAG_FIRST && id < ID_OBJECT_FLAG_FIRST + _countof(kObjectFlags)) {
+            const int index = id - ID_OBJECT_FLAG_FIRST;
+            const auto& flag = kObjectFlags[index];
+            HWND edit = flag.collision ? state->collision : state->blend;
+            uint32_t mask = get_u32(edit, 0);
+            if (SendMessageA(state->checks[index], BM_GETCHECK, 0, 0) == BST_CHECKED) mask |= flag.mask;
+            else mask &= ~flag.mask;
+            set_u32_hex(edit, mask);
+        } else if ((id == ID_OBJECT_BLEND || id == ID_OBJECT_COLLISION) && HIWORD(wparam) == EN_CHANGE) {
+            const uint32_t mask = get_u32(id == ID_OBJECT_BLEND ? state->blend : state->collision, 0);
+            for (size_t i = 0; i < _countof(kObjectFlags); ++i)
+                if (kObjectFlags[i].collision == (id == ID_OBJECT_COLLISION))
+                    SendMessageA(state->checks[i], BM_SETCHECK, mask & kObjectFlags[i].mask ? BST_CHECKED : BST_UNCHECKED, 0);
+        } else if (id == IDOK) {
+            bool surface_ok = true, blend_ok = false, collision_ok = false;
+            const LRESULT selected = SendMessageA(state->surface, CB_GETCURSEL, 0, 0);
+            const uint32_t surface = selected == CB_ERR ? get_u32(state->surface, 0, &surface_ok) :
+                static_cast<uint32_t>(SendMessageA(state->surface, CB_GETITEMDATA, selected, 0));
+            const uint32_t blend = get_u32(state->blend, 0, &blend_ok);
+            const uint32_t collision = get_u32(state->collision, 0, &collision_ok);
+            if (!surface_ok || !blend_ok || !collision_ok || surface > 255 || collision > 0xffff) {
+                MessageBoxA(hwnd, "Enter a valid surface ID from 0 to 255.\n", "Invalid Object settings", MB_ICONWARNING);
+                return 0;
+            }
+            state->value.mesh.materials.front().surface_type = surface;
+            state->value.mesh.materials.front().flags = blend;
+            state->value.collision_flags = static_cast<uint16_t>(collision);
+            std::string why;
+            if (!state->source_asset && !prepare_imported_static_object(&state->value, &why)) {
+                MessageBoxA(hwnd, why.c_str(), "Invalid Object", MB_ICONERROR);
+                return 0;
+            }
+            state->accepted = true;
+            DestroyWindow(hwnd);
+        } else if (id == IDCANCEL) DestroyWindow(hwnd);
+        return 0;
+    }
+    case WM_CLOSE: DestroyWindow(hwnd); return 0;
+    }
+    return DefWindowProcA(hwnd, message, wparam, lparam);
+}
+
+void command_import_object(bool editing = false) {
+    if (g.document.obj_path.empty() && g.document.source_pc_path.empty()) {
+        MessageBoxA(g.window, "Open an environment OBJ or .PC first.", "Import Object", MB_ICONINFORMATION);
+        return;
+    }
+    StaticObjectTemplate object;
+    ObjectPropertiesState state;
+    if (editing) {
+        if (!valid_entity_index(g.selected)) return;
+        const auto* current = find_static_object_template(g.document, g.document.entities[g.selected].value_u32_b, true);
+        if (!current) return;
+        object = *current;
+        if (current->imported) state.value = *current->imported;
+        else {
+            state.source_asset = true;
+            state.value.mesh.materials.resize(1);
+            const EntityModel* model = entity_render_model(g.document.entities[g.selected]);
+            if (model && !model->face_materials.empty()) {
+                const int32_t index = model->face_materials.front();
+                if (index >= 0 && static_cast<size_t>(index) < model->materials.size())
+                    state.value.mesh.materials.front() = model->materials[index];
+            }
+            std::string why;
+            if (!load_static_object_collision_flags(object, &state.value.collision_flags, &why)) {
+                MessageBoxA(g.window, why.c_str(), "Could not read Object properties", MB_ICONERROR);
+                return;
+            }
+        }
+    } else {
+        std::string path, why;
+        if (!choose_path(g.window, false, "Import static Object from OBJ", "Wavefront OBJ\0*.obj\0", "obj", &path)) return;
+        if (!load_static_object_obj(path, &state.value, &why)) {
+            MessageBoxA(g.window, why.c_str(), "Could not import Object", MB_ICONERROR);
+            return;
+        }
+        uint32_t id = asura_lower_name_hash(std::string("alev-object:") + path);
+        for (;;) {
+            bool used = !id || find_static_object_template(g.document, id, true);
+            for (const auto& entity : g.document.entities) used |= entity.value_u32_b == id;
+            if (!used) break;
+            ++id;
+        }
+        object = make_canonical_static_object_template(id, path_stem(str_from_c(path.c_str())), {});
+    }
+    auto& material = state.value.mesh.materials.front();
+    if (object.properties.fields & 1) material.surface_type = object.properties.surface_type;
+    if (object.properties.fields & 2) material.flags = object.properties.blending_flags;
+    if (object.properties.fields & 4) state.value.collision_flags = object.properties.collision_flags;
+    const uint32_t old_surface = material.surface_type, old_blend = material.flags;
+    const uint16_t old_collision = state.value.collision_flags;
+    if (!run_centered_modal("Asura2005ObjectProperties", editing ? "Object material and collision" : "Import static Object",
+                            680, 438, &state) || !state.accepted) return;
+    if (!editing || old_surface != material.surface_type) object.properties.fields |= 1;
+    if (!editing || old_blend != material.flags) object.properties.fields |= 2;
+    if (!editing || old_collision != state.value.collision_flags) object.properties.fields |= 4;
+    if (object.properties.fields & 1) object.properties.surface_type = material.surface_type;
+    if (object.properties.fields & 2) object.properties.blending_flags = material.flags;
+    if (object.properties.fields & 4) object.properties.collision_flags = state.value.collision_flags;
+    state.value.mesh.resource_name = object.resource_name;
+    if (!state.source_asset) {
+        char texture_name[80];
+        snprintf(texture_name, sizeof(texture_name), "\\objects\\alev_%08X.dds", object.file_id);
+        material.texture_name = texture_name;
+        object.imported = std::make_shared<const ImportedStaticObject>(std::move(state.value));
+    }
+    if (!g.history.begin(g.document, g.selected)) return;
+    if (editing) {
+        Snipe_ServerEntity_StaticObject_ChunkDataV0 edited_body{};
+        memcpy(&edited_body, object.body.data(), sizeof(edited_body));
+        for (auto& current : g.document.static_object_templates) {
+            Snipe_ServerEntity_StaticObject_ChunkDataV0 body{};
+            memcpy(&body, current.body.data(), sizeof(body));
+            if (current.file_id == object.file_id) current = object;
+            else if (edited_body.m_xPhysicalObject.m_uSkinID &&
+                     body.m_xPhysicalObject.m_uSkinID == edited_body.m_xPhysicalObject.m_uSkinID)
+                current.properties = object.properties;
+        }
+    } else g.document.static_object_templates.push_back(object);
+    commit_history_transaction();
+    apply_static_object_preview_properties(g.document, &g.pickup_models, &g.static_object_models);
+    refresh_inspector();
+    invalidate_environment_cache();
+    request_redraw();
+    if (editing) set_status("Object material and collision updated for all instances of this type.");
+    else begin_place(EntityKind::StaticObject, object.file_id);
+}
+
 void command_object_donor() {
     std::vector<std::string> paths;
     if (!choose_paths(g.window, "Choose one or more target-game Objects donor .PC levels",
@@ -3869,6 +4142,21 @@ void command_object_donor() {
         set_status("The selected Objects donors do not contain a usable Object catalog.");
         MessageBoxA(g.window, why.c_str(), "Could not load Objects donors", MB_ICONERROR);
         return;
+    }
+    for (const auto& object : g.document.static_object_templates) {
+        if (!object.imported) {
+            for (auto& donor : templates)
+                if (donor.file_id == object.file_id) donor.properties = object.properties;
+            continue;
+        }
+        for (const auto& donor : templates) {
+            if (donor.file_id == object.file_id) {
+                MessageBoxA(g.window, "A donor Object has the same file ID as an imported OBJ Object.",
+                            "Could not switch Objects donors", MB_ICONERROR);
+                return;
+            }
+        }
+        templates.push_back(object);
     }
     for (const Entity& entity : g.document.entities) {
         if (entity.kind != EntityKind::StaticObject)
@@ -3929,6 +4217,7 @@ void command_object_donor() {
     }
     commit_history_transaction();
     char status[260]{};
+    apply_static_object_preview_properties(g.document, &g.pickup_models, &g.static_object_models);
     snprintf(status, sizeof(status),
              "%zu Objects donor levels loaded: %zu definitions, %zu rendered models.",
              paths.size(), templates.size(), g.static_object_models.size());
@@ -4283,6 +4572,10 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             command_weapons_donor();
         else if (id == ID_OBJECT_DONOR)
             command_object_donor();
+        else if (id == ID_IMPORT_STATIC_OBJECT)
+            command_import_object();
+        else if (id == ID_OBJECT_PROPERTIES)
+            command_import_object(true);
         else if (id == ID_SKYBOX_TEXTURES)
             command_skybox_textures();
         else if (id == ID_TOGGLE_RAIN)

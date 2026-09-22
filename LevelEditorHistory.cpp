@@ -97,6 +97,7 @@ bool equal(const PickupTemplate& a, const PickupTemplate& b) {
 
 bool equal(const StaticObjectTemplate& a, const StaticObjectTemplate& b) {
     return a.file_id == b.file_id && a.resource_name == b.resource_name &&
+           a.imported == b.imported && a.properties == b.properties &&
            a.donor_path == b.donor_path && a.entity_padding == b.entity_padding &&
            memcmp(a.body.data(), b.body.data(), a.body.size()) == 0;
 }

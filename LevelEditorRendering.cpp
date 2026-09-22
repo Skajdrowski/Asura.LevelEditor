@@ -174,6 +174,7 @@ struct GpuEntitySnapshot {
     uint32_t light_flags = 0;
     uint32_t selection_order = 0;
     uint32_t animation_id = 0;
+    StaticObjectProperties object_properties;
 };
 
 struct GpuModelLookupSnapshot {
@@ -205,7 +206,7 @@ bool same_entity_snapshot(const GpuEntitySnapshot& a, const GpuEntitySnapshot& b
            a.sound_range == b.sound_range && a.light_range == b.light_range &&
            a.value_u32_a == b.value_u32_a && a.light_flags == b.light_flags &&
            a.selection_order == b.selection_order &&
-           a.animation_id == b.animation_id &&
+           a.animation_id == b.animation_id && a.object_properties == b.object_properties &&
            a.vertices == b.vertices && a.faces == b.faces && a.materials == b.materials &&
            a.face_count == b.face_count;
 }
@@ -2062,12 +2063,18 @@ void gpu_refresh_entity_model_lookup() {
 
     gpu.static_lookup_snapshot_scratch.clear();
     gpu.static_lookup_snapshot_scratch.reserve(g.static_object_models.size());
+    for (const auto& object : g.document.static_object_templates) {
+        if (!object.imported) continue;
+        const EntityModel* model = &object.imported->mesh;
+        gpu.static_lookup_snapshot_scratch.push_back(
+            {object.file_id, model, model->faces.data(), model->faces.size()});
+    }
     for (const StaticObjectModel& entry : g.static_object_models) {
         const EntityModel* model = &entry.mesh;
         gpu.static_lookup_snapshot_scratch.push_back(
             {entry.file_id, model, model->faces.data(), model->faces.size()});
     }
-    gpu_commit_model_lookup(g.static_object_models.size(), &gpu.static_lookup_snapshot,
+    gpu_commit_model_lookup(gpu.static_lookup_snapshot_scratch.size(), &gpu.static_lookup_snapshot,
                             &gpu.static_lookup_snapshot_scratch, &gpu.static_lookup);
 }
 
@@ -2109,6 +2116,9 @@ GpuEntitySnapshot gpu_entity_snapshot(const Entity& entity, const EntityModel* m
     snapshot.value_u32_a = entity.value_u32_a;
     snapshot.selection_order = selection_order;
     snapshot.animation_id = entity.pickup_anim_id;
+    if (entity.kind == EntityKind::StaticObject)
+        for (const auto& object : g.document.static_object_templates)
+            if (object.file_id == entity.value_u32_b) { snapshot.object_properties = object.properties; break; }
     if (entity.kind == EntityKind::Sound) {
         // Applying sound box properties must invalidate the cached overlay even
         // when selection, position and audible range have not changed.

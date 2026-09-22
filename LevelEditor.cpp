@@ -61,6 +61,12 @@ int APIENTRY WinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE, _In_ LPSTR com
     if (!RegisterClassExA(&sound_properties_class))
         return 1;
 
+    WNDCLASSEXA object_properties_class = light_properties_class;
+    object_properties_class.lpfnWndProc = object_properties_proc;
+    object_properties_class.lpszClassName = "Asura2005ObjectProperties";
+    if (!RegisterClassExA(&object_properties_class))
+        return 1;
+
     WNDCLASSEXA skybox_properties_class{};
     skybox_properties_class.cbSize = sizeof(skybox_properties_class);
     skybox_properties_class.lpfnWndProc = skybox_properties_proc;

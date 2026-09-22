@@ -154,8 +154,8 @@ bool mark_material_support(const ChunkList& chunks, uint32_t before_chunk,
 }
 
 bool append_rscf(Buffer* out, Str name, uint32_t type, uint32_t subtype, const void* payload, uint32_t payload_size,
-                 Error* err) {
-    ChunkMark mark = begin_chunk(out, ASURA_CHUNK_RESOURCEFILE, 0, 0, err);
+                 Error* err, uint32_t version) {
+    ChunkMark mark = begin_chunk(out, ASURA_CHUNK_RESOURCEFILE, version, 0, err);
     append_u32(out, type, err);
     append_u32(out, subtype, err);
     append_u32(out, payload_size, err);

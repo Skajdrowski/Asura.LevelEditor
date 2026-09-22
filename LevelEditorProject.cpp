@@ -1,5 +1,6 @@
 #include "LevelEditorProject.h"
 #include "LevelEditorExport.h"
+#include "LevelEditorImport.h"
 
 #include <cmath>
 #include <cstring>
@@ -13,7 +14,7 @@ namespace editor {
 namespace {
 
 constexpr char kProjectMagic[8] = {'A', 'L', 'E', 'V', '2', '0', '0', '5'};
-constexpr uint32_t kProjectVersion = 16;
+constexpr uint32_t kProjectVersion = 18;
 
 struct BinaryWriter {
     std::vector<uint8_t> bytes;
@@ -276,6 +277,31 @@ bool save_project(const Document& document, const char* path, std::string* why) 
         writer.str(object.donor_path);
         writer.u32(object.entity_padding);
         writer.raw(object.body.data(), object.body.size());
+        writer.u32(object.properties.fields);
+        writer.u32(object.properties.surface_type);
+        writer.u32(object.properties.blending_flags);
+        writer.u32(object.properties.collision_flags);
+        writer.u32(object.imported ? 1u : 0u);
+        if (object.imported) {
+            const auto& asset = *object.imported;
+            const auto& material = asset.mesh.materials.front();
+            writer.u32(asset.collision_flags);
+            writer.u32(material.surface_type);
+            writer.u32(material.flags);
+            writer.str(material.texture_name);
+            writer.u32(static_cast<uint32_t>(material.texture_bytes.size()));
+            writer.raw(material.texture_bytes.data(), material.texture_bytes.size());
+            writer.u32(static_cast<uint32_t>(asset.mesh.vertices.size()));
+            for (const auto& vertex : asset.mesh.vertices) {
+                write_vec3(writer, vertex.position);
+                write_vec3(writer, vertex.normal);
+                writer.f32(vertex.texcoord.x);
+                writer.f32(vertex.texcoord.y);
+            }
+            writer.u32(static_cast<uint32_t>(asset.mesh.faces.size()));
+            for (const auto& face : asset.mesh.faces)
+                writer.raw(face.data(), 3 * sizeof(uint16_t));
+        }
     }
     writer.u32(static_cast<uint32_t>(document.entities.size()));
     for (const Entity& entity : document.entities) {
@@ -354,6 +380,10 @@ bool save_project(const Document& document, const char* path, std::string* why) 
         }
     }
 
+    if (writer.bytes.size() > 512 * MiB) {
+        if (why) *why = "The embedded Object assets exceed the 512 MiB project size limit.";
+        return false;
+    }
     Error error{};
     if (!write_entire_file(path, writer.bytes.data(), writer.bytes.size(), &error)) {
         if (why)
@@ -476,6 +506,48 @@ bool load_project(Document* document, const char* path, std::string* why) {
                 object.donor_path = reader.str();
                 object.entity_padding = static_cast<uint16_t>(reader.u32());
                 reader.raw(object.body.data(), object.body.size());
+                if (project_version >= 18) {
+                    object.properties.fields = reader.u32();
+                    object.properties.surface_type = reader.u32();
+                    object.properties.blending_flags = reader.u32();
+                    const uint32_t collision = reader.u32();
+                    if (object.properties.fields > 7 || object.properties.surface_type > 255 || collision > 0xffff)
+                        reader.ok = false;
+                    object.properties.collision_flags = static_cast<uint16_t>(collision);
+                }
+                if (project_version >= 17 && reader.u32()) {
+                    auto asset = std::make_shared<ImportedStaticObject>();
+                    asset->mesh.resource_name = object.resource_name;
+                    asset->mesh.materials.resize(1);
+                    auto& material = asset->mesh.materials.front();
+                    const uint32_t collision = reader.u32();
+                    if (collision > 0xffff || !object.file_id) reader.ok = false;
+                    asset->collision_flags = static_cast<uint16_t>(collision);
+                    material.surface_type = reader.u32();
+                    material.flags = reader.u32();
+                    material.texture_flags = 8;
+                    material.texture_name = reader.str();
+                    const uint32_t texture_size = reader.u32();
+                    if (texture_size > 64 * MiB || texture_size > reader.size - reader.at) reader.ok = false;
+                    if (reader.ok) {
+                        material.texture_bytes.resize(texture_size);
+                        reader.raw(material.texture_bytes.data(), texture_size);
+                    }
+                    const uint32_t vertex_count = reader.u32();
+                    if (vertex_count > 65535 || vertex_count > (reader.size - reader.at) / 32) reader.ok = false;
+                    asset->mesh.vertices.resize(reader.ok ? vertex_count : 0);
+                    for (auto& vertex : asset->mesh.vertices) {
+                        vertex.position = read_vec3(reader);
+                        vertex.normal = read_vec3(reader);
+                        vertex.texcoord = {reader.f32(), reader.f32()};
+                    }
+                    const uint32_t face_count = reader.u32();
+                    if (face_count > 1000000 || face_count > (reader.size - reader.at) / 6) reader.ok = false;
+                    asset->mesh.faces.resize(reader.ok ? face_count : 0);
+                    for (auto& face : asset->mesh.faces) reader.raw(face.data(), 3 * sizeof(uint16_t));
+                    if (reader.ok && !prepare_imported_static_object(asset.get(), why)) reader.ok = false;
+                    object.imported = std::move(asset);
+                }
                 next.static_object_templates.push_back(std::move(object));
             }
         }
