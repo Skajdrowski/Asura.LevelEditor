@@ -1295,6 +1295,7 @@ bool append_pc_texture(Buffer* out, const ChunkList& source, Str name, Error* er
 bool append_pc_materials(Buffer* out, const ChunkList& source, const EnvView& env,
                          const MaterialMap& map,
                          const std::vector<PcEnvironmentMaterialBinding>& materials,
+                         const std::vector<CollisionPolygon>& barriers,
                          Error* err) {
     std::vector<uint8_t> used(materials.size());
     for (uint32_t i = 0; i < env.strip_count; ++i) {
@@ -1303,6 +1304,12 @@ bool append_pc_materials(Buffer* out, const ChunkList& source, const EnvView& en
         const uint32_t ordinal = original >= 1000 ? original - 1000 : original;
         if (ordinal >= materials.size()) return fail(err, "rebuilt PC material index is invalid");
         used[ordinal] = 1;
+    }
+    for (const CollisionPolygon& face : barriers) {
+        if (face.material == 0xffff) continue; // Source collision has no material binding.
+        if (face.material >= materials.size())
+            return fail(err, "collision barrier material %u is missing", face.material);
+        used[face.material] = 1;
     }
     std::vector<Str> names(materials.size());
     std::vector<std::string> emitted;
@@ -1473,6 +1480,93 @@ struct PcCollisionFlagLookup {
     }
 };
 
+bool collect_collision_barriers(const Document& doc, const EnvView& env,
+                                std::vector<CollisionPolygon>* output, Error* err) {
+    output->clear();
+    struct Bounds { Asura_Vector_3 min, max; };
+    std::vector<Bounds> module_bounds(env.module_count);
+    for (uint32_t module = 0; module < env.module_count; ++module) {
+        const uint32_t block_index = env.modules[module].m_uBufferIndex;
+        if (block_index >= env.block_count) return fail(err, "collision barrier module is invalid");
+        const uint8_t* block = env.blocks[block_index];
+        const uint32_t count = read_u32(block);
+        Bounds& bounds = module_bounds[module];
+        bounds.min = {FLT_MAX, FLT_MAX, FLT_MAX};
+        bounds.max = {-FLT_MAX, -FLT_MAX, -FLT_MAX};
+        for (uint32_t i = 0; i < count; ++i) {
+            const uint8_t* v = block + 8 + static_cast<uint64_t>(i) * 36;
+            const Asura_Vector_3 p{read_f32(v), read_f32(v + 4), read_f32(v + 8)};
+            bounds.min.x = fminf(bounds.min.x, p.x); bounds.max.x = fmaxf(bounds.max.x, p.x);
+            bounds.min.y = fminf(bounds.min.y, p.y); bounds.max.y = fmaxf(bounds.max.y, p.y);
+            bounds.min.z = fminf(bounds.min.z, p.z); bounds.max.z = fmaxf(bounds.max.z, p.z);
+        }
+    }
+    const auto assign_module = [&](CollisionPolygon* face) {
+        Asura_Vector_3 center{};
+        for (uint32_t i = 0; i < face->vertex_count; ++i) {
+            center.x += face->vertices[i].x; center.y += face->vertices[i].y;
+            center.z += face->vertices[i].z;
+        }
+        const float inv = 1.0f / face->vertex_count;
+        center.x *= inv; center.y *= inv; center.z *= inv;
+        float best = FLT_MAX;
+        for (uint32_t module = 0; module < env.module_count; ++module) {
+            const Bounds& b = module_bounds[module];
+            if (b.min.x == FLT_MAX) continue;
+            const float dx = fmaxf(fmaxf(b.min.x - center.x, center.x - b.max.x), 0.0f);
+            const float dy = fmaxf(fmaxf(b.min.y - center.y, center.y - b.max.y), 0.0f);
+            const float dz = fmaxf(fmaxf(b.min.z - center.z, center.z - b.max.z), 0.0f);
+            const float distance = dx * dx + dy * dy + dz * dz;
+            if (distance < best) { best = distance; face->module_index = module; }
+        }
+        return best != FLT_MAX;
+    };
+    constexpr uint8_t sides[6][4] = {
+        {0, 4, 6, 2}, {1, 3, 7, 5}, {0, 1, 5, 4},
+        {2, 6, 7, 3}, {0, 2, 3, 1}, {4, 5, 7, 6}
+    };
+    for (const Entity& entity : doc.entities) {
+        if (entity.kind != EntityKind::CollisionBarrier) continue;
+        if (!entity.collision_faces.empty()) {
+            for (CollisionPolygon face : entity.collision_faces) {
+                if (face.vertex_count < 3 || face.vertex_count > 4 || !assign_module(&face))
+                    return fail(err, "imported collision barrier has invalid geometry");
+                output->push_back(face);
+            }
+            continue;
+        }
+        const Asura_Bounding_Box& b = entity.source_bounds;
+        if (!isfinite(b.MinX) || !isfinite(b.MaxX) || !isfinite(b.MinY) ||
+            !isfinite(b.MaxY) || !isfinite(b.MinZ) || !isfinite(b.MaxZ) ||
+            b.MinX >= b.MaxX || b.MinY >= b.MaxY || b.MinZ >= b.MaxZ)
+            return fail(err, "collision barrier '%s' needs positive bounds on all axes", entity.name.c_str());
+        Asura_Vector_3 corners[8];
+        const Asura_Vector_3 center{(b.MinX + b.MaxX) * .5f,
+                                    (b.MinY + b.MaxY) * .5f,
+                                    (b.MinZ + b.MaxZ) * .5f};
+        float rotation[9]{};
+        quaternion_matrix(euler_quaternion(entity.rotation), rotation);
+        for (uint32_t i = 0; i < 8; ++i) {
+            const Asura_Vector_3 local{(i & 1 ? b.MaxX : b.MinX) - center.x,
+                                        (i & 2 ? b.MaxY : b.MinY) - center.y,
+                                        (i & 4 ? b.MaxZ : b.MinZ) - center.z};
+            corners[i] = {entity.position.x + rotation[0] * local.x + rotation[1] * local.y + rotation[2] * local.z,
+                          entity.position.y + rotation[3] * local.x + rotation[4] * local.y + rotation[5] * local.z,
+                          entity.position.z + rotation[6] * local.x + rotation[7] * local.y + rotation[8] * local.z};
+        }
+        for (const auto& side : sides) {
+            CollisionPolygon face;
+            face.vertex_count = 4;
+            face.material = 8;
+            face.flags = 0x200;
+            for (uint32_t i = 0; i < 4; ++i) face.vertices[i] = corners[side[i]];
+            if (!assign_module(&face)) return fail(err, "collision barrier has no environment module");
+            output->push_back(face);
+        }
+    }
+    return true;
+}
+
 bool pack_document(Document& doc, const char* output_path, std::string* why) {
     if (!normalise_editor_guids(&doc, why))
         return false;
@@ -1507,6 +1601,9 @@ bool pack_document(Document& doc, const char* output_path, std::string* why) {
                                            ? nullptr
                                            : doc.skybox.texture_paths[slot].c_str();
     cfg.allow_unknown_materials = doc.material_map.empty();
+    for (const Entity& entity : doc.entities)
+        if (entity.kind == EntityKind::CollisionBarrier && entity.collision_faces.empty())
+            cfg.min_material_count = 9;
 
     Arena arena{}, scratch{};
     Buffer output{}, env_payload{};
@@ -1519,6 +1616,7 @@ bool pack_document(Document& doc, const char* output_path, std::string* why) {
     ObjData obj{};
     EnvBuild env{};
     EnvView view{};
+    std::vector<CollisionPolygon> collision_barriers;
     Sounds sounds{};
     SoundTriggerExport sound_triggers;
     TextureSet textures{};
@@ -1543,6 +1641,8 @@ bool pack_document(Document& doc, const char* output_path, std::string* why) {
             material_map.collision_flag_context = &pc_face_collision;
             material_map.resolve_collision_flags = PcCollisionFlagLookup::resolve;
         }
+        if (ok && pc_materials.size() < cfg.min_material_count)
+            pc_materials.resize(cfg.min_material_count);
         material_map.default_collision_flags = pc_collision_flags.data();
         material_map.default_collision_flag_count = static_cast<uint32_t>(pc_collision_flags.size());
     } else if (ok) {
@@ -1559,6 +1659,8 @@ bool pack_document(Document& doc, const char* output_path, std::string* why) {
              view.module_count <= kMaxAabbTreeObjects;
         if (!ok && !err.set)
             fail(&err, "generated environment has an invalid module count");
+        if (ok)
+            ok = collect_collision_barriers(doc, view, &collision_barriers, &err);
     }
     if (ok) {
         metrics = arena_array<ModuleMetric>(&arena, view.module_count, &err);
@@ -1573,7 +1675,8 @@ bool pack_document(Document& doc, const char* output_path, std::string* why) {
              (!from_pc || append_imported_hierarchy_support(&output, doc, source, &err)) &&
              append_sky_resources(&output, cfg, &scratch, &err) &&
              (!from_pc || append_pc_sky_textures(&output, source, doc, &err)) &&
-             (from_pc ? append_pc_materials(&output, source, view, material_map, pc_materials, &err)
+             (from_pc ? append_pc_materials(&output, source, view, material_map, pc_materials,
+                                            collision_barriers, &err)
                       : append_textures(&output, cfg, view, material_map, &arena, &scratch, &textures, &err)) &&
              append_rscf(&output, str_from_c(cfg.env_name), ASURA_RESOURCEFILE_TYPE_PLATFORMSPECIFIC,
                          ASURA_RESOURCEFILE_TYPE_PC_ENVIRONMENT, env_payload.base,
@@ -1584,6 +1687,7 @@ bool pack_document(Document& doc, const char* output_path, std::string* why) {
              append_editor_lights(&output, doc, &err) &&
              append_phon(&output, sounds, &err) &&
              append_emod(&output, view, view.module_count, cfg, material_map,
+                         collision_barriers.data(), static_cast<uint32_t>(collision_barriers.size()),
                          &scratch, metrics, &err) &&
              append_mlin(&output, metrics, view.module_count, &err) &&
              append_mrvb(&output, view.module_count, &err) && append_nav1(&output, view.module_count, &err) &&
@@ -2457,17 +2561,20 @@ bool pc_environment_collision_flags(const ChunkList& chunks, uint32_t material_c
                                                       static_cast<uint64_t>(polygon) * item_size))
                                                 : read_u16(collision + materials_at +
                                                            static_cast<uint64_t>(polygon) * item_size);
-            if (material == 0xffff)
-                continue;
-            const uint32_t ordinal = material >= 1000
-                                         ? static_cast<uint32_t>(material) - 1000
-                                         : material;
-            if (ordinal < material_count) {
-                const uint32_t packed = (ordinal << 16) | flags;
-                frequencies.push_back(static_cast<int32_t>(packed));
+            const uint32_t ordinal = material == 0xffff
+                                         ? 0xffffu
+                                         : (material >= 1000 ? static_cast<uint32_t>(material) - 1000
+                                                             : material);
+            if (ordinal == 0xffffu || ordinal < material_count) {
+                if (ordinal != 0xffffu) {
+                    const uint32_t packed = (ordinal << 16) | flags;
+                    frequencies.push_back(static_cast<int32_t>(packed));
+                }
                 if (polygons) {
                     PcCollisionPolygon face;
                     face.material = ordinal; face.flags = flags;
+                    face.module_index = module_index;
+                    face.polygon_index = polygon;
                     const uint8_t* ids = collision + fixed_size + vertex_bytes + static_cast<uint64_t>(polygon) * 8;
                     for (uint32_t corner = 0; corner < 4; ++corner) {
                         const uint16_t index = read_u16(ids + corner * 2);

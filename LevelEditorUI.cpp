@@ -280,6 +280,18 @@ void append_light_bounding_box(const Asura_Bounding_Box& bounds, std::vector<Lig
     }
 }
 
+void append_collision_barrier_gizmo(const Entity& entity, std::vector<LightGizmoLine>* lines) {
+    if (entity.kind != EntityKind::CollisionBarrier) return;
+    if (entity.collision_faces.empty()) {
+        append_oriented_bounds_gizmo(entity, lines);
+        return;
+    }
+    for (const CollisionBarrierFace& face : entity.collision_faces)
+        for (uint32_t i = 0; i < face.vertex_count; ++i)
+            append_light_gizmo_line(lines, entity_view_position(face.vertices[i]),
+                                    entity_view_position(face.vertices[(i + 1) % face.vertex_count]));
+}
+
 void append_camera_spawn_arrow(const Entity& entity, float marker, std::vector<LightGizmoLine>* lines) {
     if (entity.kind != EntityKind::SpawnPoint || !(entity.value_u32_a & SnipeSpawnTeam_Camera))
         return;
@@ -1217,6 +1229,7 @@ const char* entity_type_label(EntityKind kind) {
     case EntityKind::StaticObject: return "Object";
     case EntityKind::BuildingVolume: return "Indoor zone";
     case EntityKind::SoundRegion: return "Ambience region";
+    case EntityKind::CollisionBarrier: return "Collision barrier";
     }
     return "Entity";
 }
@@ -1390,13 +1403,19 @@ void refresh_inspector() {
     const bool source_entity = enabled && g.document.entities[g.selected].source_entity_record;
     const bool pickup = enabled && g.document.entities[g.selected].kind == EntityKind::Pickup;
     const bool static_object = enabled && g.document.entities[g.selected].kind == EntityKind::StaticObject;
+    const bool collision_barrier = enabled &&
+                                   g.document.entities[g.selected].kind == EntityKind::CollisionBarrier;
+    const bool imported_barrier = collision_barrier &&
+                                  !g.document.entities[g.selected].collision_faces.empty();
     const bool oriented_bounds = enabled &&
-                                 g.document.entities[g.selected].kind == EntityKind::BuildingVolume;
+                                 (g.document.entities[g.selected].kind == EntityKind::BuildingVolume ||
+                                  (collision_barrier && !imported_barrier));
     bool selection_deletable = enabled;
     for (int index : g.selected_entities) {
         const Entity& entity = g.document.entities[index];
         selection_deletable &= !entity.source_entity_record || entity.kind == EntityKind::Pickup ||
-                               entity.kind == EntityKind::StaticObject;
+                               entity.kind == EntityKind::StaticObject ||
+                               entity.kind == EntityKind::CollisionBarrier;
     }
     if (g.rain_toggle) {
         SendMessageA(g.rain_toggle, BM_SETCHECK,
@@ -1413,6 +1432,8 @@ void refresh_inspector() {
     HWND fields[] = {g.name, g.pos[0], g.pos[1], g.pos[2], g.rot[0], g.rot[1], g.rot[2],
                      g.value[0], g.value[1], g.value[2]};
     for (HWND h : fields)
+        EnableWindow(h, enabled && !imported_barrier);
+    for (HWND h : g.rot)
         EnableWindow(h, enabled);
     EnableWindow(g.value[0], enabled && (!source_entity || pickup || static_object || oriented_bounds));
     EnableWindow(g.value[1], enabled && ((!source_entity && !pickup && !static_object) || oriented_bounds));
@@ -1560,7 +1581,7 @@ void refresh_inspector() {
         set_control_text(g.value_label[1], "Bounds depth");
         set_float(g.value[0], e.value_a);
         set_float(g.value[1], e.value_b);
-    } else if (e.kind == EntityKind::BuildingVolume) {
+    } else if (e.kind == EntityKind::BuildingVolume || e.kind == EntityKind::CollisionBarrier) {
         const Asura_Vector_3 size = oriented_box_dimensions(e);
         set_control_text(g.value_label[0], "Bounds width");
         set_control_text(g.value_label[1], "Bounds height");
@@ -1626,7 +1647,8 @@ void focus_camera_on_entity(int index) {
         if (isfinite(model_radius) && model_radius > .01f)
             radius = model_radius;
     } else if (entity.kind == EntityKind::PositionMarker ||
-               entity.kind == EntityKind::BuildingVolume || entity.kind == EntityKind::SoundRegion) {
+               entity.kind == EntityKind::BuildingVolume || entity.kind == EntityKind::SoundRegion ||
+               entity.kind == EntityKind::CollisionBarrier) {
         const auto& bounds = entity.kind == EntityKind::SoundRegion ? entity.ambience_outer_bounds : entity.source_bounds;
         const float width = bounds.MaxX - bounds.MinX;
         const float height = bounds.MaxY - bounds.MinY;
@@ -1657,6 +1679,35 @@ void apply_inspector() {
     const uint32_t rotation_dirty = kInspectorDirtyRotX | kInspectorDirtyRotY | kInspectorDirtyRotZ;
     for (int index : targets) {
         Entity& e = g.document.entities[index];
+        if (e.kind == EntityKind::CollisionBarrier && !e.collision_faces.empty()) {
+            Asura_Vector_3 next = e.rotation;
+            if (changed(kInspectorDirtyRotX)) next.x = get_float(g.rot[0], next.x);
+            if (changed(kInspectorDirtyRotY)) next.y = get_float(g.rot[1], next.y);
+            if (changed(kInspectorDirtyRotZ)) next.z = get_float(g.rot[2], next.z);
+            if (isfinite(next.x) && isfinite(next.y) && isfinite(next.z) &&
+                (next.x != e.rotation.x || next.y != e.rotation.y || next.z != e.rotation.z)) {
+                const Asura_Quat old = euler_quaternion(e.rotation);
+                const Asura_Quat inverse{-old.x, -old.y, -old.z, old.w};
+                const Asura_Quat current = euler_quaternion(next);
+                Asura_Bounding_Box bounds{FLT_MAX, -FLT_MAX, FLT_MAX, -FLT_MAX, FLT_MAX, -FLT_MAX};
+                for (CollisionBarrierFace& face : e.collision_faces)
+                    for (uint32_t corner = 0; corner < face.vertex_count; ++corner) {
+                        const Asura_Vector_3 local = rotate_by_quaternion(
+                            sub(face.vertices[corner], e.position), inverse);
+                        const Asura_Vector_3 point = add(e.position, rotate_by_quaternion(local, current));
+                        face.vertices[corner] = point;
+                        bounds.MinX = fminf(bounds.MinX, point.x);
+                        bounds.MaxX = fmaxf(bounds.MaxX, point.x);
+                        bounds.MinY = fminf(bounds.MinY, point.y);
+                        bounds.MaxY = fmaxf(bounds.MaxY, point.y);
+                        bounds.MinZ = fminf(bounds.MinZ, point.z);
+                        bounds.MaxZ = fmaxf(bounds.MaxZ, point.z);
+                    }
+                e.source_bounds = bounds;
+                e.rotation = next;
+            }
+            continue;
+        }
         if (changed(kInspectorDirtyName))
             e.name = name;
         if (changed(kInspectorDirtyPosX))
@@ -1784,7 +1835,7 @@ void apply_inspector() {
                         e.name = object->resource_name + suffix;
                 }
             }
-        } else if (e.kind == EntityKind::BuildingVolume) {
+        } else if (e.kind == EntityKind::BuildingVolume || e.kind == EntityKind::CollisionBarrier) {
             Asura_Vector_3 size = oriented_box_dimensions(e);
             if (changed(kInspectorDirtyValueA))
                 size.x = get_float(g.value[0], size.x);
@@ -1928,8 +1979,9 @@ void add_entity_at(EntityKind kind, const Asura_Vector_3& p) {
         snprintf(name, sizeof(name), "%s %zu",
                   object && !object->resource_name.empty() ? object->resource_name.c_str() : "Object",
                   g.document.entities.size() + 1);
-    } else if (kind == EntityKind::BuildingVolume) {
-        snprintf(name, sizeof(name), "Building volume %zu", g.document.entities.size() + 1);
+    } else if (kind == EntityKind::BuildingVolume || kind == EntityKind::CollisionBarrier) {
+        snprintf(name, sizeof(name), kind == EntityKind::CollisionBarrier
+                  ? "Collision barrier %zu" : "Building volume %zu", g.document.entities.size() + 1);
         constexpr Asura_Vector_3 size{10.0f, 5.0f, 10.0f};
         e.source_bounds = {p.x - size.x * .5f, p.x + size.x * .5f,
                            p.y - size.y * .5f, p.y + size.y * .5f,
@@ -2055,13 +2107,17 @@ int hit_entity(int x, int y) {
             }
             continue;
         }
-        if (entity.kind != EntityKind::BuildingVolume && entity.kind != EntityKind::SoundRegion && !entity_is_selected(i) &&
+        if (entity.kind != EntityKind::BuildingVolume && entity.kind != EntityKind::SoundRegion &&
+            entity.kind != EntityKind::CollisionBarrier && !entity_is_selected(i) &&
             environment_occludes_view_position(entity_view_position(entity.position)))
             continue;
-        if (entity.kind == EntityKind::BuildingVolume || entity.kind == EntityKind::SoundRegion) {
+        if (entity.kind == EntityKind::BuildingVolume || entity.kind == EntityKind::SoundRegion ||
+            entity.kind == EntityKind::CollisionBarrier) {
             std::vector<LightGizmoLine> lines;
             lines.reserve(kLightBoundingBoxLines);
             if (entity.kind == EntityKind::SoundRegion) append_sound_gizmo(entity, &lines);
+            else if (entity.kind == EntityKind::CollisionBarrier)
+                append_collision_barrier_gizmo(entity, &lines);
             else append_oriented_bounds_gizmo(entity, &lines);
             const int edge_radius = 10;
             const int edge_distance_limit = edge_radius * edge_radius;
@@ -2119,6 +2175,7 @@ COLORREF entity_color(EntityKind kind) {
     case EntityKind::PositionMarker: return RGB(190, 88, 255);
     case EntityKind::BuildingVolume: return RGB(38, 224, 255);
     case EntityKind::SoundRegion: return RGB(200, 135, 255);
+    case EntityKind::CollisionBarrier: return RGB(255, 80, 210);
     default: return RGB(255, 120, 80);
     }
 }
@@ -2367,7 +2424,8 @@ void draw_entities(HDC dc) {
     for (int i = 0; i < static_cast<int>(g.document.entities.size()); ++i) {
         const Entity& e = g.document.entities[i];
         const bool selected = entity_is_selected(i);
-        if (e.kind != EntityKind::BuildingVolume && e.kind != EntityKind::SoundRegion && !selected &&
+        if (e.kind != EntityKind::BuildingVolume && e.kind != EntityKind::SoundRegion &&
+            e.kind != EntityKind::CollisionBarrier && !selected &&
             environment_occludes_view_position(entity_view_position(e.position)))
             continue;
         POINT p{};
@@ -2378,10 +2436,13 @@ void draw_entities(HDC dc) {
             draw_light_gizmo(dc, e, true);
         else if (e.kind == EntityKind::Sound && selected)
             draw_sound_gizmo(dc, e);
-        if (e.kind == EntityKind::BuildingVolume || e.kind == EntityKind::SoundRegion) {
+        if (e.kind == EntityKind::BuildingVolume || e.kind == EntityKind::SoundRegion ||
+            e.kind == EntityKind::CollisionBarrier) {
             std::vector<LightGizmoLine> lines;
             lines.reserve(kLightBoundingBoxLines);
             if (e.kind == EntityKind::SoundRegion) append_sound_gizmo(e, &lines);
+            else if (e.kind == EntityKind::CollisionBarrier)
+                append_collision_barrier_gizmo(e, &lines);
             else append_oriented_bounds_gizmo(e, &lines);
             draw_gizmo_lines(dc, lines, selected ? 2 : 1,
                              selected ? RGB(255, 255, 255) : color);
@@ -2500,7 +2561,8 @@ void layout_controls() {
     MoveWindow(GetDlgItem(g.window, ID_ADD_SOUND), ui_px(8), y, bw, ui_px(27), TRUE);
     MoveWindow(GetDlgItem(g.window, ID_ADD_BUILDING_VOLUME), ui_px(120), y, bw, ui_px(27), TRUE);
     y += ui_px(31);
-    MoveWindow(GetDlgItem(g.window, ID_ADD_SOUND_REGION), ui_px(8), y, ui_px(218), ui_px(27), TRUE);
+    MoveWindow(GetDlgItem(g.window, ID_ADD_SOUND_REGION), ui_px(8), y, bw, ui_px(27), TRUE);
+    MoveWindow(GetDlgItem(g.window, ID_ADD_COLLISION_BARRIER), ui_px(120), y, bw, ui_px(27), TRUE);
     y += ui_px(31);
     MoveWindow(GetDlgItem(g.window, ID_DELETE_ENTITY), ui_px(8), y, ui_px(218), ui_px(27), TRUE);
     y += ui_px(38);
@@ -2586,10 +2648,11 @@ void create_controls() {
     g.list = make_control("LISTBOX", "", LBS_NOTIFY | LBS_EXTENDEDSEL | WS_VSCROLL | WS_BORDER,
                           ID_ENTITY_LIST);
     constexpr const char* entity_button_text[] = {
-        "+ Spawn", "+ Light", "+ Pickup", "+ Object", "+ Sound", "+ Indoor zone", "+ Ambience region", "Delete selected"};
+        "+ Spawn", "+ Light", "+ Pickup", "+ Object", "+ Sound", "+ Indoor zone",
+        "+ Ambience", "+ Barrier box", "Delete selected"};
     constexpr int entity_button_ids[] = {
         ID_ADD_SPAWN, ID_ADD_LIGHT, ID_ADD_PICKUP, ID_ADD_STATIC_OBJECT, ID_ADD_SOUND,
-        ID_ADD_BUILDING_VOLUME, ID_ADD_SOUND_REGION, ID_DELETE_ENTITY};
+        ID_ADD_BUILDING_VOLUME, ID_ADD_SOUND_REGION, ID_ADD_COLLISION_BARRIER, ID_DELETE_ENTITY};
     for (size_t i = 0; i < _countof(entity_button_ids); ++i)
         make_control("BUTTON", entity_button_text[i], BS_PUSHBUTTON, entity_button_ids[i]);
     make_control("STATIC",
@@ -2790,6 +2853,23 @@ bool load_document_preview(Document* document, Mesh* mesh, std::string* why,
             for (const Entity& entity : imported.entities)
                 if (entity.kind == EntityKind::SoundRegion) document->entities.push_back(entity);
             document->sound_regions_loaded = true;
+        }
+        if (!document->source_collision_inventory_complete) {
+            for (Entity entity : imported.entities) {
+                if (entity.kind != EntityKind::CollisionBarrier) continue;
+                if (document->source_collision_inventory_legacy && !entity.collision_faces.empty() &&
+                    legacy_collision_barrier_face(entity.collision_faces.front().material,
+                                                  entity.collision_faces.front().flags))
+                    continue;
+                entity.guid = allocate_editor_guid(document);
+                if (!entity.guid) {
+                    if (why) *why = "No free GUID is available for an imported collision barrier.";
+                    return false;
+                }
+                document->entities.push_back(std::move(entity));
+            }
+            document->source_collision_inventory_complete = true;
+            document->source_collision_inventory_legacy = false;
         }
         enrich_project_pickup_templates(document, imported);
         enrich_project_static_object_templates(document, imported);
@@ -4597,6 +4677,8 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             begin_place(EntityKind::BuildingVolume);
         else if (id == ID_ADD_SOUND_REGION)
             begin_place(EntityKind::SoundRegion);
+        else if (id == ID_ADD_COLLISION_BARRIER)
+            begin_place(EntityKind::CollisionBarrier);
         else if (id == ID_UNDO)
             command_undo();
         else if (id == ID_REDO)
@@ -4651,7 +4733,9 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             return 0;
         }
         select_entity(hit);
-        if (hit >= 0 && g.history.begin(g.document, g.selected)) {
+        if (hit >= 0 && !(g.document.entities[hit].kind == EntityKind::CollisionBarrier &&
+                          !g.document.entities[hit].collision_faces.empty()) &&
+            g.history.begin(g.document, g.selected)) {
             g.moving_entity = true;
             g.entity_drag_last_mouse = p;
             SetCapture(hwnd);
@@ -4715,7 +4799,13 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
                 Entity& e = g.document.entities[g.selected];
                 if (e.position.x == p.x && e.position.y == p.y && e.position.z == p.z)
                     return 0;
+                const Asura_Vector_3 delta = sub(p, e.position);
                 e.position = p;
+                if (e.kind == EntityKind::CollisionBarrier) {
+                    e.source_bounds.MinX += delta.x; e.source_bounds.MaxX += delta.x;
+                    e.source_bounds.MinY += delta.y; e.source_bounds.MaxY += delta.y;
+                    e.source_bounds.MinZ += delta.z; e.source_bounds.MaxZ += delta.z;
+                }
                 if (e.kind == EntityKind::Light)
                     e.light.Position = e.position;
                 // Dragging only changes position. A full inspector refresh is

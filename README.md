@@ -32,6 +32,8 @@ You can save your work into Level Editor's own **.alev** project format and come
 Level Editor supports 5 server-side entities: Spawn, Object, Pickup, Sound, Indoor Zone
 and 2 client-side entities: Light and Ambience region
 
+>Collision barriers are separate level collision geometry.
+
 ## Spawn
 
 Player spawnpoints. Level Editor can render them in viewport as T-Posing characters, depending on their team assignment.
@@ -117,6 +119,12 @@ In levels you can specify default ambience played everywhere with it's default v
 
 Regions affect default ambience by either changing it's sound stream or volume when player's camera overlap one of them. Their outer box defines volume fade size.
 Both inner and outer box the same size means **no fade**
+
+## Collision barrier
+
+Invisible level's collision faces, containing material index and a collision flag.
+
+Editor defines them as **Bounding Box** and automatically overwrites material index as `Wrecked Car (8)` and coll flag `Ignore bullets & grenades only (0x200)`
 
 # Asura Skybox
 

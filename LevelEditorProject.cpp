@@ -14,7 +14,7 @@ namespace editor {
 namespace {
 
 constexpr char kProjectMagic[8] = {'A', 'L', 'E', 'V', '2', '0', '0', '5'};
-constexpr uint32_t kProjectVersion = 18;
+constexpr uint32_t kProjectVersion = 20;
 
 struct BinaryWriter {
     std::vector<uint8_t> bytes;
@@ -353,7 +353,7 @@ bool save_project(const Document& document, const char* path, std::string* why) 
         }
         if (entity.kind == EntityKind::Pickup || entity.kind == EntityKind::AssassinationTarget ||
             entity.kind == EntityKind::PositionMarker || entity.kind == EntityKind::StaticObject ||
-            entity.kind == EntityKind::BuildingVolume) {
+            entity.kind == EntityKind::BuildingVolume || entity.kind == EntityKind::CollisionBarrier) {
             writer.u32(entity.source_entity_record ? 1u : 0u);
             writer.u32(entity.source_entity_classification);
             writer.f32(entity.source_bounds.MinX);
@@ -377,6 +377,17 @@ bool save_project(const Document& document, const char* path, std::string* why) 
         if (entity.kind == EntityKind::SoundRegion) {
             writer.raw(&entity.ambience_inner_bounds, sizeof(entity.ambience_inner_bounds));
             writer.raw(&entity.ambience_outer_bounds, sizeof(entity.ambience_outer_bounds));
+        }
+        if (entity.kind == EntityKind::CollisionBarrier) {
+            writer.u32(static_cast<uint32_t>(entity.collision_faces.size()));
+            for (const auto& face : entity.collision_faces) {
+                writer.u32(face.vertex_count);
+                writer.u32(face.material);
+                writer.u32(face.flags);
+                writer.u32(face.module_index);
+                for (uint32_t i = 0; i < face.vertex_count; ++i)
+                    write_vec3(writer, face.vertices[i]);
+            }
         }
     }
 
@@ -421,6 +432,8 @@ bool load_project(Document* document, const char* path, std::string* why) {
     }
 
     Document next;
+    next.source_collision_inventory_complete = project_version >= 20;
+    next.source_collision_inventory_legacy = project_version == 19;
     next.sound_regions_loaded = project_version >= 16;
     next.project_path = path;
     next.obj_path = reader.str();
@@ -573,7 +586,9 @@ bool load_project(Document* document, const char* path, std::string* why) {
                                                             ? static_cast<uint32_t>(EntityKind::StaticObject)
                                                             : project_version <= 15
                                                                   ? static_cast<uint32_t>(EntityKind::BuildingVolume)
-                                                                  : static_cast<uint32_t>(EntityKind::SoundRegion);
+                                                                  : project_version <= 18
+                                                                        ? static_cast<uint32_t>(EntityKind::SoundRegion)
+                                                                        : static_cast<uint32_t>(EntityKind::CollisionBarrier);
         if (kind > maximum_kind)
             reader.ok = false;
         const bool supported = kind <= (project_version <= 7
@@ -584,7 +599,9 @@ bool load_project(Document* document, const char* path, std::string* why) {
                                                          ? static_cast<uint32_t>(EntityKind::StaticObject)
                                                          : project_version <= 15
                                                                ? static_cast<uint32_t>(EntityKind::BuildingVolume)
-                                                               : static_cast<uint32_t>(EntityKind::SoundRegion));
+                                                         : project_version <= 18
+                                                               ? static_cast<uint32_t>(EntityKind::SoundRegion)
+                                                               : static_cast<uint32_t>(EntityKind::CollisionBarrier));
         if (supported)
             entity.kind = static_cast<EntityKind>(kind);
         entity.name = reader.str();
@@ -626,8 +643,10 @@ bool load_project(Document* document, const char* path, std::string* why) {
                 entity.sound_trigger_source_guid = reader.u32();
             }
         }
-        if (project_version >= 8 && kind >= static_cast<uint32_t>(EntityKind::Pickup) &&
-            kind <= static_cast<uint32_t>(EntityKind::BuildingVolume)) {
+        if (project_version >= 8 &&
+            ((kind >= static_cast<uint32_t>(EntityKind::Pickup) &&
+              kind <= static_cast<uint32_t>(EntityKind::BuildingVolume)) ||
+             (project_version >= 19 && kind == static_cast<uint32_t>(EntityKind::CollisionBarrier)))) {
             entity.source_entity_record = reader.u32() != 0;
             entity.source_entity_classification = static_cast<uint16_t>(reader.u32());
             entity.source_bounds.MinX = reader.f32();
@@ -663,6 +682,32 @@ bool load_project(Document* document, const char* path, std::string* why) {
             reader.raw(&entity.ambience_outer_bounds, sizeof(entity.ambience_outer_bounds));
             Error error{};
             if (!valid_sound_region(entity, &error)) reader.ok = false;
+        }
+        if (project_version >= 19 && entity.kind == EntityKind::CollisionBarrier) {
+            const uint32_t face_count = reader.u32();
+            if (face_count > 10000 || face_count > (reader.size - reader.at) / 28)
+                reader.ok = false;
+            entity.collision_faces.reserve(reader.ok ? face_count : 0);
+            for (uint32_t face_index = 0; face_index < face_count && reader.ok; ++face_index) {
+                CollisionBarrierFace face;
+                face.vertex_count = reader.u32();
+                const uint32_t material = reader.u32(), flags = reader.u32();
+                face.module_index = reader.u32();
+                if (face.vertex_count < 3 || face.vertex_count > 4 ||
+                    material > 0xffff || flags > 0xffff) {
+                    reader.ok = false;
+                    break;
+                }
+                face.material = static_cast<uint16_t>(material);
+                face.flags = static_cast<uint16_t>(flags);
+                for (uint32_t i = 0; i < face.vertex_count; ++i) {
+                    face.vertices[i] = read_vec3(reader);
+                    const auto& v = face.vertices[i];
+                    if (!std::isfinite(v.x) || !std::isfinite(v.y) || !std::isfinite(v.z))
+                        reader.ok = false;
+                }
+                entity.collision_faces.push_back(face);
+            }
         }
         if (supported)
             next.entities.push_back(std::move(entity));

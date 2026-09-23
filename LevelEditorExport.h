@@ -29,6 +29,8 @@ struct PcCollisionPolygon {
     uint32_t vertex_count = 0;
     uint32_t material = 0;
     uint16_t flags = 0;
+    uint32_t module_index = 0;
+    uint32_t polygon_index = 0;
 };
 
 bool pc_environment_collision_flags(

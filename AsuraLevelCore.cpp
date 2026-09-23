@@ -951,7 +951,8 @@ bool append_minimal_collision_v0(Buffer* out, Error* err) {
 }
 
 bool append_module_collision_v3(Buffer* out, const EnvView& env, uint32_t module, const Config& cfg,
-                                const MaterialMap& materials, Arena* scratch, ModuleMetric* metric, Error* err) {
+                                const MaterialMap& materials, const CollisionPolygon* extra_polygons,
+                                uint32_t extra_polygon_count, Arena* scratch, ModuleMetric* metric, Error* err) {
     if (module >= env.module_count)
         return fail(err, "collision module %u exceeds Env module count %u", module, env.module_count);
     const Asura_PC_EnvironmentRenderer_Module a = env.modules[module];
@@ -962,7 +963,19 @@ bool append_module_collision_v3(Buffer* out, const EnvView& env, uint32_t module
     const uint32_t nv = read_u32(block), ni = read_u32(block + 4);
     const uint8_t* vertices = block + 8;
     const uint8_t* indices = vertices + static_cast<uint64_t>(nv) * 36;
+    uint32_t extra_vertices = 0, extra_triangles = 0;
+    for (uint32_t i = 0; i < extra_polygon_count; ++i) {
+        const CollisionPolygon& face = extra_polygons[i];
+        if (face.module_index != module) continue;
+        if (face.vertex_count < 3 || face.vertex_count > 4)
+            return fail(err, "collision barrier has an invalid face");
+        extra_vertices += face.vertex_count;
+        extra_triangles += face.vertex_count - 2;
+    }
+    if (nv + extra_vertices > 65535)
+        return fail(err, "collision module %u exceeds 65535 vertices with barriers", module);
     if (!nv || nv > 65535) {
+        if (extra_vertices) return fail(err, "collision barrier is assigned to an empty module");
         metric->translation = {0, 0, 0};
         metric->vertex_count = 3;
         metric->triangle_count = 1;
@@ -973,8 +986,9 @@ bool append_module_collision_v3(Buffer* out, const EnvView& env, uint32_t module
         max_tris += env.strips[a.m_uFirstStrip + k].m_uNumberOfTriangles;
     if (max_tris > 0xffffffffull)
         return fail(err, "Env module %u has too many collision triangles", module);
-    CollTri* tris = arena_array<CollTri>(scratch, max_tris ? max_tris : 1, err, false);
-    if (!tris)
+    CollTri* tris = arena_array<CollTri>(scratch, max_tris + extra_triangles ? max_tris + extra_triangles : 1, err, false);
+    Asura_Vector_3* added_vertices = arena_array<Asura_Vector_3>(scratch, extra_vertices ? extra_vertices : 1, err, false);
+    if (!tris || !added_vertices)
         return false;
     uint32_t nt = 0;
     for (uint32_t k = 0; k < a.m_uNumberOfStrips; ++k) {
@@ -1021,6 +1035,23 @@ bool append_module_collision_v3(Buffer* out, const EnvView& env, uint32_t module
             tris[nt++] = {x, y, z, static_cast<uint16_t>(flags), static_cast<uint16_t>(m)};
         }
     }
+    uint32_t added = 0;
+    for (uint32_t i = 0; i < extra_polygon_count; ++i) {
+        const CollisionPolygon& face = extra_polygons[i];
+        if (face.module_index != module) continue;
+        const uint16_t base = static_cast<uint16_t>(nv + added);
+        for (uint32_t corner = 0; corner < face.vertex_count; ++corner) {
+            const Asura_Vector_3 point = face.vertices[corner];
+            if (!isfinite(point.x) || !isfinite(point.y) || !isfinite(point.z))
+                return fail(err, "collision barrier has non-finite coordinates");
+            added_vertices[added++] = point;
+        }
+        tris[nt++] = {base, static_cast<uint16_t>(base + 1), static_cast<uint16_t>(base + 2),
+                      face.flags, face.material};
+        if (face.vertex_count == 4)
+            tris[nt++] = {base, static_cast<uint16_t>(base + 2), static_cast<uint16_t>(base + 3),
+                          face.flags, face.material};
+    }
     if (!nt) {
         metric->translation = {0, 0, 0};
         metric->vertex_count = 3;
@@ -1041,6 +1072,11 @@ bool append_module_collision_v3(Buffer* out, const EnvView& env, uint32_t module
         mx.y = fmax(mx.y, p.y);
         mx.z = fmax(mx.z, p.z);
     }
+    for (uint32_t i = 0; i < added; ++i) {
+        const Asura_Vector_3 p = added_vertices[i];
+        mn.x = fmin(mn.x, p.x); mn.y = fmin(mn.y, p.y); mn.z = fmin(mn.z, p.z);
+        mx.x = fmax(mx.x, p.x); mx.y = fmax(mx.y, p.y); mx.z = fmax(mx.z, p.z);
+    }
     Asura_Vector_3 c{(mn.x + mx.x) * .5f, (mn.y + mx.y) * .5f, (mn.z + mx.z) * .5f};
     // EMOD bounds also seed the target's camera/module query (0x4125B0).
     // Keep headroom above flat geometry; the game's up direction is negative Y.
@@ -1049,7 +1085,7 @@ bool append_module_collision_v3(Buffer* out, const EnvView& env, uint32_t module
     const float rx = bounds[1] - bounds[0], ry = bounds[3] - bounds[2], rz = bounds[5] - bounds[4];
     const float radius = .5f * sqrt(rx * rx + ry * ry + rz * rz);
     metric->translation = c;
-    metric->vertex_count = nv;
+    metric->vertex_count = nv + added;
     metric->triangle_count = nt;
     const uint16_t overall_flags = 0;
     bool has_polygon_flags = false;
@@ -1059,7 +1095,7 @@ bool append_module_collision_v3(Buffer* out, const EnvView& env, uint32_t module
             break;
         }
     append_u32(out, 3, err);
-    append_u32(out, nv, err);
+    append_u32(out, nv + added, err);
     append_u32(out, nt, err);
     append_u32(out, has_polygon_flags ? 1 : 0, err);
     append_u32(out, 1, err);
@@ -1072,6 +1108,11 @@ bool append_module_collision_v3(Buffer* out, const EnvView& env, uint32_t module
         append_f32(out, read_f32(q) - c.x, err);
         append_f32(out, read_f32(q + 4) - c.y, err);
         append_f32(out, read_f32(q + 8) - c.z, err);
+    }
+    for (uint32_t i = 0; i < added; ++i) {
+        append_f32(out, added_vertices[i].x - c.x, err);
+        append_f32(out, added_vertices[i].y - c.y, err);
+        append_f32(out, added_vertices[i].z - c.z, err);
     }
     for (uint32_t i = 0; i < nt; ++i) {
         append_u16(out, tris[i].a, err);
@@ -1089,7 +1130,8 @@ bool append_module_collision_v3(Buffer* out, const EnvView& env, uint32_t module
 }
 
 bool append_emod(Buffer* out, const EnvView& env, uint32_t modules, const Config& cfg,
-                 const MaterialMap& materials, Arena* scratch, ModuleMetric* metrics, Error* err) {
+                 const MaterialMap& materials, const CollisionPolygon* extra_polygons,
+                 uint32_t extra_polygon_count, Arena* scratch, ModuleMetric* metrics, Error* err) {
     ChunkMark ch = begin_chunk(out, ASURA_CHUNK_ENVIRONMENT_MODULELIST, 6, 0, err);
     append_u32(out, modules, err);
     append_u32(out, 0, err); // empty padded environment name
@@ -1101,7 +1143,8 @@ bool append_emod(Buffer* out, const EnvView& env, uint32_t modules, const Config
         const uint64_t module_data_at = out->size;
         buffer_append(out, &module_data, sizeof(module_data), err);
         const uint64_t blob_at = out->size;
-        if (!append_module_collision_v3(out, env, i, cfg, materials, scratch, &metrics[i], err))
+        if (!append_module_collision_v3(out, env, i, cfg, materials, extra_polygons,
+                                        extra_polygon_count, scratch, &metrics[i], err))
             return false;
         patch_u32(out, module_data_at + offsetof(Asura_Chunk_Environment_ModuleList_EntryV6, m_uCollisionDataSize),
                   static_cast<uint32_t>(out->size - blob_at), err);
@@ -1267,11 +1310,11 @@ bool append_file_rscf(Buffer* out, Str name, uint32_t type, uint32_t subtype,
 bool append_textures(Buffer* out, const Config& cfg, const EnvView& env, const MaterialMap& map, Arena* arena,
                      Arena* scratch, TextureSet* set, Error* err) {
     memset(set, 0, sizeof(*set));
-    if (!cfg.texture_dir)
+    if (!cfg.texture_dir && !cfg.min_material_count)
         return true;
-    if (!dir_exists(cfg.texture_dir))
+    if (cfg.texture_dir && !dir_exists(cfg.texture_dir))
         return fail(err, "texture directory not found: %s", cfg.texture_dir);
-    if (!list_files(cfg.texture_dir, arena, &set->files, err))
+    if (cfg.texture_dir && !list_files(cfg.texture_dir, arena, &set->files, err))
         return false;
     uint32_t write = 0;
     for (uint32_t i = 0; i < set->files.count; ++i) {
@@ -1326,9 +1369,10 @@ bool append_textures(Buffer* out, const Config& cfg, const EnvView& env, const M
         max_ord = ord > max_ord ? ord : max_ord;
         any = true;
     }
-    if (!any)
+    if (!any && !cfg.min_material_count)
         return true;
-    const uint32_t count = max_ord + 1;
+    const uint32_t rendered_count = any ? max_ord + 1 : 0u;
+    const uint32_t count = rendered_count > cfg.min_material_count ? rendered_count : cfg.min_material_count;
     int32_t* tex = arena_array<int32_t>(arena, count, err, false);
     uint32_t* flags = arena_array<uint32_t>(arena, count, err);
     uint32_t* surface = arena_array<uint32_t>(arena, count, err, false);

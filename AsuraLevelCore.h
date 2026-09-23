@@ -74,6 +74,7 @@ struct Config {
     uint32_t diffuse_abgr;
     uint32_t max_prim_count;
     uint32_t max_collision_polys;
+    uint32_t min_material_count = 0;
     float auto_block_xz_cell;
     const char* material_map;
     const char* texture_dir;
@@ -138,6 +139,14 @@ struct EnvView {
 struct ModuleMetric {
     Asura_Vector_3 translation;
     uint32_t vertex_count, triangle_count, link_count;
+};
+
+struct CollisionPolygon {
+    Asura_Vector_3 vertices[4]{}; // Absolute PC coordinates.
+    uint32_t vertex_count = 0;
+    uint16_t material = 0;
+    uint16_t flags = 0;
+    uint32_t module_index = 0;
 };
 
 struct DiskFile {
@@ -210,7 +219,8 @@ bool append_textures(Buffer* out, const Config& config, const EnvView& env, cons
 bool append_sound_resources(Buffer* out, const Sounds& sounds, Arena* scratch, Error* err);
 bool append_phon(Buffer* out, const Sounds& sounds, Error* err);
 bool append_emod(Buffer* out, const EnvView& env, uint32_t modules, const Config& config,
-                 const MaterialMap& materials, Arena* scratch, ModuleMetric* metrics, Error* err);
+                 const MaterialMap& materials, const CollisionPolygon* extra_polygons,
+                 uint32_t extra_polygon_count, Arena* scratch, ModuleMetric* metrics, Error* err);
 bool append_mlin(Buffer* out, ModuleMetric* metrics, uint32_t module_count, Error* err);
 bool append_mrvb(Buffer* out, uint32_t module_count, Error* err);
 bool append_nav1(Buffer* out, uint32_t module_count, Error* err);

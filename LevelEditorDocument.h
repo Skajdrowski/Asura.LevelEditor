@@ -22,7 +22,15 @@ enum class EntityKind : uint32_t {
     StaticObject,
     BuildingVolume,
     SoundRegion,
+    CollisionBarrier,
 };
+
+using CollisionBarrierFace = asura::level::CollisionPolygon;
+
+inline bool legacy_collision_barrier_face(uint32_t material, uint16_t flags) {
+    return ((flags & 0x300u) == 0x300u && !(flags & 0x20u)) ||
+           (material == 8 && flags == 0x200);
+}
 
 struct Entity {
     EntityKind kind = EntityKind::SpawnPoint;
@@ -65,6 +73,8 @@ struct Entity {
     bool source_entity_record = false;
     uint16_t source_entity_classification = 0;
     Asura_Bounding_Box source_bounds{};
+    // Empty for an authored box; imported barriers retain their exact faces.
+    std::vector<CollisionBarrierFace> collision_faces;
     // Physical-object ENTI payload used both to resolve its embedded model and
     // as a byte-exact template when the editor creates another pickup.
     bool pickup_has_template = false;
@@ -157,6 +167,8 @@ struct Document {
     // Legacy project import metadata. Export always uses the current entities.
     bool source_pickup_inventory_complete = false;
     bool source_static_object_inventory_complete = false;
+    bool source_collision_inventory_complete = false;
+    bool source_collision_inventory_legacy = false; // Version 19 projects need only newly recognized faces.
     bool dirty = false;
 };
 

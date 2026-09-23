@@ -2372,6 +2372,7 @@ DirectX::XMFLOAT4 gpu_overlay_entity_color(EntityKind kind, bool selected) {
     case EntityKind::PositionMarker: return {.75f, .35f, 1, 1};
     case EntityKind::BuildingVolume: return {.15f, .88f, 1, 1};
     case EntityKind::SoundRegion: return {.78f, .53f, 1, 1};
+    case EntityKind::CollisionBarrier: return {.784f, .063f, .180f, 1};
     default: return {1, .45f, .25f, 1};
     }
 }
@@ -2827,9 +2828,13 @@ void gpu_render() {
                     continue;
                 const Entity& entity = g.document.entities[i];
                 const DirectX::XMFLOAT4 color = gpu_overlay_entity_color(entity.kind, selected);
-                if (entity.kind == EntityKind::BuildingVolume) {
+                if (entity.kind == EntityKind::BuildingVolume ||
+                    entity.kind == EntityKind::CollisionBarrier) {
                     entity_gizmo.clear();
-                    append_oriented_bounds_gizmo(entity, &entity_gizmo);
+                    if (entity.kind == EntityKind::CollisionBarrier)
+                        append_collision_barrier_gizmo(entity, &entity_gizmo);
+                    else
+                        append_oriented_bounds_gizmo(entity, &entity_gizmo);
                     append_gpu_gizmo(&overlay, entity_gizmo, color);
                     continue;
                 }

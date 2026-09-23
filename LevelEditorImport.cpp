@@ -1939,6 +1939,90 @@ bool source_ambience_info(const ChunkRef& chunk, Document* document, Error* err)
     return true;
 }
 
+bool import_pc_collision_barriers(const ChunkList& chunks, Document* document, Error* err) {
+    std::vector<PcEnvironmentMaterialBinding> materials;
+    std::vector<uint32_t> material_flags;
+    std::vector<PcCollisionPolygon> polygons;
+    if (!pc_environment_material_bindings(chunks, &materials, err) ||
+        !pc_environment_collision_flags(chunks, static_cast<uint32_t>(materials.size()),
+                                        &material_flags, err, &polygons))
+        return false;
+
+    // The 0x200 bit marks collision-only barriers across stock materials.
+    std::vector<size_t> candidates;
+    for (size_t i = 0; i < polygons.size(); ++i)
+        if ((polygons[i].flags & 0x200u) && polygons[i].vertex_count >= 3 && polygons[i].vertex_count <= 4)
+            candidates.push_back(i);
+    if (candidates.size() > 10000)
+        return fail(err, "the PC has too many collision-only barrier faces");
+
+    std::vector<uint8_t> assigned(candidates.size());
+    const auto shares_edge = [](const PcCollisionPolygon& a, const PcCollisionPolygon& b) {
+        uint32_t shared = 0;
+        for (uint32_t i = 0; i < a.vertex_count; ++i)
+            for (uint32_t j = 0; j < b.vertex_count; ++j) {
+                const auto& x = a.vertices[i];
+                const auto& y = b.vertices[j];
+                if (fabsf(x.x - y.x) < .02f && fabsf(x.y - y.y) < .02f &&
+                    fabsf(x.z - y.z) < .02f) {
+                    ++shared;
+                    break;
+                }
+            }
+        return shared >= 2;
+    };
+    for (size_t seed = 0; seed < candidates.size(); ++seed) {
+        if (assigned[seed]) continue;
+        assigned[seed] = 1;
+        std::vector<size_t> component{seed};
+        for (size_t head = 0; head < component.size(); ++head) {
+            const auto& first = polygons[candidates[component[head]]];
+            for (size_t next = 0; next < candidates.size(); ++next) {
+                if (assigned[next]) continue;
+                const auto& other = polygons[candidates[next]];
+                if (first.module_index == other.module_index && first.material == other.material &&
+                    legacy_collision_barrier_face(first.material, first.flags) ==
+                        legacy_collision_barrier_face(other.material, other.flags) &&
+                    shares_edge(first, other)) {
+                    assigned[next] = 1;
+                    component.push_back(next);
+                }
+            }
+        }
+        Entity barrier;
+        barrier.kind = EntityKind::CollisionBarrier;
+        barrier.source_entity_record = true;
+        barrier.guid = allocate_editor_guid(document);
+        if (!barrier.guid) return fail(err, "no GUID is available for an imported collision barrier");
+        barrier.name = "Collision barrier " + std::to_string(document->entities.size() + 1);
+        barrier.source_bounds = {FLT_MAX, -FLT_MAX, FLT_MAX, -FLT_MAX, FLT_MAX, -FLT_MAX};
+        for (size_t member : component) {
+            const auto& polygon = polygons[candidates[member]];
+            CollisionBarrierFace face;
+            face.vertex_count = polygon.vertex_count;
+            face.material = static_cast<uint16_t>(polygon.material);
+            face.flags = polygon.flags;
+            face.module_index = polygon.module_index;
+            for (uint32_t corner = 0; corner < face.vertex_count; ++corner) {
+                const auto& vertex = polygon.vertices[corner];
+                face.vertices[corner] = vertex;
+                barrier.source_bounds.MinX = std::min(barrier.source_bounds.MinX, vertex.x);
+                barrier.source_bounds.MaxX = std::max(barrier.source_bounds.MaxX, vertex.x);
+                barrier.source_bounds.MinY = std::min(barrier.source_bounds.MinY, vertex.y);
+                barrier.source_bounds.MaxY = std::max(barrier.source_bounds.MaxY, vertex.y);
+                barrier.source_bounds.MinZ = std::min(barrier.source_bounds.MinZ, vertex.z);
+                barrier.source_bounds.MaxZ = std::max(barrier.source_bounds.MaxZ, vertex.z);
+            }
+            barrier.collision_faces.push_back(face);
+        }
+        barrier.position = {(barrier.source_bounds.MinX + barrier.source_bounds.MaxX) * .5f,
+                            (barrier.source_bounds.MinY + barrier.source_bounds.MaxY) * .5f,
+                            (barrier.source_bounds.MinZ + barrier.source_bounds.MaxZ) * .5f};
+        document->entities.push_back(std::move(barrier));
+    }
+    return true;
+}
+
 bool load_pc_level(const std::string& path, Document* document, Mesh* mesh, std::string* why,
                    std::vector<PickupModel>* pickup_models,
                    std::vector<StaticObjectModel>* object_models) {
@@ -1974,7 +2058,8 @@ bool load_pc_level(const std::string& path, Document* document, Mesh* mesh, std:
         ok = fail(&err, "the .PC contains no PC environment RSCF");
     if (ok)
         ok = decode_pc_environment(environment, &next_mesh, &arena, &err) &&
-             import_pc_entities(chunks, &next_document, &err);
+             import_pc_entities(chunks, &next_document, &err) &&
+             import_pc_collision_barriers(chunks, &next_document, &err);
     if (ok)
         import_sound_triggers(chunks, &next_document);
     if (ok)
@@ -1988,6 +2073,7 @@ bool load_pc_level(const std::string& path, Document* document, Mesh* mesh, std:
     if (ok && object_models)
         ok = decode_pc_static_object_models(chunks, next_document, &next_object_models, &err);
     if (ok) {
+        next_document.source_collision_inventory_complete = true;
         next_document.source_pc_path = path;
         next_document.output_path = edited_pc_path(path);
         next_document.dirty = false;

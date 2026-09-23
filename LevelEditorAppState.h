@@ -109,6 +109,7 @@ void append_light_gizmo_line(std::vector<LightGizmoLine>* lines, Asura_Vector_3 
 void append_camera_spawn_arrow(const Entity& entity, float marker,
                                std::vector<LightGizmoLine>* lines);
 void append_sound_gizmo(const Entity& entity, std::vector<LightGizmoLine>* lines);
+void append_collision_barrier_gizmo(const Entity& entity, std::vector<LightGizmoLine>* lines);
 void append_light_gizmo(const Entity& entity, std::vector<LightGizmoLine>* lines);
 void camera_axes(Asura_Vector_3* position, Asura_Vector_3* right, Asura_Vector_3* up,
                  Asura_Vector_3* forward);

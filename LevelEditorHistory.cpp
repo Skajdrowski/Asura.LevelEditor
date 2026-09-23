@@ -55,6 +55,15 @@ bool equal(const Asura_Chunk_Phonons_PhononDataV9& a,
 }
 
 bool equal(const Entity& a, const Entity& b) {
+    if (a.collision_faces.size() != b.collision_faces.size()) return false;
+    for (size_t i = 0; i < a.collision_faces.size(); ++i) {
+        const auto& x = a.collision_faces[i];
+        const auto& y = b.collision_faces[i];
+        if (x.vertex_count != y.vertex_count || x.material != y.material ||
+            x.flags != y.flags || x.module_index != y.module_index) return false;
+        for (uint32_t corner = 0; corner < x.vertex_count; ++corner)
+            if (!equal(x.vertices[corner], y.vertices[corner])) return false;
+    }
     return a.kind == b.kind && a.name == b.name && equal(a.position, b.position) &&
            equal(a.rotation, b.rotation) && a.guid == b.guid && equal(a.value_a, b.value_a) &&
            equal(a.value_b, b.value_b) && a.value_u32_a == b.value_u32_a &&
@@ -174,14 +183,16 @@ bool equal_document_content(const Document& a, const Document& b) {
            a.ambient_source_record == b.ambient_source_record &&
            a.sound_regions_loaded == b.sound_regions_loaded &&
            a.source_pickup_inventory_complete == b.source_pickup_inventory_complete &&
-           a.source_static_object_inventory_complete == b.source_static_object_inventory_complete;
+           a.source_static_object_inventory_complete == b.source_static_object_inventory_complete &&
+           a.source_collision_inventory_complete == b.source_collision_inventory_complete &&
+           a.source_collision_inventory_legacy == b.source_collision_inventory_legacy;
 }
 
 bool authorable(EntityKind kind) {
     return kind == EntityKind::SpawnPoint || kind == EntityKind::Light ||
            kind == EntityKind::Sound || kind == EntityKind::Pickup ||
            kind == EntityKind::StaticObject || kind == EntityKind::BuildingVolume ||
-           kind == EntityKind::SoundRegion;
+           kind == EntityKind::SoundRegion || kind == EntityKind::CollisionBarrier;
 }
 
 void set_error(std::string* error, const char* message) {
@@ -244,6 +255,8 @@ void canonicalize_clone(Entity* entity) {
     entity->source_entity_record = false;
     entity->source_entity_classification = 0;
     entity->source_bounds = {};
+    if (entity->kind == EntityKind::CollisionBarrier)
+        entity->collision_faces.clear();
     switch (entity->kind) {
     case EntityKind::SpawnPoint:
         entity->spawn_source_record = false;
@@ -271,6 +284,12 @@ void canonicalize_clone(Entity* entity) {
         break;
     case EntityKind::BuildingVolume:
         entity->source_entity_classification = SnipeEntityClass_BuildingVolume;
+        entity->source_bounds = {
+            entity->position.x - bounds_size.x * .5f, entity->position.x + bounds_size.x * .5f,
+            entity->position.y - bounds_size.y * .5f, entity->position.y + bounds_size.y * .5f,
+            entity->position.z - bounds_size.z * .5f, entity->position.z + bounds_size.z * .5f};
+        break;
+    case EntityKind::CollisionBarrier:
         entity->source_bounds = {
             entity->position.x - bounds_size.x * .5f, entity->position.x + bounds_size.x * .5f,
             entity->position.y - bounds_size.y * .5f, entity->position.y + bounds_size.y * .5f,
