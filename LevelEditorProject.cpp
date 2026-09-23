@@ -4,7 +4,6 @@
 
 #include <cmath>
 #include <cstring>
-#include <fstream>
 #include <utility>
 #include <vector>
 
@@ -13,8 +12,7 @@ using namespace asura;
 namespace editor {
 namespace {
 
-constexpr char kProjectMagic[8] = {'A', 'L', 'E', 'V', '2', '0', '0', '5'};
-constexpr uint32_t kProjectVersion = 20;
+constexpr char kProjectMagic[8] = {'A', 'L', 'E', 'V', 'F', 'I', 'L', 'E'};
 
 struct BinaryWriter {
     std::vector<uint8_t> bytes;
@@ -181,28 +179,6 @@ Asura_Chunk_Phonons_PhononDataV9 read_phonon(BinaryReader& reader) {
     return phonon;
 }
 
-void skip_legacy_project_records(BinaryReader& reader) {
-    const uint32_t count = reader.u32();
-    if (count > 4096) {
-        reader.ok = false;
-        return;
-    }
-    for (uint32_t index = 0; index < count && reader.ok; ++index) {
-        reader.str();
-        reader.str();
-        reader.u32();
-        reader.u32();
-        reader.u32();
-        reader.u32();
-        const uint32_t size = reader.u32();
-        if (!reader.ok || size > 32 * MiB || size > reader.size - reader.at) {
-            reader.ok = false;
-            return;
-        }
-        reader.at += size;
-    }
-}
-
 } // namespace
 
 Asura_Light legacy_editor_light(const Entity& entity) {
@@ -225,7 +201,6 @@ Asura_Light legacy_editor_light(const Entity& entity) {
 bool save_project(const Document& document, const char* path, std::string* why) {
     BinaryWriter writer;
     writer.raw(kProjectMagic, sizeof(kProjectMagic));
-    writer.u32(kProjectVersion);
     writer.str(document.obj_path);
     writer.str(document.source_pc_path);
     writer.str(document.output_path);
@@ -257,10 +232,10 @@ bool save_project(const Document& document, const char* path, std::string* why) 
     writer.f32(document.skybox.orientation_radians);
     for (const std::string& texture_path : document.skybox.texture_paths)
         writer.str(texture_path);
-    writer.u32(1u); // Cloud toggle v11+
+    writer.u32(1u); // Cloud toggle retained for the target SKYB representation.
     writer.u32(document.skybox.back_texture_is_front_upside_down ? 1u : 0u);
     writer.u32(document.skybox.right_texture_is_left_upside_down ? 1u : 0u);
-    writer.u32(7u); // Skybox version v11+
+    writer.u32(7u); // Source SKYB chunk version.
     writer.u32(document.rain_enabled ? 1u : 0u);
     writer.u32(document.weather_source_record ? 1u : 0u);
     writer.str(document.ambient_stream_path);
@@ -405,168 +380,147 @@ bool save_project(const Document& document, const char* path, std::string* why) 
 }
 
 bool load_project(Document* document, const char* path, std::string* why) {
-    std::ifstream file(path, std::ios::binary | std::ios::ate);
-    if (!file) {
+    MappedFile file{};
+    Error map_error{};
+    if (!map_file(path, &file, &map_error)) {
         if (why)
             *why = "Could not open the editor project.";
         return false;
     }
-    const std::streamoff end = file.tellg();
-    if (end < 12 || end > static_cast<std::streamoff>(512 * MiB)) {
+    if (file.size < sizeof(kProjectMagic) || file.size > 512 * MiB) {
+        unmap_file(&file);
         if (why)
             *why = "The editor project has an invalid size.";
         return false;
     }
-    std::vector<uint8_t> bytes(static_cast<size_t>(end));
-    file.seekg(0);
-    file.read(reinterpret_cast<char*>(bytes.data()), end);
-    BinaryReader reader{bytes.data(), bytes.size()};
+    BinaryReader reader{file.data, static_cast<size_t>(file.size)};
     char magic[8]{};
     reader.raw(magic, sizeof(magic));
-    const uint32_t project_version = reader.u32();
-    if (memcmp(magic, kProjectMagic, sizeof(magic)) != 0 || project_version < 1 ||
-        project_version > kProjectVersion) {
+    if (memcmp(magic, kProjectMagic, sizeof(magic)) != 0) {
+        unmap_file(&file);
         if (why)
             *why = "This is not a supported Asura Level Editor project.";
         return false;
     }
 
     Document next;
-    next.source_collision_inventory_complete = project_version >= 20;
-    next.source_collision_inventory_legacy = project_version == 19;
-    next.sound_regions_loaded = project_version >= 16;
+    next.source_collision_inventory_complete = true;
+    next.source_collision_inventory_legacy = false;
+    next.sound_regions_loaded = true;
     next.project_path = path;
     next.obj_path = reader.str();
-    if (project_version >= 7)
-        next.source_pc_path = reader.str();
+    next.source_pc_path = reader.str();
     next.output_path = reader.str();
     next.material_map = reader.str();
     next.texture_dir = reader.str();
-    if (project_version >= 4)
-        next.weapons_donor = reader.str();
-    if (project_version >= 6)
-        next.sky_texture_dir = reader.str();
+    next.weapons_donor = reader.str();
+    next.sky_texture_dir = reader.str();
     next.next_guid = reader.u32();
-    if (project_version >= 7) {
-        next.light_header_a = read_vec3(reader);
-        next.light_header_b = read_vec3(reader);
-        next.light_header_c = read_vec3(reader);
-        next.light_header_flag = reader.u32();
-        if (project_version >= 9) {
-            next.source_pickup_inventory_complete = reader.u32() != 0;
-            const uint32_t pickup_template_count = reader.u32();
-            if (pickup_template_count > 256)
-                reader.ok = false;
-            next.pickup_templates.reserve(reader.ok ? pickup_template_count : 0);
-            for (uint32_t index = 0; index < pickup_template_count && reader.ok; ++index) {
-                PickupTemplate pickup;
-                pickup.item_id = reader.u32();
-                pickup.health = reader.f32();
-                pickup.file_id = reader.u32();
-                pickup.skin_id = reader.u32();
-                pickup.anim_id = reader.u32();
-                pickup.anim_file_id = reader.u32();
-                pickup.entity_padding = static_cast<uint16_t>(reader.u32());
-                reader.raw(pickup.body.data(), pickup.body.size());
-                next.pickup_templates.push_back(std::move(pickup));
-            }
-        }
-        if (project_version >= 10) {
-            next.skybox.source_record = reader.u32() != 0;
-            next.skybox.red = reader.f32();
-            next.skybox.green = reader.f32();
-            next.skybox.blue = reader.f32();
-            next.skybox.orientation_radians = reader.f32();
-            for (std::string& texture_path : next.skybox.texture_paths)
-                texture_path = reader.str();
-            next.skybox.draw_clouds = reader.u32() != 0;
-            next.skybox.back_texture_is_front_upside_down = reader.u32() != 0;
-            next.skybox.right_texture_is_left_upside_down = reader.u32() != 0;
-            if (project_version >= 11) {
-                const uint32_t source_skybox_version = reader.u32();
-                next.rain_enabled = reader.u32() != 0;
-                next.weather_source_record = reader.u32() != 0;
-                if (source_skybox_version < 6 || source_skybox_version > 7)
-                    reader.ok = false;
-                if (project_version >= 12) {
-                    next.ambient_stream_path = reader.str();
-                    next.ambient_volume = reader.f32();
-                    next.ambient_source_record = reader.u32() != 0;
-                    if (next.ambient_stream_path.size() > 4096 ||
-                        next.ambient_stream_path.find('\0') != std::string::npos ||
-                        !std::isfinite(next.ambient_volume) || next.ambient_volume < 0.0f ||
-                        next.ambient_volume > 1.0f)
-                        reader.ok = false;
-                }
-            }
-        }
-        if (project_version >= 13) {
-            next.source_static_object_inventory_complete = reader.u32() != 0;
-            const uint32_t donor_count = reader.u32();
-            if (donor_count > 256)
-                reader.ok = false;
-            next.object_donors.reserve(reader.ok ? donor_count : 0);
-            for (uint32_t index = 0; index < donor_count && reader.ok; ++index)
-                next.object_donors.push_back(reader.str());
-            const uint32_t object_template_count = reader.u32();
-            if (object_template_count > 100000)
-                reader.ok = false;
-            next.static_object_templates.reserve(reader.ok ? object_template_count : 0);
-            for (uint32_t index = 0; index < object_template_count && reader.ok; ++index) {
-                StaticObjectTemplate object;
-                object.file_id = reader.u32();
-                object.resource_name = reader.str();
-                object.donor_path = reader.str();
-                object.entity_padding = static_cast<uint16_t>(reader.u32());
-                reader.raw(object.body.data(), object.body.size());
-                if (project_version >= 18) {
-                    object.properties.fields = reader.u32();
-                    object.properties.surface_type = reader.u32();
-                    object.properties.blending_flags = reader.u32();
-                    const uint32_t collision = reader.u32();
-                    if (object.properties.fields > 7 || object.properties.surface_type > 255 || collision > 0xffff)
-                        reader.ok = false;
-                    object.properties.collision_flags = static_cast<uint16_t>(collision);
-                }
-                if (project_version >= 17 && reader.u32()) {
-                    auto asset = std::make_shared<ImportedStaticObject>();
-                    asset->mesh.resource_name = object.resource_name;
-                    asset->mesh.materials.resize(1);
-                    auto& material = asset->mesh.materials.front();
-                    const uint32_t collision = reader.u32();
-                    if (collision > 0xffff || !object.file_id) reader.ok = false;
-                    asset->collision_flags = static_cast<uint16_t>(collision);
-                    material.surface_type = reader.u32();
-                    material.flags = reader.u32();
-                    material.texture_flags = 8;
-                    material.texture_name = reader.str();
-                    const uint32_t texture_size = reader.u32();
-                    if (texture_size > 64 * MiB || texture_size > reader.size - reader.at) reader.ok = false;
-                    if (reader.ok) {
-                        material.texture_bytes.resize(texture_size);
-                        reader.raw(material.texture_bytes.data(), texture_size);
-                    }
-                    const uint32_t vertex_count = reader.u32();
-                    if (vertex_count > 65535 || vertex_count > (reader.size - reader.at) / 32) reader.ok = false;
-                    asset->mesh.vertices.resize(reader.ok ? vertex_count : 0);
-                    for (auto& vertex : asset->mesh.vertices) {
-                        vertex.position = read_vec3(reader);
-                        vertex.normal = read_vec3(reader);
-                        vertex.texcoord = {reader.f32(), reader.f32()};
-                    }
-                    const uint32_t face_count = reader.u32();
-                    if (face_count > 1000000 || face_count > (reader.size - reader.at) / 6) reader.ok = false;
-                    asset->mesh.faces.resize(reader.ok ? face_count : 0);
-                    for (auto& face : asset->mesh.faces) reader.raw(face.data(), 3 * sizeof(uint16_t));
-                    if (reader.ok && !prepare_imported_static_object(asset.get(), why)) reader.ok = false;
-                    object.imported = std::move(asset);
-                }
-                next.static_object_templates.push_back(std::move(object));
-            }
-        }
+    next.light_header_a = read_vec3(reader);
+    next.light_header_b = read_vec3(reader);
+    next.light_header_c = read_vec3(reader);
+    next.light_header_flag = reader.u32();
+    next.source_pickup_inventory_complete = reader.u32() != 0;
+    const uint32_t pickup_template_count = reader.u32();
+    if (pickup_template_count > 256)
+        reader.ok = false;
+    next.pickup_templates.reserve(reader.ok ? pickup_template_count : 0);
+    for (uint32_t index = 0; index < pickup_template_count && reader.ok; ++index) {
+        PickupTemplate pickup;
+        pickup.item_id = reader.u32();
+        pickup.health = reader.f32();
+        pickup.file_id = reader.u32();
+        pickup.skin_id = reader.u32();
+        pickup.anim_id = reader.u32();
+        pickup.anim_file_id = reader.u32();
+        pickup.entity_padding = static_cast<uint16_t>(reader.u32());
+        reader.raw(pickup.body.data(), pickup.body.size());
+        next.pickup_templates.push_back(std::move(pickup));
     }
-    if (project_version <= 4)
-        skip_legacy_project_records(reader);
+    next.skybox.source_record = reader.u32() != 0;
+    next.skybox.red = reader.f32();
+    next.skybox.green = reader.f32();
+    next.skybox.blue = reader.f32();
+    next.skybox.orientation_radians = reader.f32();
+    for (std::string& texture_path : next.skybox.texture_paths)
+        texture_path = reader.str();
+    next.skybox.draw_clouds = reader.u32() != 0;
+    next.skybox.back_texture_is_front_upside_down = reader.u32() != 0;
+    next.skybox.right_texture_is_left_upside_down = reader.u32() != 0;
+    const uint32_t source_skybox_version = reader.u32();
+    next.rain_enabled = reader.u32() != 0;
+    next.weather_source_record = reader.u32() != 0;
+    if (source_skybox_version < 6 || source_skybox_version > 7)
+        reader.ok = false;
+    next.ambient_stream_path = reader.str();
+    next.ambient_volume = reader.f32();
+    next.ambient_source_record = reader.u32() != 0;
+    if (next.ambient_stream_path.size() > 4096 ||
+        next.ambient_stream_path.find('\0') != std::string::npos ||
+        !std::isfinite(next.ambient_volume) || next.ambient_volume < 0.0f ||
+        next.ambient_volume > 1.0f)
+        reader.ok = false;
+
+    next.source_static_object_inventory_complete = reader.u32() != 0;
+    const uint32_t donor_count = reader.u32();
+    if (donor_count > 256)
+        reader.ok = false;
+    next.object_donors.reserve(reader.ok ? donor_count : 0);
+    for (uint32_t index = 0; index < donor_count && reader.ok; ++index)
+        next.object_donors.push_back(reader.str());
+    const uint32_t object_template_count = reader.u32();
+    if (object_template_count > 100000)
+        reader.ok = false;
+    next.static_object_templates.reserve(reader.ok ? object_template_count : 0);
+    for (uint32_t index = 0; index < object_template_count && reader.ok; ++index) {
+        StaticObjectTemplate object;
+        object.file_id = reader.u32();
+        object.resource_name = reader.str();
+        object.donor_path = reader.str();
+        object.entity_padding = static_cast<uint16_t>(reader.u32());
+        reader.raw(object.body.data(), object.body.size());
+        object.properties.fields = reader.u32();
+        object.properties.surface_type = reader.u32();
+        object.properties.blending_flags = reader.u32();
+        const uint32_t collision = reader.u32();
+        if (object.properties.fields > 7 || object.properties.surface_type > 255 || collision > 0xffff)
+            reader.ok = false;
+        object.properties.collision_flags = static_cast<uint16_t>(collision);
+        if (reader.u32()) {
+            auto asset = std::make_shared<ImportedStaticObject>();
+            asset->mesh.resource_name = object.resource_name;
+            asset->mesh.materials.resize(1);
+            auto& material = asset->mesh.materials.front();
+            const uint32_t asset_collision = reader.u32();
+            if (asset_collision > 0xffff || !object.file_id) reader.ok = false;
+            asset->collision_flags = static_cast<uint16_t>(asset_collision);
+            material.surface_type = reader.u32();
+            material.flags = reader.u32();
+            material.texture_flags = 8;
+            material.texture_name = reader.str();
+            const uint32_t texture_size = reader.u32();
+            if (texture_size > 64 * MiB || texture_size > reader.size - reader.at) reader.ok = false;
+            if (reader.ok) {
+                material.texture_bytes.resize(texture_size);
+                reader.raw(material.texture_bytes.data(), texture_size);
+            }
+            const uint32_t vertex_count = reader.u32();
+            if (vertex_count > 65535 || vertex_count > (reader.size - reader.at) / 32) reader.ok = false;
+            asset->mesh.vertices.resize(reader.ok ? vertex_count : 0);
+            for (auto& vertex : asset->mesh.vertices) {
+                vertex.position = read_vec3(reader);
+                vertex.normal = read_vec3(reader);
+                vertex.texcoord = {reader.f32(), reader.f32()};
+            }
+            const uint32_t face_count = reader.u32();
+            if (face_count > 1000000 || face_count > (reader.size - reader.at) / 6) reader.ok = false;
+            asset->mesh.faces.resize(reader.ok ? face_count : 0);
+            for (auto& face : asset->mesh.faces) reader.raw(face.data(), 3 * sizeof(uint16_t));
+            if (reader.ok && !prepare_imported_static_object(asset.get(), why)) reader.ok = false;
+            object.imported = std::move(asset);
+        }
+        next.static_object_templates.push_back(std::move(object));
+    }
 
     const uint32_t entity_count = reader.u32();
     if (entity_count > 100000)
@@ -576,40 +530,14 @@ bool load_project(Document* document, const char* path, std::string* why) {
     for (uint32_t index = 0; index < entity_count && reader.ok; ++index) {
         Entity entity;
         const uint32_t kind = reader.u32();
-        const uint32_t maximum_kind = project_version <= 4
-                                          ? 3u
-                                          : project_version <= 7
-                                                ? static_cast<uint32_t>(EntityKind::Sound)
-                                                : project_version <= 12
-                                                      ? static_cast<uint32_t>(EntityKind::PositionMarker)
-                                                      : project_version <= 13
-                                                            ? static_cast<uint32_t>(EntityKind::StaticObject)
-                                                            : project_version <= 15
-                                                                  ? static_cast<uint32_t>(EntityKind::BuildingVolume)
-                                                                  : project_version <= 18
-                                                                        ? static_cast<uint32_t>(EntityKind::SoundRegion)
-                                                                        : static_cast<uint32_t>(EntityKind::CollisionBarrier);
-        if (kind > maximum_kind)
+        if (kind > static_cast<uint32_t>(EntityKind::CollisionBarrier))
             reader.ok = false;
-        const bool supported = kind <= (project_version <= 7
-                                             ? static_cast<uint32_t>(EntityKind::Sound)
-                                             : project_version <= 12
-                                                   ? static_cast<uint32_t>(EntityKind::PositionMarker)
-                                                   : project_version <= 13
-                                                         ? static_cast<uint32_t>(EntityKind::StaticObject)
-                                                         : project_version <= 15
-                                                               ? static_cast<uint32_t>(EntityKind::BuildingVolume)
-                                                         : project_version <= 18
-                                                               ? static_cast<uint32_t>(EntityKind::SoundRegion)
-                                                               : static_cast<uint32_t>(EntityKind::CollisionBarrier));
-        if (supported)
+        if (reader.ok)
             entity.kind = static_cast<EntityKind>(kind);
         entity.name = reader.str();
         entity.position = read_vec3(reader);
         entity.rotation = read_vec3(reader);
         entity.guid = reader.u32();
-        if (project_version <= 4)
-            reader.u32();
         entity.value_a = reader.f32();
         entity.value_b = reader.f32();
         entity.value_u32_a = reader.u32();
@@ -617,10 +545,10 @@ bool load_project(Document* document, const char* path, std::string* why) {
         entity.sound_name = reader.str();
         entity.sound_file = reader.str();
         if (kind == static_cast<uint32_t>(EntityKind::Sound))
-            entity.sound_loop = project_version >= 3 ? reader.u32() != 0 : true;
+            entity.sound_loop = reader.u32() != 0;
         if (kind == static_cast<uint32_t>(EntityKind::Light))
-            entity.light = project_version >= 2 ? read_light(reader) : legacy_editor_light(entity);
-        if (project_version >= 7 && kind == static_cast<uint32_t>(EntityKind::SpawnPoint)) {
+            entity.light = read_light(reader);
+        if (kind == static_cast<uint32_t>(EntityKind::SpawnPoint)) {
             entity.spawn_source_record = reader.u32() != 0;
             entity.spawn_index = static_cast<int32_t>(reader.u32());
             entity.spawn_posture = static_cast<int32_t>(reader.u32());
@@ -628,25 +556,25 @@ bool load_project(Document* document, const char* path, std::string* why) {
             entity.spawn_direction = read_vec3(reader);
             entity.entity_padding = static_cast<uint16_t>(reader.u32());
         }
-        if (project_version >= 7 && kind == static_cast<uint32_t>(EntityKind::Sound)) {
+        if (kind == static_cast<uint32_t>(EntityKind::Sound)) {
             entity.sound_source_record = reader.u32() != 0;
             entity.sound_has_controller = reader.u32() != 0;
             entity.sound_controller_active = reader.u32() != 0;
             entity.sound_controller_padding = static_cast<uint16_t>(reader.u32());
             entity.sound_phonon = read_phonon(reader);
-            if (project_version >= 15) {
-                entity.sound_trigger_enabled = reader.u32() != 0;
-                entity.sound_trigger_once = reader.u32() != 0;
-                entity.sound_stop_on_exit = reader.u32() != 0;
-                entity.sound_trigger_offset = read_vec3(reader);
-                entity.sound_trigger_size = read_vec3(reader);
-                entity.sound_trigger_source_guid = reader.u32();
-            }
+            entity.sound_trigger_enabled = reader.u32() != 0;
+            entity.sound_trigger_once = reader.u32() != 0;
+            entity.sound_stop_on_exit = reader.u32() != 0;
+            entity.sound_trigger_offset = read_vec3(reader);
+            entity.sound_trigger_size = read_vec3(reader);
+            entity.sound_trigger_source_guid = reader.u32();
         }
-        if (project_version >= 8 &&
-            ((kind >= static_cast<uint32_t>(EntityKind::Pickup) &&
-              kind <= static_cast<uint32_t>(EntityKind::BuildingVolume)) ||
-             (project_version >= 19 && kind == static_cast<uint32_t>(EntityKind::CollisionBarrier)))) {
+        if (kind == static_cast<uint32_t>(EntityKind::Pickup) ||
+            kind == static_cast<uint32_t>(EntityKind::AssassinationTarget) ||
+            kind == static_cast<uint32_t>(EntityKind::PositionMarker) ||
+            kind == static_cast<uint32_t>(EntityKind::StaticObject) ||
+            kind == static_cast<uint32_t>(EntityKind::BuildingVolume) ||
+            kind == static_cast<uint32_t>(EntityKind::CollisionBarrier)) {
             entity.source_entity_record = reader.u32() != 0;
             entity.source_entity_classification = static_cast<uint16_t>(reader.u32());
             entity.source_bounds.MinX = reader.f32();
@@ -656,19 +584,17 @@ bool load_project(Document* document, const char* path, std::string* why) {
             entity.source_bounds.MinZ = reader.f32();
             entity.source_bounds.MaxZ = reader.f32();
         }
-        if (project_version >= 9 && kind == static_cast<uint32_t>(EntityKind::Pickup)) {
+        if (kind == static_cast<uint32_t>(EntityKind::Pickup)) {
             entity.pickup_has_template = reader.u32() != 0;
             entity.pickup_skin_id = reader.u32();
             entity.pickup_anim_id = reader.u32();
             entity.pickup_anim_file_id = reader.u32();
             reader.raw(entity.pickup_body.data(), entity.pickup_body.size());
         }
-        if (project_version >= 13 && kind == static_cast<uint32_t>(EntityKind::StaticObject)) {
+        if (kind == static_cast<uint32_t>(EntityKind::StaticObject)) {
             entity.static_object_has_template = reader.u32() != 0;
             reader.raw(entity.static_object_body.data(), entity.static_object_body.size());
-            // v13+ already stores these IDs in the physical-object template.
-            // Restore the derived fields as well: leaving them at zero made
-            // the next export turn an animated static object into an empty one.
+            // Restore the derived IDs from the physical-object template too.
             if (reader.ok && entity.static_object_has_template) {
                 Snipe_ServerEntity_StaticObject_ChunkDataV0 body{};
                 memcpy(&body, entity.static_object_body.data(), sizeof(body));
@@ -677,13 +603,13 @@ bool load_project(Document* document, const char* path, std::string* why) {
                 entity.pickup_anim_file_id = body.m_xPhysicalObject.m_uAnimFileID;
             }
         }
-        if (project_version >= 16 && entity.kind == EntityKind::SoundRegion) {
+        if (entity.kind == EntityKind::SoundRegion) {
             reader.raw(&entity.ambience_inner_bounds, sizeof(entity.ambience_inner_bounds));
             reader.raw(&entity.ambience_outer_bounds, sizeof(entity.ambience_outer_bounds));
             Error error{};
             if (!valid_sound_region(entity, &error)) reader.ok = false;
         }
-        if (project_version >= 19 && entity.kind == EntityKind::CollisionBarrier) {
+        if (entity.kind == EntityKind::CollisionBarrier) {
             const uint32_t face_count = reader.u32();
             if (face_count > 10000 || face_count > (reader.size - reader.at) / 28)
                 reader.ok = false;
@@ -709,17 +635,17 @@ bool load_project(Document* document, const char* path, std::string* why) {
                 entity.collision_faces.push_back(face);
             }
         }
-        if (supported)
+        if (reader.ok)
             next.entities.push_back(std::move(entity));
-        else
-            skipped_legacy_entities = true;
     }
     if (!reader.ok || reader.at != reader.size) {
+        unmap_file(&file);
         if (why)
             *why = "The editor project is truncated or corrupt.";
         return false;
     }
-    next.dirty = skipped_legacy_entities;
+    next.dirty = false;
+    unmap_file(&file);
     *document = std::move(next);
     return true;
 }

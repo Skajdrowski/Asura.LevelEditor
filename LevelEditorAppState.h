@@ -8,6 +8,7 @@
 
 #include <array>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace editor {
@@ -17,6 +18,15 @@ struct Camera {
     float yaw = .65f;
     float pitch = .42f;
     float distance = 80;
+};
+
+struct EntityModelRaycastCache {
+    const EntityModel* model = nullptr;
+    const void* vertices = nullptr;
+    size_t vertex_count = 0;
+    const void* faces = nullptr;
+    size_t face_count = 0;
+    EnvironmentRaycast raycast;
 };
 
 struct AppState {
@@ -52,6 +62,8 @@ struct AppState {
     bool spawn_puppets_loaded = false;
     std::vector<PickupModel> pickup_models;
     std::vector<StaticObjectModel> static_object_models;
+    std::vector<EntityModelRaycastCache> entity_model_raycasts;
+    std::unordered_map<const EntityModel*, size_t> entity_model_raycast_lookup;
     std::vector<uint8_t> sound_preview_bytes;
     int sound_preview_entity = -1;
     Camera camera;

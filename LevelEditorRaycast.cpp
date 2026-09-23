@@ -32,12 +32,6 @@ float component(Asura_Vector_3 value, uint32_t axis) {
     return axis == 0 ? value.x : axis == 1 ? value.y : value.z;
 }
 
-Asura_Vector_3 triangle_centroid(const EnvironmentRaycast::Triangle& triangle) {
-    return {triangle.origin.x + (triangle.edge_a.x + triangle.edge_b.x) / 3.0f,
-            triangle.origin.y + (triangle.edge_a.y + triangle.edge_b.y) / 3.0f,
-            triangle.origin.z + (triangle.edge_a.z + triangle.edge_b.z) / 3.0f};
-}
-
 struct PreparedRay {
     EnvironmentRay ray{};
     Asura_Vector_3 inverse_direction{};
@@ -121,6 +115,10 @@ void EnvironmentRaycast::build(const Mesh& mesh) {
     clear();
     faces_.reserve(mesh.faces.size());
     triangles_.reserve(mesh.faces.size());
+    std::vector<Asura_Vector_3> centroids;
+    centroids.reserve(mesh.faces.size());
+    std::vector<Bounds> triangle_bounds;
+    triangle_bounds.reserve(mesh.faces.size());
     for (uint32_t face_index = 0; face_index < mesh.faces.size(); ++face_index) {
         const auto& face = mesh.faces[face_index];
         if (face[0] >= mesh.positions.size() || face[1] >= mesh.positions.size() ||
@@ -129,39 +127,60 @@ void EnvironmentRaycast::build(const Mesh& mesh) {
         const Asura_Vector_3 a = mesh.positions[face[0]];
         const Asura_Vector_3 b = mesh.positions[face[1]];
         const Asura_Vector_3 c = mesh.positions[face[2]];
+        const Asura_Vector_3 edge_a = subtract(b, a);
+        const Asura_Vector_3 edge_b = subtract(c, a);
         faces_.push_back(static_cast<uint32_t>(triangles_.size()));
-        triangles_.push_back({a, subtract(b, a), subtract(c, a), face_index});
+        triangles_.push_back({a, edge_a, edge_b, face_index});
+        centroids.push_back({a.x + (edge_a.x + edge_b.x) / 3.0f,
+                             a.y + (edge_a.y + edge_b.y) / 3.0f,
+                             a.z + (edge_a.z + edge_b.z) / 3.0f});
+        Bounds bounds{
+            {fminf(a.x, fminf(b.x, c.x)),
+             fminf(a.y, fminf(b.y, c.y)),
+             fminf(a.z, fminf(b.z, c.z))},
+            {fmaxf(a.x, fmaxf(b.x, c.x)),
+             fmaxf(a.y, fmaxf(b.y, c.y)),
+             fmaxf(a.z, fmaxf(b.z, c.z))},
+        };
+        // ray_triangle intentionally accepts a 1e-6 barycentric edge tolerance.
+        // Keep the broad-phase bounds at least as conservative, otherwise a ray
+        // accepted just outside an edge/vertex can be incorrectly culled here.
+        for (uint32_t axis = 0; axis < 3; ++axis) {
+            const float extent = component(bounds.max, axis) - component(bounds.min, axis);
+            const float padding = fmaxf(1.0e-6f, extent * 2.0e-6f);
+            if (axis == 0) { bounds.min.x -= padding; bounds.max.x += padding; }
+            else if (axis == 1) { bounds.min.y -= padding; bounds.max.y += padding; }
+            else { bounds.min.z -= padding; bounds.max.z += padding; }
+        }
+        triangle_bounds.push_back(bounds);
     }
     if (faces_.empty())
         return;
-    nodes_.reserve(faces_.size() * 2);
-    build_node(0, static_cast<uint32_t>(faces_.size()));
+    // Every split child has at least six faces with leaf_size=12, so a full
+    // binary tree needs at most 2*ceil(N/6)-1 nodes. Avoid reserving two nodes
+    // per triangle for large retail environments.
+    const size_t maximum_leaves = std::max<size_t>(1, (faces_.size() + 5) / 6);
+    nodes_.reserve(maximum_leaves * 2 - 1);
+    build_node(0, static_cast<uint32_t>(faces_.size()), centroids.data(), triangle_bounds.data());
 }
 
-uint32_t EnvironmentRaycast::build_node(uint32_t first, uint32_t count) {
+uint32_t EnvironmentRaycast::build_node(uint32_t first, uint32_t count,
+                                        const Asura_Vector_3* centroids,
+                                        const Bounds* triangle_bounds) {
     constexpr uint32_t leaf_size = 12;
     const float infinity = std::numeric_limits<float>::infinity();
     Bounds bounds{{infinity, infinity, infinity}, {-infinity, -infinity, -infinity}};
     Asura_Vector_3 centroid_min{infinity, infinity, infinity};
     Asura_Vector_3 centroid_max{-infinity, -infinity, -infinity};
     for (uint32_t i = first; i < first + count; ++i) {
-        const Triangle& triangle = triangles_[faces_[i]];
-        const Asura_Vector_3 vertices[3] = {
-            triangle.origin,
-            {triangle.origin.x + triangle.edge_a.x, triangle.origin.y + triangle.edge_a.y,
-             triangle.origin.z + triangle.edge_a.z},
-            {triangle.origin.x + triangle.edge_b.x, triangle.origin.y + triangle.edge_b.y,
-             triangle.origin.z + triangle.edge_b.z},
-        };
-        for (const Asura_Vector_3& p : vertices) {
-            bounds.min.x = fminf(bounds.min.x, p.x);
-            bounds.min.y = fminf(bounds.min.y, p.y);
-            bounds.min.z = fminf(bounds.min.z, p.z);
-            bounds.max.x = fmaxf(bounds.max.x, p.x);
-            bounds.max.y = fmaxf(bounds.max.y, p.y);
-            bounds.max.z = fmaxf(bounds.max.z, p.z);
-        }
-        const Asura_Vector_3 centroid = triangle_centroid(triangle);
+        const Bounds& triangle = triangle_bounds[faces_[i]];
+        bounds.min.x = fminf(bounds.min.x, triangle.min.x);
+        bounds.min.y = fminf(bounds.min.y, triangle.min.y);
+        bounds.min.z = fminf(bounds.min.z, triangle.min.z);
+        bounds.max.x = fmaxf(bounds.max.x, triangle.max.x);
+        bounds.max.y = fmaxf(bounds.max.y, triangle.max.y);
+        bounds.max.z = fmaxf(bounds.max.z, triangle.max.z);
+        const Asura_Vector_3 centroid = centroids[faces_[i]];
         centroid_min.x = fminf(centroid_min.x, centroid.x);
         centroid_min.y = fminf(centroid_min.y, centroid.y);
         centroid_min.z = fminf(centroid_min.z, centroid.z);
@@ -184,11 +203,10 @@ uint32_t EnvironmentRaycast::build_node(uint32_t first, uint32_t count) {
     const uint32_t middle = first + count / 2;
     std::nth_element(faces_.begin() + first, faces_.begin() + middle, faces_.begin() + first + count,
                      [&](uint32_t a, uint32_t b) {
-                         return component(triangle_centroid(triangles_[a]), axis) <
-                                component(triangle_centroid(triangles_[b]), axis);
+                         return component(centroids[a], axis) < component(centroids[b], axis);
                      });
-    const uint32_t left = build_node(first, middle - first);
-    const uint32_t right = build_node(middle, first + count - middle);
+    const uint32_t left = build_node(first, middle - first, centroids, triangle_bounds);
+    const uint32_t right = build_node(middle, first + count - middle, centroids, triangle_bounds);
     nodes_[node_index].count = 0;
     nodes_[node_index].left = left;
     nodes_[node_index].right = right;

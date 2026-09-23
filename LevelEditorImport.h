@@ -59,7 +59,8 @@ bool load_pickup_donor(const std::string& path, std::vector<PickupTemplate>* tem
                        std::vector<PickupModel>* models, std::string* why);
 
 uint32_t allocate_editor_guid(Document* document);
-bool normalise_editor_guids(Document* document, std::string* why);
+bool normalise_editor_guids(Document* document, const asura::level::ChunkList* source,
+                            std::string* why);
 
 struct PcSkyboxInfo {
     float red = 255.0f;

@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <map>
 #include <set>
+#include <unordered_map>
 
 using namespace asura;
 using namespace asura::level;
@@ -313,18 +314,22 @@ bool decode_pc_environment(const RscfInfo& resource, Mesh* mesh, Arena* arena, E
             const Asura_PC_EnvironmentRenderer_Strip& strip = env.strips[module.m_uFirstStrip + strip_index];
             if (static_cast<uint64_t>(strip.m_uStartIndex) + strip.m_uNumberOfTriangles + 2 > index_count)
                 return fail(err, "PC environment strip exceeds its index buffer");
+            const uint8_t* strip_indices = indices + static_cast<uint64_t>(strip.m_uStartIndex) * 2;
+            uint16_t first = read_u16(strip_indices);
+            uint16_t second = read_u16(strip_indices + 2);
             for (uint32_t triangle = 0; triangle < strip.m_uNumberOfTriangles; ++triangle) {
-                uint16_t a = read_u16(indices + static_cast<uint64_t>(strip.m_uStartIndex + triangle) * 2);
-                uint16_t b = read_u16(indices + static_cast<uint64_t>(strip.m_uStartIndex + triangle + 1) * 2);
-                uint16_t c = read_u16(indices + static_cast<uint64_t>(strip.m_uStartIndex + triangle + 2) * 2);
+                const uint16_t third = read_u16(strip_indices + static_cast<uint64_t>(triangle + 2) * 2);
+                uint16_t a = first, b = second, c = third;
                 if (triangle & 1)
                     std::swap(a, b);
-                if (a == 0xffff || b == 0xffff || c == 0xffff || a >= vertex_count || b >= vertex_count ||
-                    c >= vertex_count || a == b || b == c || a == c)
-                    continue;
-                // Negating the target's negative-up Y axis reverses handedness.
-                next.faces.push_back({vertex_base + a, vertex_base + c, vertex_base + b});
-                next.face_materials.push_back(strip.m_iOriginalMaterialIndex);
+                if (a != 0xffff && b != 0xffff && c != 0xffff && a < vertex_count && b < vertex_count &&
+                    c < vertex_count && a != b && b != c && a != c) {
+                    // Negating the target's negative-up Y axis reverses handedness.
+                    next.faces.push_back({vertex_base + a, vertex_base + c, vertex_base + b});
+                    next.face_materials.push_back(strip.m_iOriginalMaterialIndex);
+                }
+                first = second;
+                second = third;
             }
         }
     }
@@ -357,16 +362,6 @@ const RscfInfo* find_pc_environment(const ChunkList& chunks, RscfInfo* storage) 
         return nullptr;
     *storage = fallback;
     return storage;
-}
-
-std::string pc_sound_name(const ChunkList& chunks, uint32_t resource_id) {
-    for (uint32_t i = 0; i < chunks.count; ++i) {
-        RscfInfo resource{};
-        if (rscf_info(chunks.chunks[i], &resource) && resource.type == ASURA_RESOURCEFILE_TYPE_SOUND &&
-            resource.subtype == resource_id)
-            return std::string(resource.name.data, resource.name.size);
-    }
-    return {};
 }
 
 const char* snipe_item_name(uint32_t item_id) {
@@ -524,23 +519,6 @@ StaticObjectTemplate make_canonical_static_object_template(uint32_t file_id, Str
     return object;
 }
 
-std::string static_object_resource_name(const ChunkList& chunks, uint32_t file_id, uint32_t skin_id) {
-    for (uint32_t i = 0; i < chunks.count; ++i) {
-        RscfInfo resource{};
-        if (!rscf_info(chunks.chunks[i], &resource) ||
-            resource.type != ASURA_RESOURCEFILE_TYPE_PLATFORMSPECIFIC)
-            continue;
-        if (resource.subtype == ASURA_RESOURCEFILE_TYPE_PC_OBJECT && resource.payload_size >= 4 &&
-            read_u32(resource.payload) == file_id)
-            return std::string(resource.name.data, resource.name.size);
-        if ((resource.subtype == ASURA_RESOURCEFILE_TYPE_PC_OBJECTHIERARCHY ||
-             resource.subtype == ASURA_RESOURCEFILE_TYPE_PC_CHARACTER) && skin_id &&
-            asura_lower_name_hash(resource.name) == skin_id)
-            return std::string(resource.name.data, resource.name.size);
-    }
-    return {};
-}
-
 StaticObjectTemplate static_object_template_from_entity(const Entity& entity, const std::string& donor_path) {
     Snipe_ServerEntity_StaticObject_ChunkDataV0 body{};
     memcpy(&body, entity.static_object_body.data(), sizeof(body));
@@ -658,8 +636,33 @@ bool load_static_object_collision_flags(const StaticObjectTemplate& object, uint
     return ok;
 }
 
-bool decode_pc_model_materials(const ChunkList& chunks, uint32_t before_chunk,
-                               std::vector<EntityModelMaterial>* output, Error* err, bool load_textures) {
+struct PcModelMaterialIndex {
+    std::vector<uint32_t> state_chunks;
+    std::vector<RscfInfo> textures;
+};
+
+void build_pc_model_material_index(const ChunkList& chunks, PcModelMaterialIndex* index,
+                                   bool include_textures = true) {
+    index->state_chunks.clear();
+    index->textures.clear();
+    index->state_chunks.reserve(chunks.count / 8 + 1);
+    index->textures.reserve(chunks.count / 16 + 1);
+    for (uint32_t chunk_index = 0; chunk_index < chunks.count; ++chunk_index) {
+        const ChunkRef& chunk = chunks.chunks[chunk_index];
+        if (chunk.cid == ASURA_CHUNK_TEXTURENAMES || chunk.cid == ASURA_CHUNK_TEXTUREFLAGS ||
+            chunk.cid == ASURA_CHUNK_MATERIAL)
+            index->state_chunks.push_back(chunk_index);
+        if (include_textures) {
+            RscfInfo resource{};
+            if (rscf_info(chunk, &resource) && resource.type == ASURA_RESOURCEFILE_TYPE_TEXTURE)
+                index->textures.push_back(resource);
+        }
+    }
+}
+
+bool decode_pc_model_materials_indexed(const ChunkList& chunks, const PcModelMaterialIndex& index,
+                                       uint32_t before_chunk, std::vector<EntityModelMaterial>* output,
+                                       Error* err, bool load_textures) {
     std::vector<std::string> texture_names;
     std::vector<uint32_t> texture_flags;
     std::vector<std::string> material_texture_names;
@@ -667,7 +670,9 @@ bool decode_pc_model_materials(const ChunkList& chunks, uint32_t before_chunk,
     std::vector<int32_t> material_texture_indices;
     std::vector<uint32_t> material_flags;
     std::vector<uint32_t> material_surface_types;
-    for (uint32_t chunk_index = 0; chunk_index < before_chunk; ++chunk_index) {
+    for (uint32_t chunk_index : index.state_chunks) {
+        if (chunk_index >= before_chunk)
+            break;
         const ChunkRef& chunk = chunks.chunks[chunk_index];
         if (chunk.cid == ASURA_CHUNK_TEXTURENAMES) {
             if (chunk.version > 3 || chunk.size < sizeof(Asura_Chunk_TextureNames))
@@ -730,7 +735,12 @@ bool decode_pc_model_materials(const ChunkList& chunks, uint32_t before_chunk,
             material_surface_types.assign(count, 0);
             for (uint32_t material_index = 0; material_index < count; ++material_index) {
                 const uint8_t* record = chunk.data + records_at + static_cast<uint64_t>(material_index) * stride;
-                material_texture_indices[material_index] = static_cast<int32_t>(read_u32(record));
+                const int32_t texture_index = static_cast<int32_t>(read_u32(record));
+                if (texture_index != -1 &&
+                    (texture_index < 0 || static_cast<uint32_t>(texture_index) >= texture_names.size()))
+                    return fail(err, "Object preview MTRL material %u has invalid texture index %d",
+                                material_index, texture_index);
+                material_texture_indices[material_index] = texture_index;
                 material_flags[material_index] = read_u32(record + 4);
                 material_surface_types[material_index] = chunk.version ? read_u32(record + 8) : 0;
             }
@@ -743,17 +753,16 @@ bool decode_pc_model_materials(const ChunkList& chunks, uint32_t before_chunk,
         EntityModelMaterial& material = (*output)[material_index];
         material.flags = material_flags[material_index];
         material.surface_type = material_surface_types[material_index];
-        if (texture_index < 0 || static_cast<uint32_t>(texture_index) >= material_texture_names.size())
+        if (texture_index == -1)
             continue;
         material.texture_name = material_texture_names[texture_index];
         if (static_cast<uint32_t>(texture_index) < material_texture_flags.size())
             material.texture_flags = material_texture_flags[texture_index];
         const Str wanted{material.texture_name.data(), static_cast<uint32_t>(material.texture_name.size())};
-        for (uint32_t resource_index = 0; load_textures && resource_index < chunks.count; ++resource_index) {
-            RscfInfo texture{};
-            if (!rscf_info(chunks.chunks[resource_index], &texture) ||
-                texture.type != ASURA_RESOURCEFILE_TYPE_TEXTURE ||
-                !text_name_matches_resource(wanted, texture.name))
+        for (const RscfInfo& texture : index.textures) {
+            if (!load_textures)
+                break;
+            if (!text_name_matches_resource(wanted, texture.name))
                 continue;
             material.texture_bytes.assign(texture.payload, texture.payload + texture.payload_size);
             material.texture_fingerprint = 1469598103934665603ull;
@@ -765,6 +774,13 @@ bool decode_pc_model_materials(const ChunkList& chunks, uint32_t before_chunk,
         }
     }
     return true;
+}
+
+bool decode_pc_model_materials(const ChunkList& chunks, uint32_t before_chunk,
+                               std::vector<EntityModelMaterial>* output, Error* err, bool load_textures) {
+    PcModelMaterialIndex index;
+    build_pc_model_material_index(chunks, &index, load_textures);
+    return decode_pc_model_materials_indexed(chunks, index, before_chunk, output, err, load_textures);
 }
 
 bool decode_pc_preview_vertex(const uint8_t* source, EntityModelVertex* vertex) {
@@ -792,7 +808,8 @@ bool decode_pc_preview_vertex(const uint8_t* source, EntityModelVertex* vertex) 
 }
 
 bool decode_pc_static_object_model(const ChunkList& chunks, uint32_t chunk_index,
-                                   const RscfInfo& resource, StaticObjectModel* output, Error* err) {
+                                   const RscfInfo& resource, const PcModelMaterialIndex* material_index,
+                                   StaticObjectModel* output, Error* err) {
     constexpr uint32_t header_size = 20;
     constexpr uint32_t vertex_stride = 32;
     if (resource.type != ASURA_RESOURCEFILE_TYPE_PLATFORMSPECIFIC ||
@@ -814,7 +831,12 @@ bool decode_pc_static_object_model(const ChunkList& chunks, uint32_t chunk_index
     StaticObjectModel next;
     next.file_id = file_id;
     next.mesh.resource_name.assign(resource.name.data, resource.name.size);
-    if (!decode_pc_model_materials(chunks, chunk_index, &next.mesh.materials, err))
+    PcModelMaterialIndex local_material_index;
+    if (!material_index) {
+        build_pc_model_material_index(chunks, &local_material_index);
+        material_index = &local_material_index;
+    }
+    if (!decode_pc_model_materials_indexed(chunks, *material_index, chunk_index, &next.mesh.materials, err, true))
         return false;
     next.mesh.vertices.resize(vertex_count);
     for (uint32_t i = 0; i < vertex_count; ++i) {
@@ -861,18 +883,11 @@ bool decode_pc_static_object_model(const ChunkList& chunks, uint32_t chunk_index
     return true;
 }
 
-bool donor_has_static_shape(const ChunkList& chunks, uint32_t file_id) {
-    for (uint32_t i = 0; i < chunks.count; ++i) {
-        const ChunkRef& chunk = chunks.chunks[i];
-        if (chunk.cid == ASURA_CHUNK_SHAPE && chunk.size >= sizeof(Asura_Chunk_Header) + 4 &&
-            read_u32(chunk.data + sizeof(Asura_Chunk_Header)) == file_id)
-            return true;
-    }
-    return false;
-}
-
-bool decode_pc_pickup_model(const ChunkList&, uint32_t, const RscfInfo&, uint32_t, PickupModel*, Error*);
-bool decode_pc_character_model(const ChunkList&, uint32_t, const RscfInfo&, uint32_t, PickupModel*, Error*);
+bool decode_pc_pickup_model(const ChunkList&, uint32_t, const RscfInfo&, uint32_t,
+                            const PcModelMaterialIndex*, const ModelAnimationChunkIndex*,
+                            PickupModel*, Error*);
+bool decode_pc_character_model(const ChunkList&, uint32_t, const RscfInfo&, uint32_t,
+                               const PcModelMaterialIndex*, PickupModel*, Error*);
 
 bool load_static_object_donors(const std::vector<std::string>& paths,
                                std::vector<StaticObjectTemplate>* templates,
@@ -881,47 +896,75 @@ bool load_static_object_donors(const std::vector<std::string>& paths,
     Arena arena{};
     std::vector<StaticObjectTemplate> next_templates;
     std::vector<StaticObjectModel> next_models;
+    std::set<uint32_t> template_ids;
     bool ok = arena_init(&arena, 128 * MiB, &err);
     for (const std::string& path : paths) {
         ArenaMark mark = arena_mark(&arena);
         ChunkList chunks{};
         ok = ok && parse_chunks(path.c_str(), &chunks, &arena, &err);
-        for (uint32_t resource_index = 0; ok && resource_index < chunks.count; ++resource_index) {
+        PcModelMaterialIndex material_index;
+        ModelAnimationChunkIndex animation_index;
+        if (ok)
+            build_pc_model_material_index(chunks, &material_index);
+        if (ok)
+            build_model_animation_chunk_index(chunks, &animation_index);
+        std::vector<RscfInfo> resources(chunks.count);
+        std::vector<uint8_t> resource_valid(chunks.count);
+        std::unordered_map<uint32_t, uint32_t> shapes;
+        std::unordered_map<uint32_t, uint32_t> static_entities;
+        std::unordered_map<uint32_t, uint32_t> hierarchy_resources;
+        shapes.reserve(chunks.count / 8 + 1);
+        static_entities.reserve(chunks.count / 8 + 1);
+        hierarchy_resources.reserve(chunks.count / 8 + 1);
+        for (uint32_t i = 0; ok && i < chunks.count; ++i) {
+            const ChunkRef& chunk = chunks.chunks[i];
+            if (chunk.cid == ASURA_CHUNK_SHAPE && chunk.size >= sizeof(Asura_Chunk_Header) + 4)
+                shapes.try_emplace(read_u32(chunk.data + sizeof(Asura_Chunk_Header)), i);
+            if (chunk.cid == ASURA_CHUNK_ENTITY && chunk.version == 0 &&
+                chunk.size >= sizeof(Asura_Chunk_Entity) + kStaticObjectBodySize &&
+                read_u16(chunk.data + 20) == SnipeEntityClass_StaticObject) {
+                Snipe_ServerEntity_StaticObject_ChunkDataV0 body{};
+                memcpy(&body, chunk.data + sizeof(Asura_Chunk_Entity), sizeof(body));
+                if (valid_static_object_body(body) && !body.m_uNumLinksToBlock)
+                    static_entities.try_emplace(body.m_xPhysicalObject.m_uFileID, i);
+            }
             RscfInfo resource{};
-            if (!rscf_info(chunks.chunks[resource_index], &resource) ||
+            if (!rscf_info(chunk, &resource))
+                continue;
+            resources[i] = resource;
+            resource_valid[i] = 1;
+            if (resource.type == 0 &&
+                (resource.subtype == ASURA_RESOURCEFILE_TYPE_PC_CHARACTER ||
+                 resource.subtype == ASURA_RESOURCEFILE_TYPE_PC_OBJECTHIERARCHY))
+                hierarchy_resources.try_emplace(asura_lower_name_hash(resource.name), i);
+        }
+        for (uint32_t resource_index = 0; ok && resource_index < chunks.count; ++resource_index) {
+            if (!resource_valid[resource_index])
+                continue;
+            const RscfInfo& resource = resources[resource_index];
+            if (
                 resource.type != ASURA_RESOURCEFILE_TYPE_PLATFORMSPECIFIC ||
                 resource.subtype != ASURA_RESOURCEFILE_TYPE_PC_OBJECT || resource.payload_size < 20)
                 continue;
             const uint32_t file_id = read_u32(resource.payload);
-            bool duplicate = false;
-            for (const StaticObjectTemplate& existing : next_templates)
-                duplicate |= existing.file_id == file_id;
-            if (duplicate || !donor_has_static_shape(chunks, file_id))
+            if (template_ids.contains(file_id) || !shapes.contains(file_id))
                 continue;
 
             StaticObjectTemplate object = make_canonical_static_object_template(file_id, resource.name, path);
-            for (uint32_t entity_index = 0; entity_index < chunks.count; ++entity_index) {
-                const ChunkRef& chunk = chunks.chunks[entity_index];
-                if (chunk.cid != ASURA_CHUNK_ENTITY || chunk.version != 0 ||
-                    chunk.size < sizeof(Asura_Chunk_Entity) + kStaticObjectBodySize)
-                    continue;
+            const auto entity = static_entities.find(file_id);
+            if (entity != static_entities.end()) {
+                const ChunkRef& chunk = chunks.chunks[entity->second];
                 const uint8_t* payload = chunk.data + sizeof(Asura_Chunk_Header);
-                if (read_u16(payload + offsetof(Asura_Chunk_Entity_PayloadHeader, Classification)) !=
-                    SnipeEntityClass_StaticObject)
-                    continue;
                 Snipe_ServerEntity_StaticObject_ChunkDataV0 body{};
                 memcpy(&body, payload + sizeof(Asura_Chunk_Entity_PayloadHeader), sizeof(body));
-                if (valid_static_object_body(body) && !body.m_uNumLinksToBlock &&
-                    body.m_xPhysicalObject.m_uFileID == file_id) {
-                    object.entity_padding =
-                        read_u16(payload + offsetof(Asura_Chunk_Entity_PayloadHeader, m_usPadding));
-                    memcpy(object.body.data(), &body, sizeof(body));
-                    break;
-                }
+                object.entity_padding =
+                    read_u16(payload + offsetof(Asura_Chunk_Entity_PayloadHeader, m_usPadding));
+                memcpy(object.body.data(), &body, sizeof(body));
             }
+            template_ids.insert(file_id);
             next_templates.push_back(std::move(object));
             StaticObjectModel model;
-            if (decode_pc_static_object_model(chunks, resource_index, resource, &model, &err))
+            if (decode_pc_static_object_model(chunks, resource_index, resource, &material_index, &model, &err))
                 next_models.push_back(std::move(model));
             else if (err.set)
                 ok = false;
@@ -937,28 +980,28 @@ bool load_static_object_donors(const std::vector<std::string>& paths,
             memcpy(&body, chunk.data + sizeof(Asura_Chunk_Entity), sizeof(body));
             if (!valid_static_object_body(body) || body.m_uNumLinksToBlock || !body.m_xPhysicalObject.m_uSkinID) continue;
             const uint32_t file_id = body.m_xPhysicalObject.m_uFileID;
-            bool duplicate = false;
-            for (const auto& entry : next_templates) duplicate |= entry.file_id == file_id;
-            if (duplicate) continue;
-            for (uint32_t r = 0; r < chunks.count; ++r) {
-                RscfInfo resource{};
-                if (!rscf_info(chunks.chunks[r], &resource) || resource.type != 0 ||
-                    (resource.subtype != ASURA_RESOURCEFILE_TYPE_PC_CHARACTER &&
-                     resource.subtype != ASURA_RESOURCEFILE_TYPE_PC_OBJECTHIERARCHY) ||
-                    asura_lower_name_hash(resource.name) != body.m_xPhysicalObject.m_uSkinID) continue;
+            if (template_ids.contains(file_id)) continue;
+            const auto resource_it = hierarchy_resources.find(body.m_xPhysicalObject.m_uSkinID);
+            if (resource_it != hierarchy_resources.end()) {
+                const uint32_t r = resource_it->second;
+                const RscfInfo& resource = resources[r];
                 PickupModel decoded;
                 ok = resource.subtype == ASURA_RESOURCEFILE_TYPE_PC_CHARACTER
-                    ? decode_pc_character_model(chunks, r, resource, body.m_xPhysicalObject.m_uSkinID, &decoded, &err)
-                    : decode_pc_pickup_model(chunks, r, resource, body.m_xPhysicalObject.m_uSkinID, &decoded, &err);
-                if (ok) ok = decode_model_animations(chunks, {body.m_xPhysicalObject.m_uAnimID}, &decoded.mesh, &err);
+                    ? decode_pc_character_model(chunks, r, resource, body.m_xPhysicalObject.m_uSkinID,
+                                                &material_index, &decoded, &err)
+                    : decode_pc_pickup_model(chunks, r, resource, body.m_xPhysicalObject.m_uSkinID,
+                                             &material_index, &animation_index, &decoded, &err);
+                if (ok)
+                    ok = decode_model_animations(chunks, &animation_index,
+                                                 {body.m_xPhysicalObject.m_uAnimID}, &decoded.mesh, &err);
                 if (ok) {
                     auto object = make_canonical_static_object_template(file_id, resource.name, path);
                     memcpy(object.body.data(), &body, sizeof(body));
                     object.entity_padding = read_u16(chunk.data + 22);
+                    template_ids.insert(file_id);
                     next_templates.push_back(std::move(object));
                     next_models.push_back({file_id, std::move(decoded.mesh)});
                 }
-                break;
             }
         }
         unmap_file(&chunks.file);
@@ -1027,18 +1070,6 @@ uint32_t pickup_initial_state_bits(uint32_t item_id) {
     }
 }
 
-bool donor_has_pickup_model(const ChunkList& chunks, uint32_t skin_id) {
-    for (uint32_t i = 0; i < chunks.count; ++i) {
-        RscfInfo resource{};
-        if (rscf_info(chunks.chunks[i], &resource) &&
-            resource.type == ASURA_RESOURCEFILE_TYPE_PLATFORMSPECIFIC &&
-            resource.subtype == ASURA_RESOURCEFILE_TYPE_PC_OBJECTHIERARCHY &&
-            asura_lower_name_hash(resource.name) == skin_id)
-            return true;
-    }
-    return false;
-}
-
 PickupTemplate pickup_template_from_resource(const PickupResourceDefinition& definition) {
     const std::string model_name = definition.model_name;
     const std::string rest_name = model_name + "_rest";
@@ -1051,28 +1082,26 @@ PickupTemplate pickup_template_from_resource(const PickupResourceDefinition& def
 }
 
 void add_resource_backed_pickup_templates(const ChunkList& chunks, Document* catalog) {
+    std::set<uint32_t> hierarchy_skins, present_items;
+    for (uint32_t i = 0; i < chunks.count; ++i) {
+        RscfInfo resource{};
+        if (rscf_info(chunks.chunks[i], &resource) &&
+            resource.type == ASURA_RESOURCEFILE_TYPE_PLATFORMSPECIFIC &&
+            resource.subtype == ASURA_RESOURCEFILE_TYPE_PC_OBJECTHIERARCHY)
+            hierarchy_skins.insert(asura_lower_name_hash(resource.name));
+    }
+    for (const PickupTemplate& existing : catalog->pickup_templates)
+        present_items.insert(existing.item_id);
     for (const PickupResourceDefinition& definition : kPickupResourceDefinitions) {
-        bool already_present = false;
-        for (const PickupTemplate& existing : catalog->pickup_templates)
-            already_present |= existing.item_id == definition.item_id;
-        if (already_present)
+        if (present_items.contains(definition.item_id))
             continue;
 
         PickupTemplate generated = pickup_template_from_resource(definition);
-        if (donor_has_pickup_model(chunks, generated.skin_id))
+        if (hierarchy_skins.contains(generated.skin_id)) {
+            present_items.insert(definition.item_id);
             catalog->pickup_templates.push_back(std::move(generated));
+        }
     }
-}
-
-bool pickup_skin_is_referenced(const Document& document, uint32_t skin_id) {
-    for (const Entity& entity : document.entities)
-        if ((entity.kind == EntityKind::Pickup || entity.kind == EntityKind::StaticObject) &&
-            entity.pickup_skin_id == skin_id)
-            return true;
-    for (const PickupTemplate& pickup : document.pickup_templates)
-        if (pickup.skin_id == skin_id)
-            return true;
-    return false;
 }
 
 struct HierarchyBindTransform {
@@ -1094,14 +1123,20 @@ HierarchyBindTransform hierarchy_compose(const HierarchyBindTransform& parent,
             hierarchy_multiply(parent.orientation, local.orientation)};
 }
 
-bool decode_pc_hierarchy_bind_pose(const ChunkList& chunks, uint32_t before_chunk, Str hierarchy_name,
+bool decode_pc_hierarchy_bind_pose(const ChunkList& chunks, const ModelAnimationChunkIndex* chunk_index,
+                                   uint32_t before_chunk, Str hierarchy_name,
                                    uint32_t strip_count, std::vector<HierarchyBindTransform>* output,
                                    Error* err) {
     output->clear();
-    for (uint32_t scan = before_chunk; scan > 0; --scan) {
-        const ChunkRef& chunk = chunks.chunks[scan - 1];
-        if (chunk.cid != ASURA_CHUNK_HIERARCHY_SKIN)
+    ModelAnimationChunkIndex local_index;
+    if (!chunk_index) {
+        build_model_animation_chunk_index(chunks, &local_index);
+        chunk_index = &local_index;
+    }
+    for (auto scan = chunk_index->skin_chunks.rbegin(); scan != chunk_index->skin_chunks.rend(); ++scan) {
+        if (*scan >= before_chunk)
             continue;
+        const ChunkRef& chunk = chunks.chunks[*scan];
         if (chunk.version < 4 || chunk.version > 6 || chunk.size < sizeof(Asura_Chunk_Header) + 12)
             return fail(err, "ObjectHierarchy '%.*s' has an unsupported HSKN", hierarchy_name.size,
                         hierarchy_name.data);
@@ -1144,7 +1179,9 @@ bool decode_pc_hierarchy_bind_pose(const ChunkList& chunks, uint32_t before_chun
 }
 
 bool decode_pc_pickup_model(const ChunkList& chunks, uint32_t chunk_index, const RscfInfo& resource,
-                            uint32_t skin_id, PickupModel* output, Error* err) {
+                            uint32_t skin_id, const PcModelMaterialIndex* material_index,
+                            const ModelAnimationChunkIndex* animation_index,
+                            PickupModel* output, Error* err) {
     if (resource.type != ASURA_RESOURCEFILE_TYPE_PLATFORMSPECIFIC ||
         resource.subtype != ASURA_RESOURCEFILE_TYPE_PC_OBJECTHIERARCHY ||
         asura_lower_name_hash(resource.name) != skin_id)
@@ -1174,10 +1211,16 @@ bool decode_pc_pickup_model(const ChunkList& chunks, uint32_t chunk_index, const
     next.skin_id = skin_id;
     next.mesh.resource_name.assign(resource.name.data, resource.name.size);
     next.mesh.resource_subtype = ASURA_RESOURCEFILE_TYPE_PC_OBJECTHIERARCHY;
-    if (!decode_pc_model_materials(chunks, chunk_index, &next.mesh.materials, err))
+    PcModelMaterialIndex local_material_index;
+    if (!material_index) {
+        build_pc_model_material_index(chunks, &local_material_index);
+        material_index = &local_material_index;
+    }
+    if (!decode_pc_model_materials_indexed(chunks, *material_index, chunk_index, &next.mesh.materials, err, true))
         return false;
     std::vector<HierarchyBindTransform> bind_pose;
-    if (!decode_pc_hierarchy_bind_pose(chunks, chunk_index, resource.name, strip_count, &bind_pose, err))
+    if (!decode_pc_hierarchy_bind_pose(chunks, animation_index, chunk_index, resource.name,
+                                       strip_count, &bind_pose, err))
         return false;
     std::vector<EntityModelVertex> source_vertices(vertex_count);
     for (uint32_t i = 0; i < vertex_count; ++i) {
@@ -1279,7 +1322,7 @@ bool decode_pc_pickup_model(const ChunkList& chunks, uint32_t chunk_index, const
 
 bool decode_pc_character_model(const ChunkList& chunks, uint32_t chunk_index,
                                const RscfInfo& resource, uint32_t skin_id,
-                               PickupModel* output, Error* err) {
+                               const PcModelMaterialIndex* material_index, PickupModel* output, Error* err) {
     // MCP2 sub_49E420: padded skin name, four counts/material words, 64-byte
     // skinned vertices, then a 16-bit triangle strip. The first 32 vertex
     // bytes are the same bind-pose position/normal/UV used by Object meshes.
@@ -1302,7 +1345,12 @@ bool decode_pc_character_model(const ChunkList& chunks, uint32_t chunk_index,
     next.skin_id = skin_id;
     next.mesh.resource_name.assign(name.data, name.size);
     next.mesh.resource_subtype = ASURA_RESOURCEFILE_TYPE_PC_CHARACTER;
-    if (!decode_pc_model_materials(chunks, chunk_index, &next.mesh.materials, err))
+    PcModelMaterialIndex local_material_index;
+    if (!material_index) {
+        build_pc_model_material_index(chunks, &local_material_index);
+        material_index = &local_material_index;
+    }
+    if (!decode_pc_model_materials_indexed(chunks, *material_index, chunk_index, &next.mesh.materials, err, true))
         return false;
     next.mesh.vertices.resize(vertex_count);
     next.mesh.weights.resize(vertex_count);
@@ -1354,8 +1402,39 @@ bool decode_pc_character_model(const ChunkList& chunks, uint32_t chunk_index,
 }
 
 bool decode_pc_pickup_models(const ChunkList& chunks, const Document& document,
+                             const PcModelMaterialIndex* material_index,
                              std::vector<PickupModel>* models, Error* err) {
     models->clear();
+    PcModelMaterialIndex local_material_index;
+    if (!material_index) {
+        build_pc_model_material_index(chunks, &local_material_index);
+        material_index = &local_material_index;
+    }
+    ModelAnimationChunkIndex animation_index;
+    build_model_animation_chunk_index(chunks, &animation_index);
+    std::set<uint32_t> referenced_skins, seen_skins;
+    std::unordered_map<uint32_t, std::vector<uint32_t>> animations;
+    const auto add_animation = [&](uint32_t skin, uint32_t animation) {
+        if (!skin || !animation)
+            return;
+        referenced_skins.insert(skin);
+        auto& ids = animations[skin];
+        if (std::find(ids.begin(), ids.end(), animation) == ids.end())
+            ids.push_back(animation);
+    };
+    for (const Entity& entity : document.entities) {
+        if ((entity.kind == EntityKind::Pickup || entity.kind == EntityKind::StaticObject) &&
+            entity.pickup_skin_id) {
+            referenced_skins.insert(entity.pickup_skin_id);
+            add_animation(entity.pickup_skin_id, entity.pickup_anim_id);
+        }
+    }
+    for (const PickupTemplate& item : document.pickup_templates) {
+        if (item.skin_id) {
+            referenced_skins.insert(item.skin_id);
+            add_animation(item.skin_id, item.anim_id);
+        }
+    }
     for (uint32_t chunk_index = 0; chunk_index < chunks.count; ++chunk_index) {
         RscfInfo resource{};
         if (!rscf_info(chunks.chunks[chunk_index], &resource) ||
@@ -1364,29 +1443,22 @@ bool decode_pc_pickup_models(const ChunkList& chunks, const Document& document,
              resource.subtype != ASURA_RESOURCEFILE_TYPE_PC_CHARACTER))
             continue;
         const uint32_t skin_id = asura_lower_name_hash(resource.name);
-        if (!pickup_skin_is_referenced(document, skin_id))
-            continue;
-        bool duplicate = false;
-        for (const PickupModel& model : *models)
-            duplicate |= model.skin_id == skin_id;
-        if (duplicate)
+        if (!referenced_skins.contains(skin_id) || seen_skins.contains(skin_id))
             continue;
         PickupModel model;
         const bool ok = resource.subtype == ASURA_RESOURCEFILE_TYPE_PC_CHARACTER
-                            ? decode_pc_character_model(chunks, chunk_index, resource, skin_id, &model, err)
-                            : decode_pc_pickup_model(chunks, chunk_index, resource, skin_id, &model, err);
+                            ? decode_pc_character_model(chunks, chunk_index, resource, skin_id,
+                                                        material_index, &model, err)
+                            : decode_pc_pickup_model(chunks, chunk_index, resource, skin_id,
+                                                     material_index, &animation_index, &model, err);
         if (!ok)
             return false;
-        std::vector<uint32_t> animation_ids;
-        for (const Entity& entity : document.entities)
-            if (entity.pickup_skin_id == skin_id && entity.pickup_anim_id &&
-                std::find(animation_ids.begin(), animation_ids.end(), entity.pickup_anim_id) == animation_ids.end())
-                animation_ids.push_back(entity.pickup_anim_id);
-        for (const auto& item : document.pickup_templates)
-            if (item.skin_id == skin_id && item.anim_id &&
-                std::find(animation_ids.begin(), animation_ids.end(), item.anim_id) == animation_ids.end())
-                animation_ids.push_back(item.anim_id);
-        if (!decode_model_animations(chunks, animation_ids, &model.mesh, err)) return false;
+        const auto found_animations = animations.find(skin_id);
+        const std::vector<uint32_t> empty_animations;
+        const std::vector<uint32_t>& animation_ids =
+            found_animations == animations.end() ? empty_animations : found_animations->second;
+        if (!decode_model_animations(chunks, &animation_index, animation_ids, &model.mesh, err)) return false;
+        seen_skins.insert(skin_id);
         models->push_back(std::move(model));
     }
     return true;
@@ -1441,7 +1513,7 @@ bool load_pickup_donor(const std::string& path, std::vector<PickupTemplate>* tem
     if (ok && catalog.pickup_templates.empty())
         ok = fail(&err, "the weapons donor contains no renderable 0x0008 pickup resources");
     if (ok)
-        ok = decode_pc_pickup_models(chunks, catalog, &next_models, &err);
+        ok = decode_pc_pickup_models(chunks, catalog, nullptr, &next_models, &err);
     if (ok) {
         for (const PickupTemplate& pickup : catalog.pickup_templates) {
             bool resolved = false;
@@ -1493,19 +1565,14 @@ uint32_t allocate_editor_guid(Document* document) {
     return 0;
 }
 
-bool normalise_editor_guids(Document* document, std::string* why) {
+bool normalise_editor_guids(Document* document, const ChunkList* source, std::string* why) {
     std::set<uint32_t> reserved;
-    if (!document->source_pc_path.empty()) {
-        Arena arena{}; Error err{}; ChunkList source{};
-        const bool ok = arena_init(&arena, 64 * MiB, &err) &&
-                        parse_chunks(document->source_pc_path.c_str(), &source, &arena, &err);
-        if (ok) for (uint32_t i = 0; i < source.count; ++i) {
-            const auto& chunk = source.chunks[i];
+    if (source) {
+        for (uint32_t i = 0; i < source->count; ++i) {
+            const auto& chunk = source->chunks[i];
             if (chunk.cid == ASURA_CHUNK_ENTITY && chunk.size >= 24)
                 reserved.insert(read_u32(chunk.data + 16));
         }
-        unmap_file(&source.file); arena_release(&arena);
-        if (!ok) { if (why) *why = err.message; return false; }
     }
     for (size_t index = 0; index < document->entities.size(); ++index) {
         Entity& entity = document->entities[index];
@@ -1544,6 +1611,32 @@ bool normalise_editor_guids(Document* document, std::string* why) {
 bool import_pc_entities(const ChunkList& chunks, Document* document, Error* err) {
     uint32_t light_number = 0, sound_number = 0, spawn_number = 0, object_number = 0, static_number = 0;
     uint32_t target_number = 0, marker_number = 0, volume_number = 0;
+    struct ResourceNameEntry {
+        uint32_t chunk_index;
+        Str name;
+    };
+    std::unordered_map<uint32_t, ResourceNameEntry> sounds, objects, hierarchies;
+    sounds.reserve(chunks.count / 32 + 1);
+    objects.reserve(chunks.count / 16 + 1);
+    hierarchies.reserve(chunks.count / 16 + 1);
+    for (uint32_t chunk_index = 0; chunk_index < chunks.count; ++chunk_index) {
+        RscfInfo resource{};
+        if (!rscf_info(chunks.chunks[chunk_index], &resource))
+            continue;
+        if (resource.type == ASURA_RESOURCEFILE_TYPE_SOUND) {
+            sounds.try_emplace(resource.subtype, ResourceNameEntry{chunk_index, resource.name});
+            continue;
+        }
+        if (resource.type != ASURA_RESOURCEFILE_TYPE_PLATFORMSPECIFIC)
+            continue;
+        if (resource.subtype == ASURA_RESOURCEFILE_TYPE_PC_OBJECT && resource.payload_size >= 4) {
+            objects.try_emplace(read_u32(resource.payload), ResourceNameEntry{chunk_index, resource.name});
+        } else if (resource.subtype == ASURA_RESOURCEFILE_TYPE_PC_OBJECTHIERARCHY ||
+                   resource.subtype == ASURA_RESOURCEFILE_TYPE_PC_CHARACTER) {
+            hierarchies.try_emplace(asura_lower_name_hash(resource.name),
+                                    ResourceNameEntry{chunk_index, resource.name});
+        }
+    }
     for (uint32_t chunk_index = 0; chunk_index < chunks.count; ++chunk_index) {
         const ChunkRef& chunk = chunks.chunks[chunk_index];
         if (chunk.cid != ASURA_CHUNK_LIGHTS)
@@ -1606,7 +1699,9 @@ bool import_pc_entities(const ChunkList& chunks, Document* document, Error* err)
             entity.value_b = entity.sound_phonon.m_fOuterRadius;
             entity.sound_loop = (entity.sound_phonon.m_uFlags & 1u) != 0;
             entity.sound_controller_active = (entity.sound_phonon.m_uFlags & 0x10u) != 0;
-            entity.sound_name = pc_sound_name(chunks, entity.sound_phonon.m_uSoundResourceID);
+            const auto sound = sounds.find(entity.sound_phonon.m_uSoundResourceID);
+            if (sound != sounds.end())
+                entity.sound_name.assign(sound->second.name.data, sound->second.name.size);
             entity.name = entity.sound_name.empty() ? "Sound " + std::to_string(++sound_number) : entity.sound_name;
             document->entities.push_back(std::move(entity));
         }
@@ -1686,7 +1781,18 @@ bool import_pc_entities(const ChunkList& chunks, Document* document, Error* err)
             memcpy(entity.static_object_body.data(), body_bytes, entity.static_object_body.size());
             entity.position = body.m_xPhysicalObject.m_xPosition;
             entity.rotation = quaternion_euler(body.m_xPhysicalObject.m_xOrientation);
-            entity.name = static_object_resource_name(chunks, entity.value_u32_b, entity.pickup_skin_id);
+            const ResourceNameEntry* resource_name = nullptr;
+            const auto object = objects.find(entity.value_u32_b);
+            if (object != objects.end())
+                resource_name = &object->second;
+            if (entity.pickup_skin_id) {
+                const auto hierarchy = hierarchies.find(entity.pickup_skin_id);
+                if (hierarchy != hierarchies.end() &&
+                    (!resource_name || hierarchy->second.chunk_index < resource_name->chunk_index))
+                    resource_name = &hierarchy->second;
+            }
+            if (resource_name)
+                entity.name.assign(resource_name->name.data, resource_name->name.size);
             if (entity.name.empty()) {
                 char name[96]{};
                 snprintf(name, sizeof(name), "Object %u (%08X)", ++static_number, entity.value_u32_b);
@@ -1790,8 +1896,20 @@ bool import_pc_entities(const ChunkList& chunks, Document* document, Error* err)
 }
 
 bool decode_pc_static_object_models(const ChunkList& chunks, const Document& document,
+                                    const PcModelMaterialIndex* material_index,
                                     std::vector<StaticObjectModel>* models, Error* err) {
     models->clear();
+    PcModelMaterialIndex local_material_index;
+    if (!material_index) {
+        build_pc_model_material_index(chunks, &local_material_index);
+        material_index = &local_material_index;
+    }
+    std::set<uint32_t> referenced;
+    for (const Entity& entity : document.entities)
+        if (entity.kind == EntityKind::StaticObject)
+            referenced.insert(entity.value_u32_b);
+    for (const StaticObjectTemplate& object : document.static_object_templates)
+        referenced.insert(object.file_id);
     for (uint32_t chunk_index = 0; chunk_index < chunks.count; ++chunk_index) {
         RscfInfo resource{};
         if (!rscf_info(chunks.chunks[chunk_index], &resource) ||
@@ -1799,15 +1917,10 @@ bool decode_pc_static_object_models(const ChunkList& chunks, const Document& doc
             resource.subtype != ASURA_RESOURCEFILE_TYPE_PC_OBJECT || resource.payload_size < 20)
             continue;
         const uint32_t file_id = read_u32(resource.payload);
-        bool referenced = false;
-        for (const Entity& entity : document.entities)
-            referenced |= entity.kind == EntityKind::StaticObject && entity.value_u32_b == file_id;
-        for (const StaticObjectTemplate& object : document.static_object_templates)
-            referenced |= object.file_id == file_id;
-        if (!referenced)
+        if (!referenced.contains(file_id))
             continue;
         StaticObjectModel model;
-        if (decode_pc_static_object_model(chunks, chunk_index, resource, &model, err))
+        if (decode_pc_static_object_model(chunks, chunk_index, resource, material_index, &model, err))
             models->push_back(std::move(model));
         else if (err->set)
             return false;
@@ -1937,11 +2050,27 @@ bool import_pc_collision_barriers(const ChunkList& chunks, Document* document, E
 
     // The 0x200 bit marks collision-only barriers across stock materials.
     std::vector<size_t> candidates;
+    candidates.reserve(polygons.size());
     for (size_t i = 0; i < polygons.size(); ++i)
         if ((polygons[i].flags & 0x200u) && polygons[i].vertex_count >= 3 && polygons[i].vertex_count <= 4)
             candidates.push_back(i);
     if (candidates.size() > 10000)
         return fail(err, "the PC has too many collision-only barrier faces");
+
+    // Connectivity can only cross faces with identical runtime classification.
+    // Bucket those immutable properties once so the component walk does not
+    // rescan every unrelated collision face for every member it visits. Members
+    // stay in source order, preserving the exact component/face ordering of the
+    // previous full scan.
+    const auto group_key = [](const PcCollisionPolygon& face) {
+        return (static_cast<uint64_t>(face.module_index) << 32) | face.material;
+    };
+    std::unordered_map<uint64_t, std::array<std::vector<size_t>, 2>> groups;
+    groups.reserve(candidates.size());
+    for (size_t candidate = 0; candidate < candidates.size(); ++candidate) {
+        const auto& face = polygons[candidates[candidate]];
+        groups[group_key(face)][legacy_collision_barrier_face(face.material, face.flags)].push_back(candidate);
+    }
 
     std::vector<uint8_t> assigned(candidates.size());
     const auto shares_edge = [](const PcCollisionPolygon& a, const PcCollisionPolygon& b) {
@@ -1962,15 +2091,17 @@ bool import_pc_collision_barriers(const ChunkList& chunks, Document* document, E
         if (assigned[seed]) continue;
         assigned[seed] = 1;
         std::vector<size_t> component{seed};
+        const auto& seed_face = polygons[candidates[seed]];
+        const auto group = groups.find(group_key(seed_face));
+        if (group == groups.end())
+            return fail(err, "internal collision-barrier grouping error");
+        const auto& members = group->second[legacy_collision_barrier_face(seed_face.material, seed_face.flags)];
         for (size_t head = 0; head < component.size(); ++head) {
             const auto& first = polygons[candidates[component[head]]];
-            for (size_t next = 0; next < candidates.size(); ++next) {
+            for (size_t next : members) {
                 if (assigned[next]) continue;
                 const auto& other = polygons[candidates[next]];
-                if (first.module_index == other.module_index && first.material == other.material &&
-                    legacy_collision_barrier_face(first.material, first.flags) ==
-                        legacy_collision_barrier_face(other.material, other.flags) &&
-                    shares_edge(first, other)) {
+                if (shares_edge(first, other)) {
                     assigned[next] = 1;
                     component.push_back(next);
                 }
@@ -1983,6 +2114,7 @@ bool import_pc_collision_barriers(const ChunkList& chunks, Document* document, E
         if (!barrier.guid) return fail(err, "no GUID is available for an imported collision barrier");
         barrier.name = "Collision barrier " + std::to_string(document->entities.size() + 1);
         barrier.source_bounds = {FLT_MAX, -FLT_MAX, FLT_MAX, -FLT_MAX, FLT_MAX, -FLT_MAX};
+        barrier.collision_faces.reserve(component.size());
         for (size_t member : component) {
             const auto& polygon = polygons[candidates[member]];
             CollisionBarrierFace face;
@@ -2055,10 +2187,13 @@ bool load_pc_level(const std::string& path, Document* document, Mesh* mesh, std:
         for (StaticObjectTemplate& object : next_document.static_object_templates)
             object.donor_path = path;
     }
+    PcModelMaterialIndex material_index;
+    if (ok && (pickup_models || object_models))
+        build_pc_model_material_index(chunks, &material_index);
     if (ok && pickup_models)
-        ok = decode_pc_pickup_models(chunks, next_document, &next_pickup_models, &err);
+        ok = decode_pc_pickup_models(chunks, next_document, &material_index, &next_pickup_models, &err);
     if (ok && object_models)
-        ok = decode_pc_static_object_models(chunks, next_document, &next_object_models, &err);
+        ok = decode_pc_static_object_models(chunks, next_document, &material_index, &next_object_models, &err);
     if (ok) {
         next_document.source_collision_inventory_complete = true;
         next_document.source_pc_path = path;

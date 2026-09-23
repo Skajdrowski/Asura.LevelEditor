@@ -55,11 +55,10 @@ ModelBoneTransform interpolate(const ModelBoneTransform &a, const ModelBoneTrans
     return {plus(times(a.position, 1 - t), times(b.position, t)),
             normalize({q.x * s + r.x * u, q.y * s + r.y * u, q.z * s + r.z * u, q.w * s + r.w * u})};
 }
-bool decode_skin(const ChunkList &chunks, EntityModel *model, Error *err) {
-    for (uint32_t i = 0; i < chunks.count; ++i) {
+bool decode_skin(const ChunkList &chunks, const ModelAnimationChunkIndex &index,
+                 EntityModel *model, Error *err) {
+    for (uint32_t i : index.skin_chunks) {
         const auto &c = chunks.chunks[i];
-        if (c.cid != ASURA_CHUNK_HIERARCHY_SKIN)
-            continue;
         const Str name = padded_string_at(c.data, c.size, 24);
         if (!name.data ||
             !str_ieq(name, {model->resource_name.data(), static_cast<uint32_t>(model->resource_name.size())}))
@@ -153,24 +152,49 @@ bool decode_animation(const ChunkRef &c, ModelAnimation *animation, Error *err) 
 }
 } // namespace
 
+void build_model_animation_chunk_index(const ChunkList &chunks, ModelAnimationChunkIndex *index) {
+    index->skin_chunks.clear();
+    index->animation_chunks.clear();
+    index->skin_chunks.reserve(chunks.count / 16 + 1);
+    index->animation_chunks.reserve(chunks.count / 16 + 1);
+    for (uint32_t i = 0; i < chunks.count; ++i) {
+        const uint32_t cid = chunks.chunks[i].cid;
+        if (cid == ASURA_CHUNK_HIERARCHY_SKIN)
+            index->skin_chunks.push_back(i);
+        else if (cid == ASURA_CHUNK_HIERARCHY_COMPRESSEDANIM)
+            index->animation_chunks.push_back(i);
+    }
+}
+
 Asura_Quat decode_legacy_animation_quaternion(uint32_t word) {
     // MCP1 Asura_Comp_Quat::ToQuat, 0x821FA080; MCP2 0x435F60. HCAN <=v4 uses
     // this legacy axis-angle codec; the later fast quaternion format differs.
     constexpr float step = 3.14159265358979323846f / 512;
+    constexpr float angle_limit = 1.5707999467849731f; // exact target bits: 0x3FC90FF9
     const float w = (word & 2047) / 1024.f;
     if (w >= 1)
         return {0, 0, 0, 1};
-    const float a = std::min(1.57079632679f, ((word >> 20) & 511) * step),
-                b = std::min(1.57079632679f, ((word >> 11) & 511) * step), s = sqrtf(1 - w * w);
-    return {s * sinf(a) * cosf(b) * (word & 0x80000000 ? -1 : 1), s * sinf(b) * (word & 0x40000000 ? -1 : 1),
-            s * cosf(a) * cosf(b) * (word & 0x20000000 ? -1 : 1), w};
+    const float a = std::min(angle_limit, ((word >> 20) & 511) * step),
+                b = std::min(angle_limit, ((word >> 11) & 511) * step);
+    const float cosine_b = cosf(b);
+    float x = sinf(a) * cosine_b, y = sinf(b), z = cosf(a) * cosine_b;
+    if (word & 0x80000000) x = -x;
+    if (word & 0x40000000) y = -y;
+    if (word & 0x20000000) z = -z;
+    const float s = sqrtf(1 - w * w);
+    return {x * s, y * s, z * s, w};
 }
 
-bool decode_model_animations(const ChunkList &chunks, const std::vector<uint32_t> &ids, EntityModel *model,
-                             Error *err) {
+bool decode_model_animations(const ChunkList &chunks, const ModelAnimationChunkIndex *chunk_index,
+                             const std::vector<uint32_t> &ids, EntityModel *model, Error *err) {
     if (model->weights.empty() || ids.empty())
         return true;
-    if (!decode_skin(chunks, model, err))
+    ModelAnimationChunkIndex local_index;
+    if (!chunk_index) {
+        build_model_animation_chunk_index(chunks, &local_index);
+        chunk_index = &local_index;
+    }
+    if (!decode_skin(chunks, *chunk_index, model, err))
         return false;
     if (model->bones.empty())
         return true;
@@ -193,10 +217,8 @@ bool decode_model_animations(const ChunkList &chunks, const std::vector<uint32_t
         for (float &w : weights.weights)
             w /= sum;
     }
-    for (uint32_t i = 0; i < chunks.count; ++i) {
+    for (uint32_t i : chunk_index->animation_chunks) {
         const auto &c = chunks.chunks[i];
-        if (c.cid != ASURA_CHUNK_HIERARCHY_COMPRESSEDANIM)
-            continue;
         const auto name = padded_string_at(c.data, c.size, 44);
         if (!name.data)
             continue;
@@ -230,11 +252,11 @@ const ModelAnimation *entity_model_animation(const Entity &entity, const EntityM
     return nullptr;
 }
 
-bool sample_entity_model(const Entity &entity, const EntityModel &model, double seconds,
+bool sample_entity_model(const Entity &entity, const EntityModel &model, const ModelAnimation &animation,
+                         double seconds,
                          std::vector<EntityModelVertex> *vertices,
                          std::vector<ModelBoneTransform> *transform_scratch) {
-    const auto *animation = entity_model_animation(entity, model);
-    if (!animation || !transform_scratch)
+    if (!transform_scratch)
         return false;
     Asura_ServerEntity_PhysicalObject_ChunkDataV7 physical{};
     if (entity.kind == EntityKind::StaticObject && entity.static_object_has_template)
@@ -249,9 +271,9 @@ bool sample_entity_model(const Entity &entity, const EntityModel &model, double 
     else
         physical.m_iAnimFlags = 1;
     double time =
-        seconds / animation->duration + (std::isfinite(physical.m_fAnimTimer) ? physical.m_fAnimTimer : 0);
+        seconds / animation.duration + (std::isfinite(physical.m_fAnimTimer) ? physical.m_fAnimTimer : 0);
     if (time > 1 && physical.m_iAnimFlags & 1) {
-        const double loop = animation->loop_point;
+        const double loop = animation.loop_point;
         time = loop < 1 ? loop + fmod(time - loop, 1 - loop) : 1;
     }
     const float t = static_cast<float>(std::clamp(time, 0., 1.));
@@ -262,7 +284,7 @@ bool sample_entity_model(const Entity &entity, const EntityModel &model, double 
     for (size_t b = 0; b < model.bones.size(); ++b) {
         const auto &bone = model.bones[b];
         auto local = bone.bind;
-        const auto &track = animation->tracks[b];
+        const auto &track = animation.tracks[b];
         if (!track.empty()) {
             auto next =
                 std::upper_bound(track.begin(), track.end(), t,

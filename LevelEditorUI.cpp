@@ -1,6 +1,8 @@
 #include "LevelEditorInternal.h"
 #include "LevelEditorSoundTriggers.h"
 
+#include <cstdlib>
+
 using namespace asura;
 using namespace asura::level;
 
@@ -81,13 +83,19 @@ bool entity_is_selected(int index) {
 }
 
 void set_single_selection_state(int index) {
+    const int old_selected = g.selected;
+    const std::vector<int> old_selection = g.selected_entities;
     g.selected_entities.clear();
     g.selected = valid_entity_index(index) ? index : -1;
     if (g.selected >= 0)
         g.selected_entities.push_back(g.selected);
+    if (g.selected != old_selected || g.selected_entities != old_selection)
+        gpu_invalidate_entity_cache();
 }
 
 void normalize_selection_state() {
+    const int old_selected = g.selected;
+    const std::vector<int> old_selection = g.selected_entities;
     std::vector<int> normalized;
     normalized.reserve(g.selected_entities.size());
     for (int index : g.selected_entities) {
@@ -98,6 +106,8 @@ void normalize_selection_state() {
     g.selected_entities = std::move(normalized);
     if (!entity_is_selected(g.selected))
         g.selected = g.selected_entities.empty() ? -1 : g.selected_entities.back();
+    if (g.selected != old_selected || g.selected_entities != old_selection)
+        gpu_invalidate_entity_cache();
 }
 
 void record_inspector_edit(int id, int notification) {
@@ -437,12 +447,21 @@ void update_title() {
 
 bool commit_history_transaction() {
     const bool changed = g.history.commit(&g.document, g.selected);
+    if (changed)
+        gpu_invalidate_entity_cache();
     update_title();
     return changed;
 }
 
+void invalidate_entity_model_caches() {
+    gpu_invalidate_entity_cache();
+    g.entity_model_raycast_lookup.clear();
+    g.entity_model_raycasts.clear();
+}
+
 void reset_history(bool mark_as_saved) {
     g.history.reset(&g.document, g.selected, mark_as_saved);
+    invalidate_entity_model_caches();
     update_title();
 }
 
@@ -1303,10 +1322,52 @@ void select_entities_from_list() {
         sync_entity_list_selection();
     if (g.selected != old_primary || g.selected_entities != old_selection)
         stop_sound_preview();
+    if (g.selected != old_primary || g.selected_entities != old_selection)
+        gpu_invalidate_entity_cache();
     refresh_inspector();
     request_redraw();
     if (restricted)
         set_status("Multiple selection is limited to one entity type.");
+}
+
+int32_t compare_entity_list_order(const void* left, const void* right) {
+    const uint32_t a = *static_cast<const uint32_t*>(left);
+    const uint32_t b = *static_cast<const uint32_t*>(right);
+    const Entity& first = g.document.entities[a];
+    const Entity& second = g.document.entities[b];
+    const int32_t names = _stricmp(first.name.c_str(), second.name.c_str());
+    if (names != 0)
+        return names;
+    const int32_t types = _stricmp(entity_type_label(first.kind), entity_type_label(second.kind));
+    if (types != 0)
+        return types;
+    if (first.guid != second.guid)
+        return first.guid < second.guid ? -1 : 1;
+    return a == b ? 0 : a < b ? -1 : 1;
+}
+
+int32_t compare_pickup_choices(const void* left, const void* right) {
+    const PickupTemplate* a = *static_cast<const PickupTemplate* const*>(left);
+    const PickupTemplate* b = *static_cast<const PickupTemplate* const*>(right);
+    const std::string first = snipe_item_label(a->item_id);
+    const std::string second = snipe_item_label(b->item_id);
+    const int32_t names = _stricmp(first.c_str(), second.c_str());
+    if (names != 0)
+        return names;
+    if (a->item_id != b->item_id)
+        return a->item_id < b->item_id ? -1 : 1;
+    return a == b ? 0 : a < b ? -1 : 1;
+}
+
+int32_t compare_static_object_choices(const void* left, const void* right) {
+    const StaticObjectTemplate* a = *static_cast<const StaticObjectTemplate* const*>(left);
+    const StaticObjectTemplate* b = *static_cast<const StaticObjectTemplate* const*>(right);
+    const int32_t names = _stricmp(a->resource_name.c_str(), b->resource_name.c_str());
+    if (names != 0)
+        return names;
+    if (a->file_id != b->file_id)
+        return a->file_id < b->file_id ? -1 : 1;
+    return a == b ? 0 : a < b ? -1 : 1;
 }
 
 void refresh_list() {
@@ -1314,17 +1375,8 @@ void refresh_list() {
     std::vector<uint32_t> order(g.document.entities.size());
     for (uint32_t index = 0; index < order.size(); ++index)
         order[index] = index;
-    std::sort(order.begin(), order.end(), [](uint32_t a, uint32_t b) {
-        const Entity& first = g.document.entities[a];
-        const Entity& second = g.document.entities[b];
-        const int names = _stricmp(first.name.c_str(), second.name.c_str());
-        if (names != 0)
-            return names < 0;
-        const int types = _stricmp(entity_type_label(first.kind), entity_type_label(second.kind));
-        if (types != 0)
-            return types < 0;
-        return first.guid != second.guid ? first.guid < second.guid : a < b;
-    });
+    if (!order.empty())
+        qsort(order.data(), order.size(), sizeof(order[0]), compare_entity_list_order);
     for (uint32_t index : order) {
         const Entity& entity = g.document.entities[index];
         const std::string line = std::string(entity_type_label(entity.kind)) + "  " + entity.name;
@@ -1342,14 +1394,8 @@ void refresh_pickup_choices(uint32_t selected_item) {
     choices.reserve(g.document.pickup_templates.size());
     for (const PickupTemplate& item : g.document.pickup_templates)
         choices.push_back(&item);
-    std::sort(choices.begin(), choices.end(), [](const PickupTemplate* a, const PickupTemplate* b) {
-        const std::string first = snipe_item_label(a->item_id);
-        const std::string second = snipe_item_label(b->item_id);
-        const int names = _stricmp(first.c_str(), second.c_str());
-        if (names != 0)
-            return names < 0;
-        return a->item_id != b->item_id ? a->item_id < b->item_id : a < b;
-    });
+    if (!choices.empty())
+        qsort(choices.data(), choices.size(), sizeof(choices[0]), compare_pickup_choices);
     for (const PickupTemplate* item : choices) {
         const std::string label = snipe_item_label(item->item_id);
         const LRESULT row = SendMessageA(g.pickup_item, CB_ADDSTRING, 0,
@@ -1368,13 +1414,8 @@ void refresh_static_object_choices(uint32_t selected_file) {
     choices.reserve(g.document.static_object_templates.size());
     for (const StaticObjectTemplate& object : g.document.static_object_templates)
         choices.push_back(&object);
-    std::sort(choices.begin(), choices.end(), [](const StaticObjectTemplate* a,
-                                                 const StaticObjectTemplate* b) {
-        const int names = _stricmp(a->resource_name.c_str(), b->resource_name.c_str());
-        if (names != 0)
-            return names < 0;
-        return a->file_id != b->file_id ? a->file_id < b->file_id : a < b;
-    });
+    if (!choices.empty())
+        qsort(choices.data(), choices.size(), sizeof(choices[0]), compare_static_object_choices);
     for (const StaticObjectTemplate* object : choices) {
         char label[640]{};
         snprintf(label, sizeof(label), "%s (%08X)",
@@ -1615,6 +1656,7 @@ void toggle_entity_selection(int index) {
         g.selected_entities.erase(g.selected_entities.begin() + static_cast<ptrdiff_t>(position));
         g.selected = g.selected_entities.empty() ? -1 : g.selected_entities.back();
     }
+    gpu_invalidate_entity_cache();
     sync_entity_list_selection();
     refresh_inspector();
     request_redraw();
@@ -2022,60 +2064,55 @@ void begin_place(EntityKind kind, uint32_t object_file = 0) {
     set_status("Click visible environment geometry to place the entity. Right-drag orbits; wheel zooms.");
 }
 
-bool ray_hits_model_triangle(const EnvironmentRay& ray, const Asura_Vector_3& a,
-                             const Asura_Vector_3& b, const Asura_Vector_3& c,
-                             float maximum_distance, float* distance) {
-    const Asura_Vector_3 ab = sub(b, a);
-    const Asura_Vector_3 ac = sub(c, a);
-    const Asura_Vector_3 p = cross(ray.direction, ac);
-    const float determinant = dot(ab, p);
-    if (fabsf(determinant) <= 1.0e-9f)
-        return false;
-    const float inverse_determinant = 1.0f / determinant;
-    const Asura_Vector_3 from_a = sub(ray.origin, a);
-    const float u = dot(from_a, p) * inverse_determinant;
-    if (u < -1.0e-6f || u > 1.000001f)
-        return false;
-    const Asura_Vector_3 q = cross(from_a, ab);
-    const float v = dot(ray.direction, q) * inverse_determinant;
-    if (v < -1.0e-6f || u + v > 1.000001f)
-        return false;
-    const float hit_distance = dot(ac, q) * inverse_determinant;
-    if (hit_distance <= 1.0e-5f || hit_distance >= maximum_distance)
-        return false;
-    *distance = hit_distance;
-    return true;
+const EnvironmentRaycast* entity_model_raycast(const EntityModel& model) {
+    auto found = g.entity_model_raycast_lookup.find(&model);
+    if (found == g.entity_model_raycast_lookup.end()) {
+        const size_t index = g.entity_model_raycasts.size();
+        g.entity_model_raycasts.push_back({});
+        g.entity_model_raycasts.back().model = &model;
+        g.entity_model_raycast_lookup.emplace(&model, index);
+        found = g.entity_model_raycast_lookup.find(&model);
+    }
+    EntityModelRaycastCache& cache = g.entity_model_raycasts[found->second];
+    if (cache.vertices == model.vertices.data() && cache.vertex_count == model.vertices.size() &&
+        cache.faces == model.faces.data() && cache.face_count == model.faces.size())
+        return cache.raycast.empty() ? nullptr : &cache.raycast;
+
+    Mesh mesh;
+    mesh.positions.reserve(model.vertices.size());
+    for (const EntityModelVertex& vertex : model.vertices)
+        mesh.positions.push_back(vertex.position);
+    mesh.faces.reserve(model.faces.size());
+    for (const auto& face : model.faces)
+        mesh.faces.push_back({face[0], face[1], face[2]});
+    cache.raycast.build(mesh);
+    cache.vertices = model.vertices.data();
+    cache.vertex_count = model.vertices.size();
+    cache.faces = model.faces.data();
+    cache.face_count = model.faces.size();
+    return cache.raycast.empty() ? nullptr : &cache.raycast;
 }
 
 bool entity_model_ray_distance(const Entity& entity, const EntityModel& model, const EnvironmentRay& ray,
                                float* distance) {
     if (!distance)
         return false;
+    const EnvironmentRaycast* raycast = entity_model_raycast(model);
+    if (!raycast)
+        return false;
     const Asura_Quat orientation = euler_quaternion(entity.rotation);
     const Asura_Vector_3 model_origin = entity_view_position(entity.position);
-    const auto model_position = [&](Asura_Vector_3 value) {
-        value = rotate_by_quaternion(value, orientation);
-        value.y = -value.y;
-        return add(model_origin, value);
-    };
-    float closest = FLT_MAX;
-    bool found = false;
-    for (const auto& face : model.faces) {
-        if (face[0] >= model.vertices.size() || face[1] >= model.vertices.size() ||
-            face[2] >= model.vertices.size())
-            continue;
-        const Asura_Vector_3 a = model_position(model.vertices[face[0]].position);
-        const Asura_Vector_3 b = model_position(model.vertices[face[1]].position);
-        const Asura_Vector_3 c = model_position(model.vertices[face[2]].position);
-        float candidate = 0.0f;
-        if (ray_hits_model_triangle(ray, a, b, c, closest, &candidate)) {
-            closest = candidate;
-            found = true;
-        }
-    }
-    if (!found)
+    const Asura_Quat inverse{-orientation.x, -orientation.y, -orientation.z, orientation.w};
+    Asura_Vector_3 local_origin = sub(ray.origin, model_origin);
+    Asura_Vector_3 local_direction = ray.direction;
+    local_origin.y = -local_origin.y;
+    local_direction.y = -local_direction.y;
+    const EnvironmentRay local_ray{rotate_by_quaternion(local_origin, inverse),
+                                   rotate_by_quaternion(local_direction, inverse)};
+    EnvironmentRayHit hit{};
+    if (!raycast->intersect(local_ray, &hit))
         return false;
-    *distance = closest;
+    *distance = hit.distance;
     return true;
 }
 
@@ -2656,6 +2693,7 @@ void create_controls() {
         make_control("BUTTON", entity_button_text[i], BS_PUSHBUTTON, entity_button_ids[i]);
     make_control("STATIC",
                  "Right: orbit; Middle: pan; Wheel: zoom\r\n"
+                 "Shift-drag entity: adjust height\r\n"
                  "Ctrl/Shift: select same-type entities\r\n"
                  "Ctrl+Z/Y: undo/redo\r\n"
                  "Ctrl+C/V: copy/paste; Del: remove",
@@ -3097,6 +3135,7 @@ void refresh_after_history_restore(const Document& previous, const char* action)
     set_single_selection_state(g.selected);
     std::string why;
     const bool resources_ready = refresh_history_derived_resources(previous, &why);
+    invalidate_entity_model_caches();
     refresh_list();
     refresh_inspector();
     update_title();
@@ -3150,6 +3189,7 @@ void command_paste_entity() {
     }
     g.selected_entities = std::move(pasted);
     g.selected = g.selected_entities.empty() ? -1 : g.selected_entities.back();
+    gpu_invalidate_entity_cache();
     g.pending_kind = -1;
     refresh_list();
     refresh_inspector();
@@ -3336,33 +3376,33 @@ void command_export_obj() {
     MessageBoxA(g.window, result.c_str(), "OBJ export complete", MB_ICONINFORMATION);
 }
 
-bool valid_wave_bytes(const std::vector<uint8_t>& bytes) {
-    return bytes.size() >= 12 && memcmp(bytes.data(), "RIFF", 4) == 0 &&
-           memcmp(bytes.data() + 8, "WAVE", 4) == 0;
+bool valid_wave_bytes(const uint8_t* bytes, size_t size) {
+    return size >= 12 && memcmp(bytes, "RIFF", 4) == 0 &&
+           memcmp(bytes + 8, "WAVE", 4) == 0;
 }
 
 bool load_preview_wave_file(const std::string& path, std::vector<uint8_t>* bytes, std::string* why) {
-    std::ifstream file(path, std::ios::binary | std::ios::ate);
-    if (!file) {
+    MappedFile file{};
+    Error error{};
+    if (!map_file(path.c_str(), &file, &error)) {
         if (why)
             *why = "Could not open the selected WAV file.";
         return false;
     }
-    const std::streamoff size = file.tellg();
-    if (size < 12 || size > static_cast<std::streamoff>(512 * MiB)) {
+    if (file.size < 12 || file.size > 512 * MiB || file.size > static_cast<uint64_t>(SIZE_MAX)) {
+        unmap_file(&file);
         if (why)
             *why = "The selected WAV file has an invalid size.";
         return false;
     }
-    std::vector<uint8_t> next(static_cast<size_t>(size));
-    file.seekg(0);
-    if (!file.read(reinterpret_cast<char*>(next.data()), static_cast<std::streamsize>(size)) ||
-        !valid_wave_bytes(next)) {
+    if (!valid_wave_bytes(file.data, static_cast<size_t>(file.size))) {
+        unmap_file(&file);
         if (why)
             *why = "The selected sound is not a raw RIFF/WAVE resource.";
         return false;
     }
-    *bytes = std::move(next);
+    bytes->assign(file.data, file.data + static_cast<size_t>(file.size));
+    unmap_file(&file);
     return true;
 }
 
@@ -3386,7 +3426,7 @@ bool load_embedded_preview_wave(const Entity& entity, std::vector<uint8_t>* byte
                 resource.subtype != entity.sound_phonon.m_uSoundResourceID)
                 continue;
             bytes->assign(resource.payload, resource.payload + resource.payload_size);
-            ok = valid_wave_bytes(*bytes);
+            ok = valid_wave_bytes(bytes->data(), bytes->size());
             if (!ok)
                 fail(&err, "embedded sound resource %u is not raw RIFF/WAVE data",
                      entity.sound_phonon.m_uSoundResourceID);
@@ -3958,6 +3998,7 @@ void command_weapons_donor() {
         }
     }
     commit_history_transaction();
+    invalidate_entity_model_caches();
     char status[220]{};
     snprintf(status, sizeof(status), "Weapons donor loaded: %zu pickup item definitions, %zu rendered models.",
              templates.size(), g.pickup_models.size());
@@ -4195,6 +4236,7 @@ void command_import_object(bool editing = false) {
     } else g.document.static_object_templates.push_back(object);
     commit_history_transaction();
     apply_static_object_preview_properties(g.document, &g.pickup_models, &g.static_object_models);
+    invalidate_entity_model_caches();
     refresh_inspector();
     invalidate_environment_cache();
     request_redraw();
@@ -4294,6 +4336,7 @@ void command_object_donor() {
         }
     }
     commit_history_transaction();
+    invalidate_entity_model_caches();
     char status[260]{};
     apply_static_object_preview_properties(g.document, &g.pickup_models, &g.static_object_models);
     snprintf(status, sizeof(status),
@@ -4504,19 +4547,30 @@ void delete_selected() {
     stop_sound_preview();
     if (!g.history.begin(g.document, g.selected))
         return;
-    std::vector<int> targets = g.selected_entities;
-    std::sort(targets.begin(), targets.end());
-    const int next_index = targets.front();
-    for (auto it = targets.rbegin(); it != targets.rend(); ++it)
-        g.document.entities.erase(g.document.entities.begin() + *it);
+    const size_t deleted_count = g.selected_entities.size();
+    std::vector<uint8_t> remove(g.document.entities.size());
+    int next_index = static_cast<int>(g.document.entities.size());
+    for (int index : g.selected_entities) {
+        remove[static_cast<size_t>(index)] = 1;
+        next_index = std::min(next_index, index);
+    }
+    size_t write = 0;
+    for (size_t read = 0; read < g.document.entities.size(); ++read) {
+        if (remove[read])
+            continue;
+        if (write != read)
+            g.document.entities[write] = std::move(g.document.entities[read]);
+        ++write;
+    }
+    g.document.entities.resize(write);
     set_single_selection_state(std::min(next_index, static_cast<int>(g.document.entities.size()) - 1));
     commit_history_transaction();
     refresh_list();
     refresh_inspector();
     request_redraw();
-    if (targets.size() > 1) {
+    if (deleted_count > 1) {
         char status[96]{};
-        snprintf(status, sizeof(status), "Deleted %zu selected entities.", targets.size());
+        snprintf(status, sizeof(status), "Deleted %zu selected entities.", deleted_count);
         set_status(status);
     }
 }
@@ -4732,9 +4786,9 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             return 0;
         }
         select_entity(hit);
-        if (hit >= 0 && !(g.document.entities[hit].kind == EntityKind::CollisionBarrier &&
-                          !g.document.entities[hit].collision_faces.empty()) &&
-            g.history.begin(g.document, g.selected)) {
+        if (hit >= 0 && !g.history.transaction_active() &&
+            !(g.document.entities[hit].kind == EntityKind::CollisionBarrier &&
+              !g.document.entities[hit].collision_faces.empty())) {
             g.moving_entity = true;
             g.entity_drag_last_mouse = p;
             SetCapture(hwnd);
@@ -4792,12 +4846,38 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
         if (g.moving_entity && g.selected >= 0) {
             if (now.x == g.entity_drag_last_mouse.x && now.y == g.entity_drag_last_mouse.y)
                 return 0;
+            const POINT previous = g.entity_drag_last_mouse;
             g.entity_drag_last_mouse = now;
-            Asura_Vector_3 p{};
-            if (environment_point_from_screen(now.x, now.y, &p)) {
-                Entity& e = g.document.entities[g.selected];
+            Entity& e = g.document.entities[g.selected];
+            Asura_Vector_3 p = e.position;
+            bool have_position = false;
+            if (wparam & MK_SHIFT) {
+                const RECT vr = viewport_rect();
+                Asura_Vector_3 cam{}, right{}, up{}, forward{};
+                camera_axes(&cam, &right, &up, &forward);
+                const Asura_Vector_3 rel = sub(entity_view_position(e.position), cam);
+                const float depth = dot(rel, forward);
+                const float focal = .85f * static_cast<float>(std::min(vr.right - vr.left, vr.bottom - vr.top));
+                const float vertical_screen_scale = depth > .05f && focal > 0.0f
+                                                        ? focal * (up.y * depth - dot(rel, up) * forward.y) /
+                                                              (depth * depth)
+                                                        : 0.0f;
+                if (fabsf(vertical_screen_scale) > 1.0e-6f) {
+                    p.y += static_cast<float>(now.y - previous.y) / vertical_screen_scale;
+                    have_position = true;
+                }
+            } else {
+                have_position = environment_point_from_screen(now.x, now.y, &p);
+            }
+            if (have_position) {
                 if (e.position.x == p.x && e.position.y == p.y && e.position.z == p.z)
                     return 0;
+                if (!g.history.transaction_active() && !g.history.begin(g.document, g.selected)) {
+                    g.moving_entity = false;
+                    if (GetCapture() == hwnd)
+                        ReleaseCapture();
+                    return 0;
+                }
                 const Asura_Vector_3 delta = sub(p, e.position);
                 e.position = p;
                 if (e.kind == EntityKind::CollisionBarrier) {
@@ -4816,6 +4896,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
                 set_float(g.pos[1], e.position.y);
                 set_float(g.pos[2], e.position.z);
                 g.refreshing_inspector = was_refreshing_inspector;
+                gpu_invalidate_entity_cache();
                 request_redraw();
             }
         } else if (g.orbiting) {

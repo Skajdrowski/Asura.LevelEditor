@@ -10,7 +10,6 @@ namespace asura::level {
 // sub_4836C0 shares one 0x4000-byte buffer between AABB
 // traversal frames (28 bytes each) and returned object IDs (4 bytes each).
 // Keep a complete module query comfortably below that workspace limit.
-constexpr uint32_t kDefaultMaxCollisionPolys = 3000;
 
 bool parse_chunks_impl(const char* display_path, ChunkList* out, Arena* arena, Error* err) {
     if (out->file.size < 8 || memcmp(out->file.data, kAsuraMagic, 8) != 0)
@@ -213,7 +212,7 @@ bool initialize_editor_config(const char* obj_path, Config* cfg, Error* err) {
     cfg->flip_z = true;
     cfg->diffuse_abgr = 0xff808080u;
     cfg->max_prim_count = 1000;
-    cfg->max_collision_polys = kDefaultMaxCollisionPolys;
+    cfg->max_collision_polys = kWorkspaceSafeMaxCollisionPolys;
     cfg->auto_block_xz_cell = 40.0f;
     cfg->texture_prefix = "\\environments\\";
     cfg->arena_reserve = sizeof(void*) == 4 ? 256ull * MiB : 8ull * GiB;
@@ -715,6 +714,8 @@ bool build_env(const Config& cfg, const ObjData& obj, const MaterialMap& materia
         make_vec<Asura_PC_EnvironmentRenderer_Module>(arena, err, obj.face_count < 1024 ? obj.face_count : 1024);
     Vec<Asura_PC_EnvironmentRenderer_Strip> tb =
         make_vec<Asura_PC_EnvironmentRenderer_Strip>(arena, err, obj.face_count < 4096 ? obj.face_count : 4096);
+    Vec<uint32_t> collision_triangles =
+        make_vec<uint32_t>(arena, err, obj.face_count < 1024 ? obj.face_count : 1024);
     Buffer blocks{};
     if (!buffer_init(&blocks, cfg.output_reserve, err))
         return false;
@@ -728,12 +729,13 @@ bool build_env(const Config& cfg, const ObjData& obj, const MaterialMap& materia
         while (cursor < group_end) {
             ArenaMark mark = arena_mark(scratch);
             const uint32_t remaining = group_end - cursor;
-            uint32_t slot_cap = next_pow2((remaining > 21845 ? 65535 : remaining * 3) * 2 + 1);
+            const uint32_t vertex_cap = remaining > 21845 ? 65535 : remaining * 3;
+            uint32_t slot_cap = next_pow2(vertex_cap * 2 + 1);
             if (slot_cap < 16)
                 slot_cap = 16;
             VertexSlot* slots = arena_array<VertexSlot>(scratch, slot_cap, err);
             Asura_PC_EnvironmentRenderer_Vertex* verts =
-                arena_array<Asura_PC_EnvironmentRenderer_Vertex>(scratch, 65535, err, false);
+                arena_array<Asura_PC_EnvironmentRenderer_Vertex>(scratch, vertex_cap, err, false);
             LocalTri* tris = arena_array<LocalTri>(scratch, remaining, err, false);
             if (err->set) {
                 buffer_release(&blocks);
@@ -752,7 +754,7 @@ bool build_env(const Config& cfg, const ObjData& obj, const MaterialMap& materia
                 }
                 if (!add)
                     return false;
-                if (vert_count >= 65535)
+                if (vert_count >= vertex_cap)
                     return false;
                 const Asura_Vector_3 p = transform_vec(obj.positions[key.v], cfg);
                 Asura_Vector_3 n{0, 0, 1};
@@ -803,6 +805,9 @@ bool build_env(const Config& cfg, const ObjData& obj, const MaterialMap& materia
                 buffer_release(&blocks);
                 return fail(err, "could not fit an Env triangle in a uint16_t block");
             }
+            uint32_t collision_triangle_count = 0;
+            for (uint32_t i = 0; i < tri_count; ++i)
+                collision_triangle_count += tris[i].a != tris[i].b && tris[i].b != tris[i].c && tris[i].a != tris[i].c;
             heap_sort(tris, tri_count, tri_less);
             const uint64_t block_start = blocks.size;
             append_u32(&blocks, vert_count, err);
@@ -857,7 +862,8 @@ bool build_env(const Config& cfg, const ObjData& obj, const MaterialMap& materia
                 run = run_end;
             }
             patch_u32(&blocks, idx_count_at, index_count, err);
-            if (!ta.push({tb.count - b_start, b_start, block_index++})) {
+            if (!ta.push({tb.count - b_start, b_start, block_index++}) ||
+                !collision_triangles.push(collision_triangle_count)) {
                 buffer_release(&blocks);
                 return false;
             }
@@ -882,6 +888,7 @@ bool build_env(const Config& cfg, const ObjData& obj, const MaterialMap& materia
     buffer_append(&out->payload, blocks.base, blocks.size, err);
     out->modules = ta.count;
     out->strip_count = tb.count;
+    out->module_collision_triangles = collision_triangles.data;
     buffer_release(&blocks);
     return !err->set;
 }
@@ -999,40 +1006,44 @@ bool append_module_collision_v3(Buffer* out, const EnvView& env, uint32_t module
         const uint64_t seg_count = static_cast<uint64_t>(seg.m_uNumberOfTriangles) + 2;
         if (static_cast<uint64_t>(seg.m_uStartIndex) + seg_count > ni)
             return fail(err, "Env strip exceeds block index buffer");
+        const uint8_t* strip_indices = indices + static_cast<uint64_t>(seg.m_uStartIndex) * 2;
+        uint16_t first = read_u16(strip_indices);
+        uint16_t second = read_u16(strip_indices + 2);
         for (uint32_t j = 0; j < seg.m_uNumberOfTriangles; ++j) {
-            uint16_t x = read_u16(indices + (static_cast<uint64_t>(seg.m_uStartIndex) + j) * 2);
-            uint16_t y = read_u16(indices + (static_cast<uint64_t>(seg.m_uStartIndex) + j + 1) * 2);
-            uint16_t z = read_u16(indices + (static_cast<uint64_t>(seg.m_uStartIndex) + j + 2) * 2);
+            const uint16_t third = read_u16(strip_indices + static_cast<uint64_t>(j + 2) * 2);
+            uint16_t x = first, y = second, z = third;
             if (j & 1) {
                 uint16_t t = x;
                 x = y;
                 y = t;
             }
-            if (x == 0xffff || y == 0xffff || z == 0xffff || x >= nv || y >= nv || z >= nv || x == y || y == z ||
-                x == z)
-                continue;
-            uint32_t m = seg.m_iOriginalMaterialIndex < 0
-                             ? 0xffffu
-                             : static_cast<uint32_t>(seg.m_iOriginalMaterialIndex);
-            if (m > 0xffff)
-                m = 0xffff;
-            const uint32_t material_ordinal = m >= 1000 ? m - 1000 : m;
-            uint32_t default_flags = material_ordinal < materials.default_collision_flag_count
-                                               ? materials.default_collision_flags[material_ordinal] : 0;
-            if (materials.resolve_collision_flags) {
-                Asura_Vector_3 corners[3];
-                const uint16_t ids[3]{x, y, z};
-                for (uint32_t corner = 0; corner < 3; ++corner) {
-                    const uint8_t* vertex = vertices + static_cast<uint64_t>(ids[corner]) * 36;
-                    corners[corner] = {read_f32(vertex), read_f32(vertex + 4), read_f32(vertex + 8)};
+            if (x != 0xffff && y != 0xffff && z != 0xffff && x < nv && y < nv && z < nv && x != y && y != z &&
+                x != z) {
+                uint32_t m = seg.m_iOriginalMaterialIndex < 0
+                                 ? 0xffffu
+                                 : static_cast<uint32_t>(seg.m_iOriginalMaterialIndex);
+                if (m > 0xffff)
+                    m = 0xffff;
+                const uint32_t material_ordinal = m >= 1000 ? m - 1000 : m;
+                uint32_t default_flags = material_ordinal < materials.default_collision_flag_count
+                                                   ? materials.default_collision_flags[material_ordinal] : 0;
+                if (materials.resolve_collision_flags) {
+                    Asura_Vector_3 corners[3];
+                    const uint16_t ids[3]{x, y, z};
+                    for (uint32_t corner = 0; corner < 3; ++corner) {
+                        const uint8_t* vertex = vertices + static_cast<uint64_t>(ids[corner]) * 36;
+                        corners[corner] = {read_f32(vertex), read_f32(vertex + 4), read_f32(vertex + 8)};
+                    }
+                    default_flags = materials.resolve_collision_flags(
+                        materials.collision_flag_context, material_ordinal, corners, default_flags);
                 }
-                default_flags = materials.resolve_collision_flags(
-                    materials.collision_flag_context, material_ordinal, corners, default_flags);
+                const uint32_t flags = material_override(materials, "collision_flags", material_ordinal, default_flags);
+                if (flags > 0xffff)
+                    return fail(err, "collision_flags[%u] exceeds a u16 mask", material_ordinal);
+                tris[nt++] = {x, y, z, static_cast<uint16_t>(flags), static_cast<uint16_t>(m)};
             }
-            const uint32_t flags = material_override(materials, "collision_flags", material_ordinal, default_flags);
-            if (flags > 0xffff)
-                return fail(err, "collision_flags[%u] exceeds a u16 mask", material_ordinal);
-            tris[nt++] = {x, y, z, static_cast<uint16_t>(flags), static_cast<uint16_t>(m)};
+            first = second;
+            second = third;
         }
     }
     uint32_t added = 0;
@@ -1058,9 +1069,14 @@ bool append_module_collision_v3(Buffer* out, const EnvView& env, uint32_t module
         metric->triangle_count = 1;
         return append_minimal_collision_v0(out, err);
     }
-    if (nt > kMaxAabbTreeObjects)
-        return fail(err, "Env module %u has %u collision triangles; the 2005 AABB tree supports at most %u", module,
-                    nt, kMaxAabbTreeObjects);
+    const uint32_t collision_limit =
+        cfg.max_collision_polys && cfg.max_collision_polys < kWorkspaceSafeMaxCollisionPolys
+            ? cfg.max_collision_polys
+            : kWorkspaceSafeMaxCollisionPolys;
+    if (nt > collision_limit)
+        return fail(err,
+                    "Env module %u has %u collision triangles after barriers; the workspace-safe exporter limit is %u",
+                    module, nt, collision_limit);
     Asura_Vector_3 mn{read_f32(vertices), read_f32(vertices + 4), read_f32(vertices + 8)}, mx = mn;
     for (uint32_t i = 1; i < nv; ++i) {
         const uint8_t* q = vertices + static_cast<uint64_t>(i) * 36;
@@ -1606,16 +1622,23 @@ bool has_weapon_token(Str text, bool path_component) {
     }
     return false;
 }
-bool append_weapon_support(Buffer* out, const Config& cfg, Arena* scratch, Error* err) {
+bool append_weapon_support(Buffer* out, const Config& cfg, const ChunkList* preparsed_donor,
+                           Arena* scratch, Error* err) {
     if (!cfg.weapon_from_pc)
         return true;
     ArenaMark mark = arena_mark(scratch);
-    ChunkList d{};
-    if (!parse_chunks(cfg.weapon_from_pc, &d, scratch, err))
+    const bool owns_donor = !preparsed_donor;
+    ChunkList d = preparsed_donor ? *preparsed_donor : ChunkList{};
+    if (owns_donor && !parse_chunks(cfg.weapon_from_pc, &d, scratch, err)) {
+        unmap_file(&d.file);
+        arena_reset(scratch, mark);
         return false;
+    }
     uint8_t* want = arena_array<uint8_t>(scratch, d.count, err);
     if (!want) {
-        unmap_file(&d.file);
+        if (owns_donor)
+            unmap_file(&d.file);
+        arena_reset(scratch, mark);
         return false;
     }
     const uint32_t support[] = {ASURA_CHUNK_TEXTURENAMES, ASURA_CHUNK_TEXTUREFLAGS, ASURA_CHUNK_MATERIAL,
@@ -1682,7 +1705,8 @@ bool append_weapon_support(Buffer* out, const Config& cfg, Arena* scratch, Error
             continue;
         has_weapon_model |= resource.subtype != ASURA_RESOURCEFILE_TYPE_PC_OBJECT && is_weapon_name(resource.name);
         if (!mark_material_support(d, i, want, err)) {
-            unmap_file(&d.file);
+            if (owns_donor)
+                unmap_file(&d.file);
             arena_reset(scratch, mark);
             return false;
         }
@@ -1697,7 +1721,8 @@ bool append_weapon_support(Buffer* out, const Config& cfg, Arena* scratch, Error
         }
     }
     if (!has_weapon_model) {
-        unmap_file(&d.file);
+        if (owns_donor)
+            unmap_file(&d.file);
         arena_reset(scratch, mark);
         return fail(err, "the Weapons donor .PC contains no weapon models");
     }
@@ -1716,7 +1741,8 @@ bool append_weapon_support(Buffer* out, const Config& cfg, Arena* scratch, Error
     for (uint32_t i = 0; i < d.count; ++i)
         if (want[i] && !append_chunk_copy(out, d.chunks[i], err))
             break;
-    unmap_file(&d.file);
+    if (owns_donor)
+        unmap_file(&d.file);
     arena_reset(scratch, mark);
     return !err->set;
 }
@@ -1725,7 +1751,9 @@ bool append_sound_resources(Buffer* out, const Sounds& s, Arena* scratch, Error*
     for (uint32_t i = 0; i < s.count; ++i)
         if (s.items[i].file) {
             if (!file_exists(s.items[i].file))
-                return fail(err, "sound file not found: %s", s.items[i].file);
+                return fail(err, "Sound entity '%.*s' (GUID %08X) asset file not found: %s",
+                            static_cast<int>(s.items[i].owner_name.size), s.items[i].owner_name.data,
+                            s.items[i].owner_guid, s.items[i].file);
             if (!append_file_rscf(out, s.items[i].name, ASURA_RESOURCEFILE_TYPE_SOUND, s.items[i].sound_resource_id,
                                   s.items[i].file, scratch, err))
                 return false;

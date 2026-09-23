@@ -36,6 +36,7 @@ bool gpu_rebuild_skybox_vertices(float orientation, bool back_texture_is_front_u
 bool gpu_init(HWND viewport);
 bool gpu_resize(uint32_t width, uint32_t height);
 void gpu_shutdown();
+void gpu_invalidate_entity_cache();
 bool gpu_upload_mesh();
 void gpu_render();
 

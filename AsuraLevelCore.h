@@ -124,7 +124,10 @@ struct EnvBuild {
     Buffer payload;
     uint32_t modules;
     uint32_t strip_count;
+    uint32_t* module_collision_triangles;
 };
+
+inline constexpr uint32_t kWorkspaceSafeMaxCollisionPolys = 3000;
 
 struct EnvView {
     const uint8_t* data;
@@ -161,6 +164,7 @@ struct TextureSet {
 
 struct SoundEntry {
     Str name;
+    Str owner_name;
     const char* file;
     Asura_Vector_3 position;
     float inner_radius, outer_radius;
@@ -168,7 +172,7 @@ struct SoundEntry {
     Asura_Vector_3 inner_cuboid_radius, outer_cuboid_radius;
     Asura_Bounding_Box retrigger_bounding_box;
     Asura_Quat orientation;
-    uint32_t sound_resource_id, controller_guid, phonon_guid, flags;
+    uint32_t sound_resource_id, controller_guid, phonon_guid, flags, owner_guid;
     uint16_t controller_padding;
     bool emit_enti, active;
 };
@@ -212,7 +216,8 @@ bool append_txfl(Buffer* out, uint32_t count, Error* err);
 bool append_mtrl(Buffer* out, const int32_t* tex, const uint32_t* flags, const uint32_t* surface,
                  uint32_t count, Error* err);
 bool append_rsfl(Buffer* out, Error* err);
-bool append_weapon_support(Buffer* out, const Config& config, Arena* scratch, Error* err);
+bool append_weapon_support(Buffer* out, const Config& config, const ChunkList* preparsed_donor,
+                           Arena* scratch, Error* err);
 bool append_sky_resources(Buffer* out, const Config& config, Arena* scratch, Error* err);
 bool append_textures(Buffer* out, const Config& config, const EnvView& env, const MaterialMap& materials,
                      Arena* arena, Arena* scratch, TextureSet* textures, Error* err);

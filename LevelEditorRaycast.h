@@ -50,7 +50,8 @@ public:
     };
 
 private:
-    uint32_t build_node(uint32_t first, uint32_t count);
+    uint32_t build_node(uint32_t first, uint32_t count, const Asura_Vector_3* centroids,
+                        const Bounds* triangle_bounds);
 
     std::vector<uint32_t> faces_;
     std::vector<Triangle> triangles_;

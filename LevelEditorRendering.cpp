@@ -182,7 +182,15 @@ struct GpuModelLookupSnapshot {
     const EntityModel* model = nullptr;
     const std::array<uint16_t, 3>* faces = nullptr;
     size_t face_count = 0;
+    StaticObjectProperties properties{};
+    bool has_properties = false;
     bool operator==(const GpuModelLookupSnapshot&) const = default;
+};
+
+struct GpuStaticObjectLookup {
+    const EntityModel* model = nullptr;
+    StaticObjectProperties properties{};
+    bool has_properties = false;
 };
 
 bool same_vec3(const Asura_Vector_3& a, const Asura_Vector_3& b) {
@@ -241,6 +249,11 @@ bool gpu_material_is_solid_cutout(const GpuMaterialRange& range) {
 constexpr float kEnvironmentRenderModeAlphaPrelight = 2.0f;
 constexpr float kEnvironmentRenderModeSolidCutout = 5.0f;
 
+struct GpuAnimatedEntity {
+    uint32_t entity_index;
+    const ModelAnimation* animation;
+};
+
 struct GpuRenderer {
     ID3D11Device* device = nullptr;
     ID3D11DeviceContext* context = nullptr;
@@ -298,6 +311,7 @@ struct GpuRenderer {
     uint32_t rain_vertex_count = 0;
     std::vector<GpuMaterialRange> material_ranges;
     std::vector<GpuModelTexture> model_textures;
+    std::unordered_map<const EntityModelMaterial*, size_t> model_texture_lookup;
     std::vector<GpuVertex> rain_scratch;
     std::vector<GpuVertex> entity_model_scratch;
     std::vector<GpuEntityModelRange> entity_model_range_scratch;
@@ -309,8 +323,10 @@ struct GpuRenderer {
     ULONGLONG animation_start = GetTickCount64();
     std::vector<GpuTransparentEntityRange> transparent_entity_range_scratch;
     std::vector<GpuVertex> overlay_scratch;
+    std::vector<LightGizmoLine> entity_gizmo_scratch;
     std::vector<uint32_t> entity_selection_order_scratch;
     std::vector<const EntityModel*> entity_models_scratch;
+    std::vector<GpuAnimatedEntity> animated_entities;
     std::vector<GpuEntitySnapshot> entity_snapshot;
     std::vector<GpuEntitySnapshot> entity_snapshot_scratch;
     std::vector<GpuModelLookupSnapshot> pickup_lookup_snapshot;
@@ -318,7 +334,10 @@ struct GpuRenderer {
     std::vector<GpuModelLookupSnapshot> static_lookup_snapshot;
     std::vector<GpuModelLookupSnapshot> static_lookup_snapshot_scratch;
     std::unordered_map<uint32_t, const EntityModel*> pickup_lookup;
-    std::unordered_map<uint32_t, const EntityModel*> static_lookup;
+    std::unordered_map<uint32_t, GpuStaticObjectLookup> static_lookup;
+    std::vector<int> entity_selection_snapshot;
+    uint64_t entity_input_generation = 1;
+    uint64_t checked_entity_input_generation = 0;
     uint32_t cached_unselected_model_count = 0;
     uint32_t cached_selected_model_count = 0;
     uint32_t cached_entity_start = 0;
@@ -379,6 +398,7 @@ void gpu_release_model_textures() {
     for (GpuModelTexture& texture : gpu.model_textures)
         gpu_release(texture.view);
     gpu.model_textures.clear();
+    gpu.model_texture_lookup.clear();
 }
 
 void gpu_release_environment_textures() {
@@ -535,9 +555,19 @@ bool gpu_create_dds_view_from_memory(const uint8_t* bytes, size_t byte_count, co
 ID3D11ShaderResourceView* gpu_model_texture_view(const EntityModelMaterial* material) {
     if (!material || material->texture_bytes.empty())
         return gpu.white_texture;
-    for (const GpuModelTexture& cached : gpu.model_textures) {
+    const auto direct = gpu.model_texture_lookup.find(material);
+    if (direct != gpu.model_texture_lookup.end() && direct->second < gpu.model_textures.size()) {
+        const GpuModelTexture& cached = gpu.model_textures[direct->second];
         if (cached.fingerprint == material->texture_fingerprint && cached.name == material->texture_name)
             return cached.view ? cached.view : gpu.white_texture;
+        gpu.model_texture_lookup.erase(direct);
+    }
+    for (size_t index = 0; index < gpu.model_textures.size(); ++index) {
+        const GpuModelTexture& cached = gpu.model_textures[index];
+        if (cached.fingerprint == material->texture_fingerprint && cached.name == material->texture_name) {
+            gpu.model_texture_lookup.emplace(material, index);
+            return cached.view ? cached.view : gpu.white_texture;
+        }
     }
 
     GpuModelTexture cached;
@@ -547,33 +577,30 @@ ID3D11ShaderResourceView* gpu_model_texture_view(const EntityModelMaterial* mate
     gpu_create_dds_view_from_memory(material->texture_bytes.data(), material->texture_bytes.size(),
                                     material->texture_name.c_str(), &cached.view, &ignored_error);
     gpu.model_textures.push_back(std::move(cached));
+    gpu.model_texture_lookup.emplace(material, gpu.model_textures.size() - 1);
     ID3D11ShaderResourceView* view = gpu.model_textures.back().view;
     return view ? view : gpu.white_texture;
 }
 
 bool gpu_create_dds_view(const char* path, ID3D11ShaderResourceView** output, std::string* why) {
     *output = nullptr;
-    std::ifstream file(path, std::ios::binary | std::ios::ate);
-    if (!file) {
+    MappedFile file{};
+    Error error{};
+    if (!map_file(path, &file, &error)) {
         if (why)
             *why = std::string("Could not open DDS texture: ") + path;
         return false;
     }
-    const std::streamoff end = file.tellg();
-    if (end < 0 || end > static_cast<std::streamoff>(512 * MiB)) {
+    if (file.size > 512 * MiB || file.size > static_cast<uint64_t>(SIZE_MAX)) {
         if (why)
             *why = std::string("Texture is not a valid DDS file: ") + path;
+        unmap_file(&file);
         return false;
     }
-    std::vector<uint8_t> bytes(static_cast<size_t>(end));
-    file.seekg(0);
-    file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-    if (!file) {
-        if (why)
-            *why = std::string("Could not read DDS texture: ") + path;
-        return false;
-    }
-    return gpu_create_dds_view_from_memory(bytes.data(), bytes.size(), path, output, why);
+    const bool ok = gpu_create_dds_view_from_memory(file.data, static_cast<size_t>(file.size),
+                                                    path, output, why);
+    unmap_file(&file);
+    return ok;
 }
 
 bool pc_texture_resource(const ChunkList& chunks, Str texture_name, RscfInfo* output);
@@ -1004,10 +1031,16 @@ bool scan_skybox_texture_folder(const std::string& directory, SkyboxTextureScan*
         char candidate[MAX_PATH * 4]{};
         if (!join_path(candidate, sizeof(candidate), directory.c_str(), str_from_c(entry.cFileName)))
             continue;
-        std::ifstream file(candidate, std::ios::binary);
+        HANDLE file = CreateFileA(candidate, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                  FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+        if (file == INVALID_HANDLE_VALUE)
+            continue;
         char magic[4]{};
-        file.read(magic, sizeof(magic));
-        if (file.gcount() != sizeof(magic) || memcmp(magic, "DDS ", sizeof(magic)) != 0)
+        DWORD read = 0;
+        const bool dds = ReadFile(file, magic, sizeof(magic), &read, nullptr) &&
+                         read == sizeof(magic) && memcmp(magic, "DDS ", sizeof(magic)) == 0;
+        CloseHandle(file);
+        if (!dds)
             continue;
         std::string target_stem = entry.cFileName;
         // MCP2's resource hash stops at the first dot. Use that same basename
@@ -1917,6 +1950,7 @@ float4 SkyCloudPSMain(SkyVSOutput input) : SV_TARGET {
 }
 
 bool gpu_upload_mesh() {
+    gpu_invalidate_entity_cache();
     gpu_release_model_textures();
     gpu_release_environment_textures();
     gpu.material_ranges.clear();
@@ -1996,6 +2030,11 @@ bool gpu_upload_mesh() {
     return true;
 }
 
+void gpu_invalidate_entity_cache() {
+    if (++gpu.entity_input_generation == 0)
+        gpu.entity_input_generation = 1;
+}
+
 GpuVertex gpu_line_vertex(Asura_Vector_3 position, DirectX::XMFLOAT4 color) {
     return {{position.x, position.y, position.z}, {0, 1, 0}, color};
 }
@@ -2063,20 +2102,35 @@ void gpu_refresh_entity_model_lookup() {
                             &gpu.pickup_lookup_snapshot_scratch, &gpu.pickup_lookup);
 
     gpu.static_lookup_snapshot_scratch.clear();
-    gpu.static_lookup_snapshot_scratch.reserve(g.static_object_models.size());
+    gpu.static_lookup_snapshot_scratch.reserve(g.document.static_object_templates.size() +
+                                               g.static_object_models.size());
     for (const auto& object : g.document.static_object_templates) {
-        if (!object.imported) continue;
-        const EntityModel* model = &object.imported->mesh;
+        const EntityModel* model = object.imported ? &object.imported->mesh : nullptr;
         gpu.static_lookup_snapshot_scratch.push_back(
-            {object.file_id, model, model->faces.data(), model->faces.size()});
+            {object.file_id, model, model ? model->faces.data() : nullptr,
+             model ? model->faces.size() : 0, object.properties, true});
     }
     for (const StaticObjectModel& entry : g.static_object_models) {
         const EntityModel* model = &entry.mesh;
         gpu.static_lookup_snapshot_scratch.push_back(
             {entry.file_id, model, model->faces.data(), model->faces.size()});
     }
-    gpu_commit_model_lookup(gpu.static_lookup_snapshot_scratch.size(), &gpu.static_lookup_snapshot,
-                            &gpu.static_lookup_snapshot_scratch, &gpu.static_lookup);
+    if (!same_model_lookup_snapshots(gpu.static_lookup_snapshot,
+                                     gpu.static_lookup_snapshot_scratch)) {
+        gpu.static_lookup.clear();
+        gpu.static_lookup.reserve(gpu.static_lookup_snapshot_scratch.size());
+        for (const GpuModelLookupSnapshot& entry : gpu.static_lookup_snapshot_scratch) {
+            auto [found, inserted] = gpu.static_lookup.try_emplace(entry.id);
+            GpuStaticObjectLookup& value = found->second;
+            if (entry.face_count && !value.model)
+                value.model = entry.model;
+            if (entry.has_properties && !value.has_properties) {
+                value.properties = entry.properties;
+                value.has_properties = true;
+            }
+        }
+        gpu.static_lookup_snapshot.swap(gpu.static_lookup_snapshot_scratch);
+    }
 }
 
 const EntityModel* gpu_entity_render_model(const Entity& entity) {
@@ -2088,8 +2142,8 @@ const EntityModel* gpu_entity_render_model(const Entity& entity) {
     }
     if (entity.kind == EntityKind::StaticObject) {
         const auto direct = gpu.static_lookup.find(entity.value_u32_b);
-        if (direct != gpu.static_lookup.end())
-            return direct->second;
+        if (direct != gpu.static_lookup.end() && direct->second.model)
+            return direct->second.model;
         const auto fallback = gpu.pickup_lookup.find(entity.pickup_skin_id);
         return fallback == gpu.pickup_lookup.end() ? nullptr : fallback->second;
     }
@@ -2117,9 +2171,11 @@ GpuEntitySnapshot gpu_entity_snapshot(const Entity& entity, const EntityModel* m
     snapshot.value_u32_a = entity.value_u32_a;
     snapshot.selection_order = selection_order;
     snapshot.animation_id = entity.pickup_anim_id;
-    if (entity.kind == EntityKind::StaticObject)
-        for (const auto& object : g.document.static_object_templates)
-            if (object.file_id == entity.value_u32_b) { snapshot.object_properties = object.properties; break; }
+    if (entity.kind == EntityKind::StaticObject) {
+        const auto found = gpu.static_lookup.find(entity.value_u32_b);
+        if (found != gpu.static_lookup.end() && found->second.has_properties)
+            snapshot.object_properties = found->second.properties;
+    }
     if (entity.kind == EntityKind::Sound) {
         // Applying sound box properties must invalidate the cached overlay even
         // when selection, position and audible range have not changed.
@@ -2473,6 +2529,7 @@ void gpu_draw_entity_model_ranges(const std::vector<GpuEntityModelRange>& ranges
     };
     auto& transparent = gpu.transparent_entity_range_scratch;
     transparent.clear();
+    transparent.reserve(ranges.size());
     gpu.context->OMSetBlendState(nullptr, nullptr, 0xffffffffu);
     gpu.context->OMSetDepthStencilState(gpu.depth_enabled, 0);
     for (const GpuEntityModelRange& range : ranges) {
@@ -2486,8 +2543,13 @@ void gpu_draw_entity_model_ranges(const std::vector<GpuEntityModelRange>& ranges
     // Complete solid objects before compositing effects, regardless of entity
     // list order. Alpha and additive ranges share a back-to-front pass so an
     // alpha surface can correctly cover a light shaft behind it.
-    std::stable_sort(transparent.begin(), transparent.end(),
-                     [](const auto& a, const auto& b) { return a.depth > b.depth; });
+    std::sort(transparent.begin(), transparent.end(), [](const auto& a, const auto& b) {
+        if (a.depth > b.depth)
+            return true;
+        if (a.depth < b.depth)
+            return false;
+        return a.range < b.range;
+    });
     if (!transparent.empty()) {
         ID3D11BlendState* bound_blend = nullptr;
         for (const auto& entry : transparent) {
@@ -2735,28 +2797,42 @@ void gpu_render() {
     // then only rebuild the transformed CPU/GPU buffers when entity-visible
     // state changes. Large retail levels otherwise transform and upload every
     // ObjectHierarchy triangle again for every orbit/pan redraw.
-    gpu_refresh_entity_model_lookup();
     const size_t entity_count = g.document.entities.size();
     std::vector<uint32_t>& selection_order = gpu.entity_selection_order_scratch;
-    selection_order.assign(entity_count, 0);
-    for (size_t order = 0; order < g.selected_entities.size(); ++order) {
-        const int selected_index = g.selected_entities[order];
-        if (valid_entity_index(selected_index))
-            selection_order[static_cast<size_t>(selected_index)] = static_cast<uint32_t>(order + 1);
-    }
-
     std::vector<const EntityModel*>& entity_models = gpu.entity_models_scratch;
-    entity_models.resize(entity_count);
-    for (size_t i = 0; i < entity_count; ++i)
-        entity_models[i] = gpu_entity_render_model(g.document.entities[i]);
+    const bool derived_state_dirty =
+        gpu.checked_entity_input_generation != gpu.entity_input_generation ||
+        selection_order.size() != entity_count || entity_models.size() != entity_count ||
+        gpu.entity_selection_snapshot != g.selected_entities ||
+        gpu.cached_overlay_mesh_radius != g.mesh.radius;
 
-    std::vector<GpuEntitySnapshot>& next_snapshot = gpu.entity_snapshot_scratch;
-    next_snapshot.resize(entity_count);
-    for (size_t i = 0; i < entity_count; ++i)
-        next_snapshot[i] = gpu_entity_snapshot(g.document.entities[i], entity_models[i], selection_order[i]);
+    if (derived_state_dirty) {
+        gpu_refresh_entity_model_lookup();
+        selection_order.assign(entity_count, 0);
+        for (size_t order = 0; order < g.selected_entities.size(); ++order) {
+            const int selected_index = g.selected_entities[order];
+            if (valid_entity_index(selected_index))
+                selection_order[static_cast<size_t>(selected_index)] = static_cast<uint32_t>(order + 1);
+        }
+        entity_models.resize(entity_count);
+        gpu.animated_entities.clear();
+        for (size_t i = 0; i < entity_count; ++i) {
+            entity_models[i] = gpu_entity_render_model(g.document.entities[i]);
+            if (entity_models[i]) {
+                const ModelAnimation* animation =
+                    entity_model_animation(g.document.entities[i], *entity_models[i]);
+                if (animation)
+                    gpu.animated_entities.push_back({static_cast<uint32_t>(i), animation});
+            }
+        }
 
-    if (gpu.cached_overlay_mesh_radius != g.mesh.radius ||
-        !same_entity_snapshots(gpu.entity_snapshot, next_snapshot)) {
+        std::vector<GpuEntitySnapshot>& next_snapshot = gpu.entity_snapshot_scratch;
+        next_snapshot.resize(entity_count);
+        for (size_t i = 0; i < entity_count; ++i)
+            next_snapshot[i] = gpu_entity_snapshot(g.document.entities[i], entity_models[i], selection_order[i]);
+
+        if (gpu.cached_overlay_mesh_radius != g.mesh.radius ||
+            !same_entity_snapshots(gpu.entity_snapshot, next_snapshot)) {
         std::vector<GpuVertex>& entity_model_vertices = gpu.entity_model_scratch;
         std::vector<GpuEntityModelRange>& entity_model_ranges = gpu.entity_model_range_scratch;
         entity_model_vertices.clear();
@@ -2820,7 +2896,8 @@ void gpu_render() {
         gpu.cached_entity_start = static_cast<uint32_t>(overlay.size());
         gpu.cached_selected_entity_start = gpu.cached_entity_start;
         const float marker = fmaxf(.35f, g.mesh.radius * .008f);
-        std::vector<LightGizmoLine> entity_gizmo;
+        std::vector<LightGizmoLine>& entity_gizmo = gpu.entity_gizmo_scratch;
+        entity_gizmo.clear();
         entity_gizmo.reserve(kMaximumLightGizmoLines);
         for (int pass = 0; pass < 2; ++pass) {
             for (size_t i = 0; i < entity_count; ++i) {
@@ -2872,14 +2949,18 @@ void gpu_render() {
         gpu.cached_overlay_ready = gpu_update_overlay(overlay) && gpu.overlay_vertices;
         gpu.cached_overlay_mesh_radius = g.mesh.radius;
         gpu.entity_snapshot.swap(next_snapshot);
+        }
+        gpu.entity_selection_snapshot = g.selected_entities;
+        gpu.checked_entity_input_generation = gpu.entity_input_generation;
     }
     // Keep the large static scene cached. Only deform and upload animated
     // objects each frame, including separate poses for shared-mesh instances.
     gpu.animated_model_scratch.clear();
     gpu.animated_model_ranges.clear();
     const double animation_seconds = (GetTickCount64() - gpu.animation_start) * .001;
-    for (size_t i = 0; i < entity_count; ++i) {
-        if (!entity_models[i] || !sample_entity_model(g.document.entities[i], *entity_models[i],
+    for (const GpuAnimatedEntity& animated : gpu.animated_entities) {
+        const size_t i = animated.entity_index;
+        if (!sample_entity_model(g.document.entities[i], *entity_models[i], *animated.animation,
                 animation_seconds, &gpu.skinned_vertex_scratch, &gpu.bone_transform_scratch)) continue;
         append_gpu_entity_model(g.document.entities[i], entity_models[i], selection_order[i] != 0,
             &gpu.animated_model_scratch, &gpu.animated_model_ranges, &gpu.skinned_vertex_scratch);

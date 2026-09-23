@@ -4,8 +4,8 @@
 #include "LevelEditorSoundTriggers.h"
 
 #include <algorithm>
-#include <fstream>
-#include <iomanip>
+#include <cstdlib>
+#include <cstdio>
 #include <unordered_map>
 
 using namespace asura;
@@ -18,6 +18,27 @@ namespace editor {
 // (0x575D70, 0x576100). The editor shows these objects, and does not export
 // the original mission scripts that could reveal them later.
 constexpr uint32_t kSnipePhysicalHidden = 1u;
+
+int32_t compare_i32(const void* left, const void* right) {
+    const int32_t a = *static_cast<const int32_t*>(left);
+    const int32_t b = *static_cast<const int32_t*>(right);
+    return a == b ? 0 : a < b ? -1 : 1;
+}
+
+struct MaterialFaceOrder {
+    int32_t material;
+    size_t face_index;
+};
+
+int32_t compare_material_face_order(const void* left, const void* right) {
+    const auto& a = *static_cast<const MaterialFaceOrder*>(left);
+    const auto& b = *static_cast<const MaterialFaceOrder*>(right);
+    if (a.material != b.material)
+        return a.material < b.material ? -1 : 1;
+    if (a.face_index != b.face_index)
+        return a.face_index < b.face_index ? -1 : 1;
+    return 0;
+}
 
 bool append_editor_lights(Buffer* out, const Document& doc, Error* err) {
     uint32_t count = 0;
@@ -255,6 +276,8 @@ bool make_editor_sounds(const Document& doc, Sounds* sounds, Arena* arena, Error
             continue;
         SoundEntry& s = sounds->items[index];
         s.name = {e.sound_name.data(), static_cast<uint32_t>(e.sound_name.size())};
+        s.owner_name = {e.name.data(), static_cast<uint32_t>(e.name.size())};
+        s.owner_guid = e.guid;
         s.file = e.sound_file.empty() ? nullptr : e.sound_file.c_str();
         s.position = e.position;
         s.inner_radius = e.value_a;
@@ -320,7 +343,8 @@ bool append_editor_pickups(Buffer* out, const Document& doc, Error* err) {
         if (entity.kind != EntityKind::Pickup)
             continue;
         if (!entity.pickup_has_template)
-            return fail(err, "pickup '%s' has no resolved item asset profile", entity.name.c_str());
+            return fail(err, "pickup '%s' (GUID %08X, item %08X) has no resolved item asset profile",
+                        entity.name.c_str(), entity.guid, entity.value_u32_a);
         ChunkMark chunk = begin_chunk(out, ASURA_CHUNK_ENTITY, 0, 0, err);
         Asura_Chunk_Entity_PayloadHeader header{};
         header.Guid = entity.guid;
@@ -361,7 +385,8 @@ bool append_editor_static_objects(Buffer* out, const Document& doc, Error* err) 
         if (entity.kind != EntityKind::StaticObject)
             continue;
         if (!entity.static_object_has_template)
-            return fail(err, "Object '%s' has no resolved asset profile", entity.name.c_str());
+            return fail(err, "Object '%s' (GUID %08X, file %08X) has no resolved asset profile",
+                        entity.name.c_str(), entity.guid, entity.value_u32_b);
         ChunkMark chunk = begin_chunk(out, ASURA_CHUNK_ENTITY, 0, 0, err);
         Asura_Chunk_Entity_PayloadHeader header{};
         header.Guid = entity.guid;
@@ -870,7 +895,7 @@ bool append_obj_static_object(Buffer* out, const StaticObjectTemplate& object, E
 }
 
 bool append_static_object_support(Buffer* out, const Document& document,
-                                  Error* err) {
+                                  const ChunkList* source, Error* err) {
     std::vector<uint32_t> required_roots;
     for (const Entity& entity : document.entities) {
         if (entity.kind != EntityKind::StaticObject)
@@ -898,13 +923,48 @@ bool append_static_object_support(Buffer* out, const Document& document,
         if (!donor_needed)
             continue;
         ArenaMark mark = arena_mark(&scratch);
-        ChunkList donor{};
-        if (!parse_chunks(donor_path.c_str(), &donor, &scratch, err)) {
+        const bool borrowed_source = source && donor_path == document.source_pc_path;
+        ChunkList donor = borrowed_source ? *source : ChunkList{};
+        if (!borrowed_source && !parse_chunks(donor_path.c_str(), &donor, &scratch, err)) {
+            unmap_file(&donor.file);
             arena_release(&scratch);
             return false;
         }
         std::vector<uint8_t> wanted(donor.count, 0);
         std::vector<uint32_t> donor_ids;
+        std::vector<RscfInfo> donor_resources(donor.count);
+        std::vector<uint8_t> donor_resource_valid(donor.count);
+        std::unordered_map<uint32_t, uint32_t> object_resources, shapes, fragments;
+        std::unordered_map<uint32_t, std::vector<uint32_t>> shape_data;
+        std::unordered_map<uint32_t, uint32_t> hierarchy_resources;
+        object_resources.reserve(donor.count / 8 + 1);
+        shapes.reserve(donor.count / 8 + 1);
+        fragments.reserve(donor.count / 16 + 1);
+        shape_data.reserve(donor.count / 16 + 1);
+        hierarchy_resources.reserve(donor.count / 8 + 1);
+        for (uint32_t i = 0; i < donor.count; ++i) {
+            const ChunkRef& chunk = donor.chunks[i];
+            if (chunk.cid == ASURA_CHUNK_SHAPE &&
+                chunk.size >= sizeof(Asura_Chunk_Header) + 4)
+                shapes.try_emplace(read_u32(chunk.data + sizeof(Asura_Chunk_Header)), i);
+            else if (chunk.cid == ASURA_CHUNK_FRAGMENT && chunk.size >= 20)
+                fragments.try_emplace(read_u32(chunk.data + 16), i);
+            else if (chunk.cid == ASURA_CHUNK_SHAPEDATA && chunk.size >= 24)
+                shape_data[read_u32(chunk.data + 16)].push_back(i);
+            RscfInfo resource{};
+            if (!rscf_info(chunk, &resource))
+                continue;
+            donor_resources[i] = resource;
+            donor_resource_valid[i] = 1;
+            if (resource.type == ASURA_RESOURCEFILE_TYPE_PLATFORMSPECIFIC &&
+                resource.subtype == ASURA_RESOURCEFILE_TYPE_PC_OBJECT &&
+                resource.payload_size >= 20)
+                object_resources.try_emplace(read_u32(resource.payload), i);
+            if (resource.type == 0 &&
+                (resource.subtype == ASURA_RESOURCEFILE_TYPE_PC_CHARACTER ||
+                 resource.subtype == ASURA_RESOURCEFILE_TYPE_PC_OBJECTHIERARCHY))
+                hierarchy_resources.try_emplace(asura_lower_name_hash(resource.name), i);
+        }
         for (const StaticObjectTemplate& object : document.static_object_templates)
             if (object.donor_path == donor_path && contains_u32(required_roots, object.file_id) &&
                 !contains_u32(donor_ids, object.file_id))
@@ -912,17 +972,14 @@ bool append_static_object_support(Buffer* out, const Document& document,
 
         for (size_t id_index = 0; !err->set && id_index < donor_ids.size(); ++id_index) {
             const uint32_t id = donor_ids[id_index];
-            for (uint32_t i = 0; i < donor.count; ++i) {
-                RscfInfo resource{};
-                if (!rscf_info(donor.chunks[i], &resource) ||
-                    resource.type != ASURA_RESOURCEFILE_TYPE_PLATFORMSPECIFIC ||
-                    resource.subtype != ASURA_RESOURCEFILE_TYPE_PC_OBJECT || resource.payload_size < 20 ||
-                    read_u32(resource.payload) != id)
-                    continue;
+            const auto object_resource = object_resources.find(id);
+            if (object_resource != object_resources.end()) {
+                const uint32_t i = object_resource->second;
+                const RscfInfo& resource = donor_resources[i];
                 if (!contains_u32(present_objects, id)) {
                     wanted[i] = 1;
                     if (!mark_material_support(donor, i, wanted.data(), err))
-                        break;
+                        continue;
                 }
                 const uint32_t vertex_count = read_u32(resource.payload + 8);
                 const uint32_t index_count = read_u32(resource.payload + 12);
@@ -933,18 +990,15 @@ bool append_static_object_support(Buffer* out, const Document& document,
                     if (next_lod && !contains_u32(donor_ids, next_lod))
                         donor_ids.push_back(next_lod);
                 }
-                break;
             }
             if (!contains_u32(present_shapes, id)) {
-                for (uint32_t i = 0; i < donor.count; ++i) {
+                const auto shape_index = shapes.find(id);
+                if (shape_index != shapes.end()) {
+                    const uint32_t i = shape_index->second;
                     const ChunkRef& shape = donor.chunks[i];
-                    if (shape.cid != ASURA_CHUNK_SHAPE ||
-                        shape.size < sizeof(Asura_Chunk_Header) + 4 ||
-                        read_u32(shape.data + sizeof(Asura_Chunk_Header)) != id)
-                        continue;
                     wanted[i] = 1;
                     // SHAP's fragment ID is separate from its model/file ID.
-                    if (!mark_material_support(donor, i, wanted.data(), err)) break;
+                    if (!mark_material_support(donor, i, wanted.data(), err)) continue;
                     // MCP2 0x47C020 reads it after the optional LOS mesh and
                     // 260-byte render record. 0x465910 uses FRAG's replacement
                     // entry on death; without it the intact model stays visible.
@@ -966,10 +1020,12 @@ bool append_static_object_support(Buffer* out, const Document& document,
                             break;
                         }
                         const uint32_t fragment_id = read_u32(shape.data + at);
-                        for (uint32_t j = 0; fragment_id && j < donor.count; ++j) {
+                        bool found_fragment = !fragment_id;
+                        const auto fragment_index = fragments.find(fragment_id);
+                        if (fragment_id && fragment_index != fragments.end()) {
+                            const uint32_t j = fragment_index->second;
                             const ChunkRef& fragment = donor.chunks[j];
-                            if (fragment.cid != ASURA_CHUNK_FRAGMENT || fragment.size < 20 ||
-                                read_u32(fragment.data + 16) != fragment_id) continue;
+                            found_fragment = true;
                             // MCP2 0x43CD50 / MCP1 Asura_Chunk_Fragment::Process:
                             // ID, count, then {file ID, position, flags, quantity}.
                             if (fragment.version != 0 || fragment.size < 24 ||
@@ -982,31 +1038,36 @@ bool append_static_object_support(Buffer* out, const Document& document,
                                 const uint32_t child = read_u32(fragment.data + 24 + k * 24);
                                 if (child && !contains_u32(donor_ids, child)) donor_ids.push_back(child);
                             }
-                            break;
                         }
+                        if (!found_fragment && !err->set)
+                            fail(err, "Object %08X references missing FRAG %08X", id, fragment_id);
                     }
-                    break;
                 }
             }
             // SHPD is keyed by shape ID, not adjacency to SHAP. In level05d,
             // shelving's SHPD precedes its model while SHAP is hundreds of
             // chunks later. MCP2 0x4415A0 reads ID, flags and optional bounds.
-            for (uint32_t i = 0; i < donor.count; ++i) {
-                const ChunkRef& data = donor.chunks[i];
-                if (data.cid == ASURA_CHUNK_SHAPEDATA && data.size >= 24 &&
-                    read_u32(data.data + 16) == id)
+            const auto data_indices = shape_data.find(id);
+            if (data_indices != shape_data.end())
+                for (uint32_t i : data_indices->second)
                     wanted[i] = 1;
-            }
         }
+        std::vector<uint32_t> wanted_text;
+        wanted_text.reserve(donor.count / 16 + 1);
+        for (uint32_t i = 0; i < donor.count; ++i)
+            if (wanted[i] && donor.chunks[i].cid == ASURA_CHUNK_TEXTURENAMES)
+                wanted_text.push_back(i);
         for (uint32_t i = 0; i < donor.count; ++i) {
-            RscfInfo resource{};
-            if (!rscf_info(donor.chunks[i], &resource) || resource.type != ASURA_RESOURCEFILE_TYPE_TEXTURE)
+            if (!donor_resource_valid[i])
+                continue;
+            const RscfInfo& resource = donor_resources[i];
+            if (resource.type != ASURA_RESOURCEFILE_TYPE_TEXTURE)
                 continue;
             const std::string normalized = normalized_resource_path(resource.name);
             if (contains_string(present_textures, normalized))
                 continue;
-            for (uint32_t text_index = 0; text_index < donor.count; ++text_index) {
-                if (wanted[text_index] && static_text_references(donor.chunks[text_index], resource.name)) {
+            for (uint32_t text_index : wanted_text) {
+                if (static_text_references(donor.chunks[text_index], resource.name)) {
                     wanted[i] = 1;
                     break;
                 }
@@ -1015,8 +1076,8 @@ bool append_static_object_support(Buffer* out, const Document& document,
         for (uint32_t i = 0; i < donor.count && !err->set; ++i) {
             if (!wanted[i])
                 continue;
-            RscfInfo resource{};
-            if (rscf_info(donor.chunks[i], &resource)) {
+            if (donor_resource_valid[i]) {
+                const RscfInfo& resource = donor_resources[i];
                 if (resource.type == ASURA_RESOURCEFILE_TYPE_PLATFORMSPECIFIC &&
                     resource.subtype == ASURA_RESOURCEFILE_TYPE_PC_OBJECT && resource.payload_size >= 4) {
                     const uint32_t id = read_u32(resource.payload);
@@ -1046,19 +1107,12 @@ bool append_static_object_support(Buffer* out, const Document& document,
                 memcpy(&body, object.body.data(), sizeof(body));
                 const uint32_t skin = body.m_xPhysicalObject.m_uSkinID;
                 if (!skin) continue;
-                for (uint32_t i = 0; i < donor.count; ++i) {
-                    RscfInfo resource{};
-                    if (rscf_info(donor.chunks[i], &resource) && resource.type == 0 &&
-                        (resource.subtype == ASURA_RESOURCEFILE_TYPE_PC_CHARACTER ||
-                         resource.subtype == ASURA_RESOURCEFILE_TYPE_PC_OBJECTHIERARCHY) &&
-                        asura_lower_name_hash(resource.name) == skin) {
-                        present_hierarchies.push_back(object.file_id);
-                        break;
-                    }
-                }
+                if (hierarchy_resources.contains(skin))
+                    present_hierarchies.push_back(object.file_id);
             }
         }
-        unmap_file(&donor.file);
+        if (!borrowed_source)
+            unmap_file(&donor.file);
         arena_reset(&scratch, mark);
         if (err->set)
             break;
@@ -1081,8 +1135,19 @@ bool append_static_object_support(Buffer* out, const Document& document,
                     source_reference |= object.file_id == id && !document.source_pc_path.empty() &&
                                         object.donor_path == document.source_pc_path;
                 if (source_reference) continue;
-                fail(err, "Object %08X is missing %s from the selected Objects donors", id,
-                     !contains_u32(present_objects, id) ? "its model" : "its collision shape");
+                const Entity* owner = nullptr;
+                for (const Entity& entity : document.entities)
+                    if (entity.kind == EntityKind::StaticObject && entity.value_u32_b == id) {
+                        owner = &entity;
+                        break;
+                    }
+                if (owner)
+                    fail(err, "Object entity '%s' (GUID %08X, file %08X) is missing %s from the selected Objects donors",
+                         owner->name.c_str(), owner->guid, id,
+                         !contains_u32(present_objects, id) ? "its model" : "its collision shape");
+                else
+                    fail(err, "Object %08X is missing %s from the selected Objects donors", id,
+                         !contains_u32(present_objects, id) ? "its model" : "its collision shape");
                 break;
             }
         }
@@ -1127,12 +1192,41 @@ bool append_imported_hierarchy_support(Buffer* out, const Document& doc,
         at += size;
     }
     std::vector<uint8_t> wanted(source.count);
+    std::unordered_map<uint32_t, std::vector<uint32_t>> lod_by_root, skin_by_name, adjunct_by_name;
+    lod_by_root.reserve(source.count / 16 + 1);
+    skin_by_name.reserve(source.count / 16 + 1);
+    adjunct_by_name.reserve(source.count / 16 + 1);
+    for (uint32_t i = 0; i < source.count; ++i) {
+        const ChunkRef& chunk = source.chunks[i];
+        if (chunk.cid == ASURA_CHUNK_HIERARCHY_SKINLOD && chunk.version == 0) {
+            const Str root = padded_string_at(chunk.data, chunk.size, 16);
+            if (root.data)
+                lod_by_root[asura_lower_name_hash(root)].push_back(i);
+            continue;
+        }
+        if (chunk.cid == ASURA_CHUNK_HIERARCHY_SKIN) {
+            const Str name = padded_string_at(chunk.data, chunk.size, 24);
+            if (name.data)
+                skin_by_name[asura_lower_name_hash(name)].push_back(i);
+            continue;
+        }
+        uint32_t name_at = 0;
+        if (chunk.cid == fourcc('H','S','B','B')) name_at = 16;
+        else if (chunk.cid == fourcc('H','M','P','T') || chunk.cid == fourcc('H','S','N','D')) name_at = 20;
+        if (name_at) {
+            const Str name = padded_string_at(chunk.data, chunk.size, name_at);
+            if (name.data)
+                adjunct_by_name[asura_lower_name_hash(name)].push_back(i);
+        }
+    }
     // MCP2 0x43D6C0: HSKL names its root skin and LOD skin, followed by
     // optional weighted vertices and a distance. Keep the named LOD meshes.
     for (size_t root = 0; root < required.size(); ++root) {
-        for (uint32_t i = 0; i < source.count; ++i) {
+        const auto lods = lod_by_root.find(required[root]);
+        if (lods == lod_by_root.end())
+            continue;
+        for (uint32_t i : lods->second) {
             const auto& lod = source.chunks[i];
-            if (lod.cid != ASURA_CHUNK_HIERARCHY_SKINLOD || lod.version != 0) continue;
             const auto root_name = padded_string_at(lod.data, lod.size, 16);
             if (!root_name.data || asura_lower_name_hash(root_name) != required[root]) continue;
             const uint32_t name_at = static_cast<uint32_t>(align_up(17ull + root_name.size, 4));
@@ -1157,23 +1251,28 @@ bool append_imported_hierarchy_support(Buffer* out, const Document& doc,
         wanted[i] = 1;
         present.push_back(skin);
         if (!mark_material_support(source, i, wanted.data(), err)) return false;
-        for (uint32_t scan = i; scan > 0; --scan) {
-            const uint32_t h = scan - 1;
-            const ChunkRef& chunk = source.chunks[h];
-            if (chunk.cid != ASURA_CHUNK_HIERARCHY_SKIN ||
-                !str_ieq(padded_string_at(chunk.data, chunk.size, 24), resource.name)) continue;
-            wanted[h] = 1;
-            if (!mark_material_support(source, h, wanted.data(), err)) return false;
-            // Animation dependencies are resolved by name below, not adjacency.
-            break;
+        const auto skins = skin_by_name.find(skin);
+        if (skins != skin_by_name.end()) {
+            for (auto h = skins->second.rbegin(); h != skins->second.rend(); ++h) {
+                if (*h >= i)
+                    continue;
+                const ChunkRef& chunk = source.chunks[*h];
+                if (!str_ieq(padded_string_at(chunk.data, chunk.size, 24), resource.name))
+                    continue;
+                wanted[*h] = 1;
+                if (!mark_material_support(source, *h, wanted.data(), err)) return false;
+                // Animation dependencies are resolved by name below, not adjacency.
+                break;
+            }
         }
-        for (uint32_t adjunct = 0; adjunct < source.count; ++adjunct) {
-            const auto& data = source.chunks[adjunct];
-            uint32_t name_at = 0;
-            if (data.cid == fourcc('H','S','B','B')) name_at = 16;
-            else if (data.cid == fourcc('H','M','P','T') || data.cid == fourcc('H','S','N','D')) name_at = 20;
-            if (name_at && str_ieq(padded_string_at(data.data, data.size, name_at), resource.name))
-                wanted[adjunct] = 1;
+        const auto adjuncts = adjunct_by_name.find(skin);
+        if (adjuncts != adjunct_by_name.end()) {
+            for (uint32_t adjunct : adjuncts->second) {
+                const auto& data = source.chunks[adjunct];
+                const uint32_t name_at = data.cid == fourcc('H','S','B','B') ? 16u : 20u;
+                if (str_ieq(padded_string_at(data.data, data.size, name_at), resource.name))
+                    wanted[adjunct] = 1;
+            }
         }
     }
     // MCP2 sub_43D8E0 reads the HCAN name after its 44-byte header. Match
@@ -1190,12 +1289,17 @@ bool append_imported_hierarchy_support(Buffer* out, const Document& doc,
             present_anims.push_back(id);
         }
     }
+    std::vector<uint32_t> wanted_text;
+    wanted_text.reserve(source.count / 16 + 1);
+    for (uint32_t i = 0; i < source.count; ++i)
+        if (wanted[i] && source.chunks[i].cid == ASURA_CHUNK_TEXTURENAMES)
+            wanted_text.push_back(i);
     for (uint32_t i = 0; i < source.count; ++i) {
         RscfInfo resource{};
         if (!rscf_info(source.chunks[i], &resource) || resource.type != ASURA_RESOURCEFILE_TYPE_TEXTURE ||
             contains_string(textures, normalized_resource_path(resource.name))) continue;
-        for (uint32_t j = 0; j < source.count; ++j)
-            if (wanted[j] && static_text_references(source.chunks[j], resource.name)) {
+        for (uint32_t j : wanted_text)
+            if (static_text_references(source.chunks[j], resource.name)) {
                 wanted[i] = 1;
                 textures.push_back(normalized_resource_path(resource.name));
                 break;
@@ -1264,36 +1368,58 @@ bool make_pc_geometry(const ChunkList& source, ObjData* obj,
     return true;
 }
 
-bool append_pc_texture(Buffer* out, const ChunkList& source, Str name, Error* err) {
-    if (!name.size) return true;
-    for (uint64_t at = sizeof(kAsuraMagic); at + sizeof(Asura_Chunk_Header) <= out->size;) {
-        const uint8_t* bytes = out->base + at;
-        const uint32_t size = read_u32(bytes + 4);
-        if (size < sizeof(Asura_Chunk_Header) || size > out->size - at)
-            return fail(err, "invalid output while checking PC textures");
-        const ChunkRef chunk{bytes, size, read_u32(bytes), read_u32(bytes + 8), read_u32(bytes + 12), 0};
-        RscfInfo existing{};
-        if (rscf_info(chunk, &existing) && existing.type == ASURA_RESOURCEFILE_TYPE_TEXTURE &&
-            text_name_matches_resource(name, existing.name))
-            return true;
-        at += size;
+struct PcTextureCopyCache {
+    std::vector<RscfInfo> source_textures;
+    std::vector<std::string> emitted_names;
+
+    bool initialize(Buffer* out, const ChunkList& source, Error* err) {
+        source_textures.clear();
+        source_textures.reserve(source.count);
+        for (uint32_t i = 0; i < source.count; ++i) {
+            RscfInfo resource{};
+            if (rscf_info(source.chunks[i], &resource) && resource.type == ASURA_RESOURCEFILE_TYPE_TEXTURE)
+                source_textures.push_back(resource);
+        }
+        emitted_names.clear();
+        for (uint64_t at = sizeof(kAsuraMagic); at + sizeof(Asura_Chunk_Header) <= out->size;) {
+            const uint8_t* bytes = out->base + at;
+            const uint32_t size = read_u32(bytes + 4);
+            if (size < sizeof(Asura_Chunk_Header) || size > out->size - at)
+                return fail(err, "invalid output while indexing PC textures");
+            const ChunkRef chunk{bytes, size, read_u32(bytes), read_u32(bytes + 8),
+                                 read_u32(bytes + 12), 0};
+            RscfInfo existing{};
+            if (rscf_info(chunk, &existing) && existing.type == ASURA_RESOURCEFILE_TYPE_TEXTURE)
+                emitted_names.emplace_back(existing.name.data, existing.name.size);
+            at += size;
+        }
+        return true;
     }
-    for (uint32_t i = 0; i < source.count; ++i) {
-        RscfInfo resource{};
-        if (rscf_info(source.chunks[i], &resource) &&
-            resource.type == ASURA_RESOURCEFILE_TYPE_TEXTURE &&
-            text_name_matches_resource(name, resource.name)) {
+};
+
+bool append_pc_texture(Buffer* out, PcTextureCopyCache* cache, Str name, Error* err) {
+    if (!name.size) return true;
+    for (const std::string& existing : cache->emitted_names) {
+        const Str resource_name{existing.data(), static_cast<uint32_t>(existing.size())};
+        if (text_name_matches_resource(name, resource_name))
+            return true;
+    }
+    for (const RscfInfo& resource : cache->source_textures) {
+        if (text_name_matches_resource(name, resource.name)) {
             if (resource.payload_size < 4 || memcmp(resource.payload, "DDS ", 4))
                 return fail(err, "PC texture '%.*s' is not a DDS payload", name.size, name.data);
-            return append_rscf(out, resource.name, resource.type, resource.subtype,
-                               resource.payload, resource.payload_size, err);
+            if (!append_rscf(out, resource.name, resource.type, resource.subtype,
+                             resource.payload, resource.payload_size, err))
+                return false;
+            cache->emitted_names.emplace_back(resource.name.data, resource.name.size);
+            return true;
         }
     }
     // Stock levels may reference textures supplied by the game's shared files.
     return true;
 }
 
-bool append_pc_materials(Buffer* out, const ChunkList& source, const EnvView& env,
+bool append_pc_materials(Buffer* out, PcTextureCopyCache* texture_cache, const EnvView& env,
                          const MaterialMap& map,
                          const std::vector<PcEnvironmentMaterialBinding>& materials,
                          const std::vector<CollisionPolygon>& barriers,
@@ -1320,7 +1446,7 @@ bool append_pc_materials(Buffer* out, const ChunkList& source, const EnvView& en
         names[i] = mapped.size ? mapped : materials[i].texture_name;
         const std::string key = normalized_resource_path(names[i]);
         if (!contains_string(emitted, key)) {
-            if (!append_pc_texture(out, source, names[i], err)) return false;
+            if (!append_pc_texture(out, texture_cache, names[i], err)) return false;
             emitted.push_back(key);
         }
     }
@@ -1349,14 +1475,14 @@ bool append_pc_materials(Buffer* out, const ChunkList& source, const EnvView& en
     return end_chunk(out, mtrl, err);
 }
 
-bool append_pc_sky_textures(Buffer* out, const ChunkList& source, const Document& doc, Error* err) {
+bool append_pc_sky_textures(Buffer* out, PcTextureCopyCache* texture_cache, const Document& doc, Error* err) {
     if (!doc.sky_texture_dir.empty()) return true;
     std::vector<std::string> emitted;
     for (const std::string& path : doc.skybox.texture_paths) {
         const Str name{path.data(), static_cast<uint32_t>(path.size())};
         const std::string key = normalized_resource_path(name);
         if (contains_string(emitted, key)) continue;
-        if (!append_pc_texture(out, source, name, err)) return false;
+        if (!append_pc_texture(out, texture_cache, name, err)) return false;
         emitted.push_back(key);
     }
     return true;
@@ -1367,15 +1493,21 @@ bool append_pc_sound_resources(Buffer* out, const ChunkList& source, const Sound
     for (uint32_t i = 0; i < sounds.count; ++i) {
         const SoundEntry& sound = sounds.items[i];
         if (sound.file || contains_u32(emitted, sound.sound_resource_id)) continue;
+        bool found = false;
         for (uint32_t j = 0; j < source.count; ++j) {
             RscfInfo resource{};
             if (rscf_info(source.chunks[j], &resource) && resource.type == ASURA_RESOURCEFILE_TYPE_SOUND &&
                 resource.subtype == sound.sound_resource_id) {
                 if (!append_rscf(out, resource.name, resource.type, resource.subtype,
                                  resource.payload, resource.payload_size, err)) return false;
+                found = true;
                 break;
             }
         }
+        if (!found)
+            return fail(err, "Sound entity '%.*s' (GUID %08X) references missing source sound resource %u",
+                        static_cast<int>(sound.owner_name.size), sound.owner_name.data, sound.owner_guid,
+                        sound.sound_resource_id);
         emitted.push_back(sound.sound_resource_id);
     }
     return true;
@@ -1569,9 +1701,24 @@ bool collect_collision_barriers(const Document& doc, const EnvView& env,
 }
 
 bool pack_document(Document& doc, const char* output_path, std::string* why) {
-    if (!normalise_editor_guids(&doc, why))
-        return false;
     const bool from_pc = !doc.source_pc_path.empty();
+    Arena source_arena{};
+    ChunkList source{};
+    Error source_err{};
+    if (from_pc &&
+        (!arena_init(&source_arena, 64 * MiB, &source_err) ||
+         !parse_chunks(doc.source_pc_path.c_str(), &source, &source_arena, &source_err))) {
+        unmap_file(&source.file);
+        arena_release(&source_arena);
+        if (why)
+            *why = source_err.set ? source_err.message : "Could not read the source PC.";
+        return false;
+    }
+    if (!normalise_editor_guids(&doc, from_pc ? &source : nullptr, why)) {
+        unmap_file(&source.file);
+        arena_release(&source_arena);
+        return false;
+    }
     if (!from_pc && doc.obj_path.empty()) {
         if (why)
             *why = "Open an OBJ or PC level before exporting.";
@@ -1586,6 +1733,8 @@ bool pack_document(Document& doc, const char* output_path, std::string* why) {
     Error err{};
     Config cfg{};
     if (!initialize_editor_config(from_pc ? doc.source_pc_path.c_str() : doc.obj_path.c_str(), &cfg, &err)) {
+        unmap_file(&source.file);
+        arena_release(&source_arena);
         if (why)
             *why = err.message;
         return false;
@@ -1609,7 +1758,6 @@ bool pack_document(Document& doc, const char* output_path, std::string* why) {
     Arena arena{}, scratch{};
     Buffer output{}, env_payload{};
     MappedFile obj_file{};
-    ChunkList source{};
     std::vector<PcEnvironmentMaterialBinding> pc_materials;
     std::vector<uint32_t> pc_collision_flags;
     PcCollisionFlagLookup pc_face_collision;
@@ -1621,22 +1769,17 @@ bool pack_document(Document& doc, const char* output_path, std::string* why) {
     Sounds sounds{};
     SoundTriggerExport sound_triggers;
     TextureSet textures{};
+    PcTextureCopyCache pc_texture_cache;
     ModuleMetric* metrics = nullptr;
     bool ok = arena_init(&arena, cfg.arena_reserve, &err) && arena_init(&scratch, cfg.arena_reserve, &err) &&
               load_material_map(cfg, &material_map, &arena, &err);
     if (ok && from_pc) {
-        ok = parse_chunks(doc.source_pc_path.c_str(), &source, &arena, &err) &&
-             make_pc_geometry(source, &obj, &pc_materials, &arena, &err);
-        // Collision is rebuilt from visible geometry. Retain face/material masks
-        // only when the source collision format is understood; an unsupported
-        // collision chunk must not prevent exporting the decoded render mesh.
-        Error collision_error{};
-        if (ok && !pc_environment_collision_flags(source, static_cast<uint32_t>(pc_materials.size()),
-                                                   &pc_collision_flags, &collision_error,
-                                                   &pc_face_collision.polygons)) {
-            pc_collision_flags.assign(pc_materials.size(), 0);
-            pc_face_collision.polygons.clear();
-        }
+        ok = make_pc_geometry(source, &obj, &pc_materials, &arena, &err);
+        // Collision is rebuilt from visible geometry, but source masks must not
+        // be silently discarded if the target collision payload is malformed.
+        if (ok)
+            ok = pc_environment_collision_flags(source, static_cast<uint32_t>(pc_materials.size()),
+                                                &pc_collision_flags, &err, &pc_face_collision.polygons);
         if (ok && !pc_face_collision.polygons.empty()) {
             pc_face_collision.build();
             material_map.collision_flag_context = &pc_face_collision;
@@ -1651,17 +1794,73 @@ bool pack_document(Document& doc, const char* output_path, std::string* why) {
     }
     if (ok && !from_pc)
         ok = validate_spawn_clearance(doc, obj, cfg, &err);
+    const ArenaMark env_mark = arena_mark(&arena);
+    Config env_cfg = cfg;
+    const uint32_t collision_limit =
+        cfg.max_collision_polys && cfg.max_collision_polys < kWorkspaceSafeMaxCollisionPolys
+            ? cfg.max_collision_polys
+            : kWorkspaceSafeMaxCollisionPolys;
     if (ok)
-        ok = buffer_init(&output, cfg.output_reserve, &err) &&
-             build_env(cfg, obj, material_map, &arena, &scratch, &env, &err);
-    if (ok) {
+        ok = buffer_init(&output, cfg.output_reserve, &err);
+    while (ok) {
+        ok = build_env(env_cfg, obj, material_map, &arena, &scratch, &env, &err);
+        if (!ok)
+            break;
         env_payload = env.payload;
         ok = env_view(env_payload, &view, &arena, &err) && view.module_count &&
              view.module_count <= kMaxAabbTreeObjects;
-        if (!ok && !err.set)
-            fail(&err, "generated environment has an invalid module count");
-        if (ok)
-            ok = collect_collision_barriers(doc, view, &collision_barriers, &err);
+        if (!ok) {
+            if (!err.set)
+                fail(&err, "generated environment has an invalid module count");
+            break;
+        }
+        ok = collect_collision_barriers(doc, view, &collision_barriers, &err);
+        if (!ok)
+            break;
+
+        std::vector<uint32_t> barrier_triangles(view.module_count);
+        for (const CollisionPolygon& face : collision_barriers) {
+            if (face.module_index >= view.module_count) {
+                ok = fail(&err, "collision barrier module is invalid");
+                break;
+            }
+            const uint32_t triangles = face.vertex_count - 2;
+            uint32_t& count = barrier_triangles[face.module_index];
+            if (count > UINT32_MAX - triangles) {
+                ok = fail(&err, "collision barrier triangle count overflow");
+                break;
+            }
+            count += triangles;
+        }
+        if (!ok)
+            break;
+        uint32_t next_collision_cap = env_cfg.max_collision_polys;
+        for (uint32_t module = 0; module < view.module_count; ++module) {
+            const uint32_t barriers = barrier_triangles[module];
+            const uint32_t visible = env.module_collision_triangles[module];
+            if (barriers > collision_limit || visible > collision_limit - barriers) {
+                if (barriers >= collision_limit) {
+                    ok = fail(&err, "collision barriers leave no workspace-safe room in Env module %u", module);
+                    break;
+                }
+                const uint32_t cap = collision_limit - barriers;
+                if (cap < next_collision_cap)
+                    next_collision_cap = cap;
+            }
+        }
+        if (!ok || next_collision_cap == env_cfg.max_collision_polys)
+            break;
+
+        // build_env caps only visible triangles. Reserve enough room for the
+        // collision-only faces assigned to a rebuilt module, then reassess in
+        // case the finer module split changes their nearest-module assignment.
+        env_cfg.max_collision_polys = next_collision_cap;
+        buffer_release(&env_payload);
+        env_payload = {};
+        env = {};
+        view = {};
+        collision_barriers.clear();
+        arena_reset(&arena, env_mark);
     }
     if (ok) {
         metrics = arena_array<ModuleMetric>(&arena, view.module_count, &err);
@@ -1670,13 +1869,16 @@ bool pack_document(Document& doc, const char* output_path, std::string* why) {
     }
     if (ok) {
         buffer_append(&output, kAsuraMagic, sizeof(kAsuraMagic), &err);
+        const ChunkList* weapon_source =
+            from_pc && cfg.weapon_from_pc && doc.source_pc_path == cfg.weapon_from_pc ? &source : nullptr;
         ok = append_fnfo(&output, &err) && append_rsfl(&output, &err) &&
-             append_weapon_support(&output, cfg, &scratch, &err) &&
-             append_static_object_support(&output, doc, &err) &&
+             append_weapon_support(&output, cfg, weapon_source, &scratch, &err) &&
+             append_static_object_support(&output, doc, from_pc ? &source : nullptr, &err) &&
              (!from_pc || append_imported_hierarchy_support(&output, doc, source, &err)) &&
              append_sky_resources(&output, cfg, &scratch, &err) &&
-             (!from_pc || append_pc_sky_textures(&output, source, doc, &err)) &&
-             (from_pc ? append_pc_materials(&output, source, view, material_map, pc_materials,
+             (!from_pc || (pc_texture_cache.initialize(&output, source, &err) &&
+                           append_pc_sky_textures(&output, &pc_texture_cache, doc, &err))) &&
+             (from_pc ? append_pc_materials(&output, &pc_texture_cache, view, material_map, pc_materials,
                                             collision_barriers, &err)
                       : append_textures(&output, cfg, view, material_map, &arena, &scratch, &textures, &err)) &&
              append_rscf(&output, str_from_c(cfg.env_name), ASURA_RESOURCEFILE_TYPE_PLATFORMSPECIFIC,
@@ -1705,6 +1907,7 @@ bool pack_document(Document& doc, const char* output_path, std::string* why) {
     // Allow the selected output to overwrite its backing PC after all required
     // data has been consumed. Every later export also rebuilds from Document.
     unmap_file(&source.file);
+    arena_release(&source_arena);
     if (ok) ok = write_entire_file(output_path, output.base, output.size, &err);
     if (!ok && why)
         *why = err.set ? err.message : "Packing failed.";
@@ -1778,11 +1981,11 @@ bool pc_environment_material_bindings(const ChunkList& chunks,
                     value &= 0xFFFF2178u;
                 }
                 texture_flags[texture_index] |= value;
+                for (PcEnvironmentMaterialBinding& binding : *output)
+                    if (binding.texture_name.data &&
+                        str_eq(binding.texture_name, texture_names[texture_index]))
+                        binding.texture_flags |= value;
             }
-            for (PcEnvironmentMaterialBinding& binding : *output)
-                if (binding.texture_index >= 0 &&
-                    static_cast<uint32_t>(binding.texture_index) < texture_flags.size())
-                    binding.texture_flags = texture_flags[binding.texture_index];
         } else if (chunk.cid == ASURA_CHUNK_MATERIAL) {
             if (chunk.version > 1)
                 return fail(err, "the active PC MTRL chunk uses unsupported version %u", chunk.version);
@@ -1801,7 +2004,11 @@ bool pc_environment_material_bindings(const ChunkList& chunks,
                 binding.texture_index = texture_index;
                 binding.flags = read_u32(record + 4);
                 binding.surface_type = chunk.version ? read_u32(record + 8) : 0;
-                if (texture_index >= 0 && static_cast<uint32_t>(texture_index) < texture_names.size()) {
+                if (texture_index != -1 &&
+                    (texture_index < 0 || static_cast<uint32_t>(texture_index) >= texture_names.size()))
+                    return fail(err, "the active PC MTRL material %u has invalid texture index %d",
+                                material_index, texture_index);
+                if (texture_index != -1) {
                     binding.texture_name = texture_names[texture_index];
                     binding.texture_flags = texture_flags[texture_index];
                 }
@@ -1932,11 +2139,13 @@ bool write_obj_texture(const std::string& path, const uint8_t* bytes, size_t siz
                        const char* invalid_message, Error* err) {
     if (size < 4 || memcmp(bytes, "DDS ", 4) != 0)
         return fail(err, invalid_message, path.c_str());
-    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    FILE* file = nullptr;
+    fopen_s(&file, path.c_str(), "wb");
     if (!file)
         return fail(err, "could not create OBJ texture: %s", path.c_str());
-    file.write(reinterpret_cast<const char*>(bytes), size);
-    if (!file)
+    const bool wrote = fwrite(bytes, 1, size, file) == size && !ferror(file);
+    const bool closed = fclose(file) == 0;
+    if (!wrote || !closed)
         return fail(err, "could not write OBJ texture: %s", path.c_str());
     return true;
 }
@@ -1997,18 +2206,22 @@ bool export_static_object_obj(const Entity& entity, const EntityModel& model,
             break;
     }
 
+    std::vector<MaterialFaceOrder> face_order;
     std::vector<int32_t> material_indices;
     if (ok) {
-        material_indices.reserve(model.faces.size());
+        face_order.reserve(model.faces.size());
         for (size_t face_index = 0; face_index < model.faces.size(); ++face_index) {
             const int32_t material_index = face_index < model.face_materials.size()
                                                ? model.face_materials[face_index]
                                                : -1;
-            material_indices.push_back(material_index);
+            face_order.push_back({material_index, face_index});
         }
-        std::sort(material_indices.begin(), material_indices.end());
-        material_indices.erase(std::unique(material_indices.begin(), material_indices.end()),
-                               material_indices.end());
+        if (!face_order.empty())
+            qsort(face_order.data(), face_order.size(), sizeof(face_order[0]), compare_material_face_order);
+        material_indices.reserve(face_order.size());
+        for (const MaterialFaceOrder& entry : face_order)
+            if (material_indices.empty() || material_indices.back() != entry.material)
+                material_indices.push_back(entry.material);
     }
 
     const std::string obj_path = output_path ? output_path : "";
@@ -2030,24 +2243,24 @@ bool export_static_object_obj(const Entity& entity, const EntityModel& model,
     uint32_t missing_texture_count = 0;
     std::vector<std::string> extracted_texture_names;
     std::vector<std::string> used_texture_filenames;
-    std::ofstream mtl;
+    FILE* mtl = nullptr;
     if (ok) {
-        mtl.open(mtl_path, std::ios::binary | std::ios::trunc);
+        fopen_s(&mtl, mtl_path.c_str(), "wb");
         if (!mtl)
             ok = fail(&err, "could not create OBJ material library: %s", mtl_path.c_str());
     }
     if (ok) {
-        mtl << "# Sniper Elite 2005 static Object materials\n";
+        fputs("# Sniper Elite 2005 static Object materials\n", mtl);
         for (int32_t material_index : material_indices) {
             if (material_index < 0)
                 continue;
             const std::string material_name = obj_material_name(material_index);
-            mtl << "\nnewmtl " << material_name << "\n"
-                << "Ka 1.000000 1.000000 1.000000\n"
-                << "Kd 1.000000 1.000000 1.000000\n"
-                << "Ks 0.000000 0.000000 0.000000\n"
-                << "d 1.000000\n"
-                << "illum 1\n";
+            fprintf(mtl, "\nnewmtl %s\n"
+                         "Ka 1.000000 1.000000 1.000000\n"
+                         "Kd 1.000000 1.000000 1.000000\n"
+                         "Ks 0.000000 0.000000 0.000000\n"
+                         "d 1.000000\n"
+                         "illum 1\n", material_name.c_str());
             if (static_cast<uint32_t>(material_index) >= model.materials.size())
                 continue;
 
@@ -2089,14 +2302,15 @@ bool export_static_object_obj(const Entity& entity, const EntityModel& model,
                 ++texture_count;
             }
             const std::string relative_texture_path = texture_folder_name + '/' + texture_name;
-            mtl << "map_Kd " << relative_texture_path << "\n";
+            fprintf(mtl, "map_Kd %s\n", relative_texture_path.c_str());
             if ((material.flags & 0x2u) != 0)
-                mtl << "map_d " << relative_texture_path << "\n";
+                fprintf(mtl, "map_d %s\n", relative_texture_path.c_str());
         }
-        if (ok && !mtl)
+        if (ok && ferror(mtl))
             ok = fail(&err, "could not write OBJ material library: %s", mtl_path.c_str());
     }
-    mtl.close();
+    if (mtl && fclose(mtl) != 0 && ok)
+        ok = fail(&err, "could not write OBJ material library: %s", mtl_path.c_str());
 
     if (ok) {
         std::string out = "{\n";
@@ -2150,56 +2364,49 @@ bool export_static_object_obj(const Entity& entity, const EntityModel& model,
         ok = write_entire_file(material_map_path.c_str(), out.data(), out.size(), &err);
     }
 
-    std::ofstream obj;
+    FILE* obj = nullptr;
     if (ok) {
-        obj.open(obj_path, std::ios::binary | std::ios::trunc);
+        fopen_s(&obj, obj_path.c_str(), "wb");
         if (!obj)
             ok = fail(&err, "could not create Wavefront OBJ: %s", obj_path.c_str());
     }
     if (ok) {
         const Asura_Quat rotation = euler_quaternion(entity.rotation);
-        obj << "# Sniper Elite 2005 selected static Object\n"
-            << "mtllib " << mtl_name << "\n"
-            << "o " << stem << "\n" << std::setprecision(9);
+        fprintf(obj, "# Sniper Elite 2005 selected static Object\nmtllib %s\no %s\n",
+                mtl_name.c_str(), stem.c_str());
         for (const EntityModelVertex& vertex : model.vertices) {
             const Asura_Vector_3 position = obj_static_object_position(vertex.position, entity, rotation);
-            obj << "v " << position.x << ' ' << position.y << ' ' << position.z << '\n';
+            fprintf(obj, "v %.9g %.9g %.9g\n", position.x, position.y, position.z);
         }
         for (const EntityModelVertex& vertex : model.vertices)
-            obj << "vt " << vertex.texcoord.x << ' ' << (1.0f - vertex.texcoord.y) << '\n';
+            fprintf(obj, "vt %.9g %.9g\n", vertex.texcoord.x, 1.0f - vertex.texcoord.y);
         for (const EntityModelVertex& vertex : model.vertices) {
             const Asura_Vector_3 normal = obj_normalized(obj_static_object_vector(vertex.normal, rotation));
-            obj << "vn " << normal.x << ' ' << normal.y << ' ' << normal.z << '\n';
+            fprintf(obj, "vn %.9g %.9g %.9g\n", normal.x, normal.y, normal.z);
         }
-        obj << "s off\n";
+        fputs("s off\n", obj);
+        size_t ordered_face = 0;
         for (int32_t material_index : material_indices) {
             if (material_index >= 0)
-                obj << "g " << obj_material_name(material_index) << "\nusemtl "
-                    << obj_material_name(material_index) << "\n";
+                fprintf(obj, "g mat_%d\nusemtl mat_%d\n", material_index, material_index);
             else
-                obj << "g unmaterialed\n";
-            for (size_t face_index = 0; face_index < model.faces.size(); ++face_index) {
-                const int32_t face_material = face_index < model.face_materials.size()
-                                                  ? model.face_materials[face_index]
-                                                  : -1;
-                if (face_material != material_index)
-                    continue;
-                const auto& face = model.faces[face_index];
-                obj << 'f';
+                fputs("g unmaterialed\n", obj);
+            while (ordered_face < face_order.size() && face_order[ordered_face].material == material_index) {
+                const auto& face = model.faces[face_order[ordered_face++].face_index];
                 // The preview decoder reversed winding for its single Y reflection.
                 // OBJ applies the inverse Y/Z game conversion, so undo that reversal.
-                const uint16_t export_order[] = {face[0], face[2], face[1]};
-                for (uint16_t vertex_index : export_order) {
-                    const uint64_t obj_index = static_cast<uint64_t>(vertex_index) + 1;
-                    obj << ' ' << obj_index << '/' << obj_index << '/' << obj_index;
-                }
-                obj << '\n';
+                const uint64_t a = static_cast<uint64_t>(face[0]) + 1,
+                                         b = static_cast<uint64_t>(face[2]) + 1,
+                                         c = static_cast<uint64_t>(face[1]) + 1;
+                fprintf(obj, "f %llu/%llu/%llu %llu/%llu/%llu %llu/%llu/%llu\n",
+                        a, a, a, b, b, b, c, c, c);
             }
         }
-        if (!obj)
+        if (ferror(obj))
             ok = fail(&err, "could not write Wavefront OBJ: %s", obj_path.c_str());
     }
-    obj.close();
+    if (obj && fclose(obj) != 0 && ok)
+        ok = fail(&err, "could not write Wavefront OBJ: %s", obj_path.c_str());
 
     if (ok && why) {
         *why = "Exported selected Object with " + std::to_string(model.vertices.size()) +
@@ -2242,12 +2449,18 @@ bool export_pc_environment_obj(const std::string& source_pc_path, const char* ou
                mesh.diffuse_abgr.size() != mesh.positions.size()))
         ok = fail(&err, "PC environment vertex attributes are inconsistent");
 
+    std::vector<MaterialFaceOrder> face_order;
     std::vector<int32_t> material_indices;
     if (ok) {
-        material_indices = mesh.face_materials;
-        std::sort(material_indices.begin(), material_indices.end());
-        material_indices.erase(std::unique(material_indices.begin(), material_indices.end()),
-                               material_indices.end());
+        face_order.reserve(mesh.faces.size());
+        for (size_t face_index = 0; face_index < mesh.faces.size(); ++face_index)
+            face_order.push_back({mesh.face_materials[face_index], face_index});
+        if (!face_order.empty())
+            qsort(face_order.data(), face_order.size(), sizeof(face_order[0]), compare_material_face_order);
+        material_indices.reserve(face_order.size());
+        for (const MaterialFaceOrder& entry : face_order)
+            if (material_indices.empty() || material_indices.back() != entry.material)
+                material_indices.push_back(entry.material);
     }
 
     const std::string obj_path = output_path ? output_path : "";
@@ -2271,22 +2484,22 @@ bool export_pc_environment_obj(const std::string& source_pc_path, const char* ou
     // allocator/template family for this tiny insertion-ordered cache.
     std::vector<std::string> extracted_texture_names;
     std::vector<std::string> used_texture_filenames;
-    std::ofstream mtl;
+    FILE* mtl = nullptr;
     if (ok) {
-        mtl.open(mtl_path, std::ios::binary | std::ios::trunc);
+        fopen_s(&mtl, mtl_path.c_str(), "wb");
         if (!mtl)
             ok = fail(&err, "could not create OBJ material library: %s", mtl_path.c_str());
     }
     if (ok) {
-        mtl << "# Sniper Elite 2005 Env materials\n";
+        fputs("# Sniper Elite 2005 Env materials\n", mtl);
         for (int32_t material_index : material_indices) {
             const std::string material_name = obj_material_name(material_index);
-            mtl << "\nnewmtl " << material_name << "\n"
-                << "Ka 1.000000 1.000000 1.000000\n"
-                << "Kd 1.000000 1.000000 1.000000\n"
-                << "Ks 0.000000 0.000000 0.000000\n"
-                << "d 1.000000\n"
-                << "illum 1\n";
+            fprintf(mtl, "\nnewmtl %s\n"
+                         "Ka 1.000000 1.000000 1.000000\n"
+                         "Kd 1.000000 1.000000 1.000000\n"
+                         "Ks 0.000000 0.000000 0.000000\n"
+                         "d 1.000000\n"
+                         "illum 1\n", material_name.c_str());
             if (material_index < 0 || static_cast<uint32_t>(material_index) >= materials.size())
                 continue;
             const PcEnvironmentMaterialBinding& material = materials[material_index];
@@ -2331,25 +2544,24 @@ bool export_pc_environment_obj(const std::string& source_pc_path, const char* ou
             }
             const std::string relative_texture_path =
                 texture_folder_name + '/' + texture_name;
-            mtl << "map_Kd " << relative_texture_path << "\n";
+            fprintf(mtl, "map_Kd %s\n", relative_texture_path.c_str());
             if ((material.flags & 0x2u) != 0)
-                mtl << "map_d " << relative_texture_path << "\n";
+                fprintf(mtl, "map_d %s\n", relative_texture_path.c_str());
         }
-        if (ok && !mtl)
+        if (ok && ferror(mtl))
             ok = fail(&err, "could not write OBJ material library: %s", mtl_path.c_str());
     }
-    mtl.close();
+    if (mtl && fclose(mtl) != 0 && ok)
+        ok = fail(&err, "could not write OBJ material library: %s", mtl_path.c_str());
 
-    std::ofstream obj;
+    FILE* obj = nullptr;
     if (ok) {
-        obj.open(obj_path, std::ios::binary | std::ios::trunc);
+        fopen_s(&obj, obj_path.c_str(), "wb");
         if (!obj)
             ok = fail(&err, "could not create Wavefront OBJ: %s", obj_path.c_str());
     }
     if (ok) {
-        obj << "# Sniper Elite 2005 PC Env\n"
-            << "mtllib " << mtl_name << "\n"
-            << "o Env\n" << std::setprecision(9);
+        fprintf(obj, "# Sniper Elite 2005 PC Env\nmtllib %s\no Env\n", mtl_name.c_str());
         constexpr float inverse_byte = 1.0f / 255.0f;
         for (size_t vertex_index = 0; vertex_index < mesh.positions.size(); ++vertex_index) {
             const Asura_Vector_3& position = mesh.positions[vertex_index];
@@ -2359,35 +2571,32 @@ bool export_pc_environment_obj(const std::string& source_pc_path, const char* ou
             const float blue = (diffuse & 0xff) * inverse_byte;
             // decode_pc_environment has already corrected the target's negative Y.
             // Negate Z here to finish the inverse of the Blender-to-game Y/Z flip.
-            obj << "v " << position.x << ' ' << position.y << ' ' << -position.z << ' '
-                << red << ' ' << green << ' ' << blue << '\n';
+            fprintf(obj, "v %.9g %.9g %.9g %.9g %.9g %.9g\n",
+                    position.x, position.y, -position.z, red, green, blue);
         }
         for (const Asura_Vector_2& texcoord : mesh.texcoords)
-            obj << "vt " << texcoord.x << ' ' << (1.0f - texcoord.y) << '\n';
+            fprintf(obj, "vt %.9g %.9g\n", texcoord.x, 1.0f - texcoord.y);
         for (const Asura_Vector_3& normal : mesh.normals)
-            obj << "vn " << normal.x << ' ' << normal.y << ' ' << -normal.z << '\n';
-        obj << "s off\n";
+            fprintf(obj, "vn %.9g %.9g %.9g\n", normal.x, normal.y, -normal.z);
+        fputs("s off\n", obj);
+        size_t ordered_face = 0;
         for (int32_t material_index : material_indices) {
-            const std::string material_name = obj_material_name(material_index);
-            obj << "g " << material_name << "\nusemtl " << material_name << "\n";
-            for (size_t face_index = 0; face_index < mesh.faces.size(); ++face_index) {
-                if (mesh.face_materials[face_index] != material_index)
-                    continue;
-                const std::array<uint32_t, 3>& face = mesh.faces[face_index];
-                obj << 'f';
+            fprintf(obj, "g mat_%d\nusemtl mat_%d\n", material_index, material_index);
+            while (ordered_face < face_order.size() && face_order[ordered_face].material == material_index) {
+                const std::array<uint32_t, 3>& face = mesh.faces[face_order[ordered_face++].face_index];
                 // The Z reflection reverses handedness, so restore the winding.
-                const uint32_t export_order[] = {face[0], face[2], face[1]};
-                for (uint32_t vertex_index : export_order) {
-                    const uint64_t obj_index = static_cast<uint64_t>(vertex_index) + 1;
-                    obj << ' ' << obj_index << '/' << obj_index << '/' << obj_index;
-                }
-                obj << '\n';
+                const uint64_t a = static_cast<uint64_t>(face[0]) + 1,
+                                         b = static_cast<uint64_t>(face[2]) + 1,
+                                         c = static_cast<uint64_t>(face[1]) + 1;
+                fprintf(obj, "f %llu/%llu/%llu %llu/%llu/%llu %llu/%llu/%llu\n",
+                        a, a, a, b, b, b, c, c, c);
             }
         }
-        if (!obj)
+        if (ferror(obj))
             ok = fail(&err, "could not write Wavefront OBJ: %s", obj_path.c_str());
     }
-    obj.close();
+    if (obj && fclose(obj) != 0 && ok)
+        ok = fail(&err, "could not write Wavefront OBJ: %s", obj_path.c_str());
 
     if (ok && why) {
         *why = "Exported " + std::to_string(mesh.positions.size()) + " vertices, " +
@@ -2539,37 +2748,31 @@ bool pc_environment_collision_flags(const ChunkList& chunks, uint32_t material_c
                                                       static_cast<uint64_t>(polygon) * item_size))
                                                 : read_u16(collision + materials_at +
                                                            static_cast<uint64_t>(polygon) * item_size);
-            const uint32_t ordinal = material == 0xffff
-                                         ? 0xffffu
-                                         : (material >= 1000 ? static_cast<uint32_t>(material) - 1000
-                                                             : material);
-            if (ordinal == 0xffffu || ordinal < material_count) {
-                if (ordinal != 0xffffu) {
-                    const uint32_t packed = (ordinal << 16) | flags;
-                    frequencies.push_back(static_cast<int32_t>(packed));
+            if (material != 0xffff && material < material_count) {
+                const uint32_t packed = (static_cast<uint32_t>(material) << 16) | flags;
+                frequencies.push_back(static_cast<int32_t>(packed));
+            }
+            if (polygons) {
+                PcCollisionPolygon face;
+                face.material = material; face.flags = flags;
+                face.module_index = module_index;
+                face.polygon_index = polygon;
+                const uint8_t* ids = collision + fixed_size + vertex_bytes + static_cast<uint64_t>(polygon) * 8;
+                for (uint32_t corner = 0; corner < 4; ++corner) {
+                    const uint16_t index = read_u16(ids + corner * 2);
+                    if (corner == 3 && index == 0xffff) break;
+                    if (index >= vertex_count)
+                        return fail(err, "the PC EMOD module %u has an invalid collision vertex", module_index);
+                    const uint8_t* vertex = collision + fixed_size + static_cast<uint64_t>(index) * 12;
+                    Asura_Vector_3 point{read_f32(vertex) + translation.x,
+                                         read_f32(vertex + 4) + translation.y,
+                                         read_f32(vertex + 8) + translation.z};
+                    if (!isfinite(point.x) || !isfinite(point.y) || !isfinite(point.z) ||
+                        fabsf(point.x) > 1e12f || fabsf(point.y) > 1e12f || fabsf(point.z) > 1e12f)
+                        return fail(err, "the PC EMOD module %u has invalid collision coordinates", module_index);
+                    face.vertices[face.vertex_count++] = point;
                 }
-                if (polygons) {
-                    PcCollisionPolygon face;
-                    face.material = ordinal; face.flags = flags;
-                    face.module_index = module_index;
-                    face.polygon_index = polygon;
-                    const uint8_t* ids = collision + fixed_size + vertex_bytes + static_cast<uint64_t>(polygon) * 8;
-                    for (uint32_t corner = 0; corner < 4; ++corner) {
-                        const uint16_t index = read_u16(ids + corner * 2);
-                        if (corner == 3 && index == 0xffff) break;
-                        if (index >= vertex_count)
-                            return fail(err, "the PC EMOD module %u has an invalid collision vertex", module_index);
-                        const uint8_t* vertex = collision + fixed_size + static_cast<uint64_t>(index) * 12;
-                        Asura_Vector_3 point{read_f32(vertex) + translation.x,
-                                             read_f32(vertex + 4) + translation.y,
-                                             read_f32(vertex + 8) + translation.z};
-                        if (!isfinite(point.x) || !isfinite(point.y) || !isfinite(point.z) ||
-                            fabsf(point.x) > 1e12f || fabsf(point.y) > 1e12f || fabsf(point.z) > 1e12f)
-                            return fail(err, "the PC EMOD module %u has invalid collision coordinates", module_index);
-                        face.vertices[face.vertex_count++] = point;
-                    }
-                    polygons->push_back(face);
-                }
+                polygons->push_back(face);
             }
         }
     }
@@ -2580,7 +2783,8 @@ bool pc_environment_collision_flags(const ChunkList& chunks, uint32_t material_c
     // Per-face records preserve matching visible geometry's masks. Material
     // modes remain a fallback for render faces absent from source collision,
     // and for the material-map export. Prefer the lower mask on a tie.
-    std::sort(frequencies.begin(), frequencies.end());
+    if (!frequencies.empty())
+        qsort(frequencies.data(), frequencies.size(), sizeof(frequencies[0]), compare_i32);
     size_t sample = 0;
     uint32_t current_material = 0xffffffffu;
     uint32_t best_count = 0;
