@@ -1,4 +1,5 @@
 #include "LevelEditorAnimation.h"
+#include "LevelEditorGeometry.h"
 #include "LevelEditorImport.h"
 
 #include <algorithm>
@@ -26,15 +27,9 @@ Asura_Quat normalize(Asura_Quat q) {
     float n = sqrtf(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
     return n > 1.e-8f ? Asura_Quat{q.x / n, q.y / n, q.z / n, q.w / n} : Asura_Quat{0, 0, 0, 1};
 }
-Asura_Vector_3 rotate(Asura_Vector_3 p, Asura_Quat q) {
-    const Asura_Vector_3 t{2 * (q.y * p.z - q.z * p.y), 2 * (q.z * p.x - q.x * p.z),
-                           2 * (q.x * p.y - q.y * p.x)};
-    return {p.x + q.w * t.x + q.y * t.z - q.z * t.y, p.y + q.w * t.y + q.z * t.x - q.x * t.z,
-            p.z + q.w * t.z + q.x * t.y - q.y * t.x};
-}
 ModelBoneTransform compose(const ModelBoneTransform &a, const ModelBoneTransform &b) {
     const auto p = a.orientation, q = b.orientation;
-    return {plus(a.position, rotate(b.position, p)),
+    return {plus(a.position, rotate_by_quaternion(b.position, p)),
             normalize({p.w * q.x + p.x * q.w + p.y * q.z - p.z * q.y,
                        p.w * q.y - p.x * q.z + p.y * q.w + p.z * q.x,
                        p.w * q.z + p.x * q.y - p.y * q.x + p.z * q.w,
@@ -42,7 +37,7 @@ ModelBoneTransform compose(const ModelBoneTransform &a, const ModelBoneTransform
 }
 ModelBoneTransform inverse(const ModelBoneTransform &t) {
     const Asura_Quat q{-t.orientation.x, -t.orientation.y, -t.orientation.z, t.orientation.w};
-    return {rotate(times(t.position, -1), q), q};
+    return {rotate_by_quaternion(times(t.position, -1), q), q};
 }
 ModelBoneTransform interpolate(const ModelBoneTransform &a, const ModelBoneTransform &b, float t) {
     Asura_Quat q = a.orientation, r = b.orientation;
@@ -236,9 +231,10 @@ const ModelAnimation *entity_model_animation(const Entity &entity, const EntityM
 }
 
 bool sample_entity_model(const Entity &entity, const EntityModel &model, double seconds,
-                         std::vector<EntityModelVertex> *vertices) {
+                         std::vector<EntityModelVertex> *vertices,
+                         std::vector<ModelBoneTransform> *transform_scratch) {
     const auto *animation = entity_model_animation(entity, model);
-    if (!animation)
+    if (!animation || !transform_scratch)
         return false;
     Asura_ServerEntity_PhysicalObject_ChunkDataV7 physical{};
     if (entity.kind == EntityKind::StaticObject && entity.static_object_has_template)
@@ -259,7 +255,10 @@ bool sample_entity_model(const Entity &entity, const EntityModel &model, double 
         time = loop < 1 ? loop + fmod(time - loop, 1 - loop) : 1;
     }
     const float t = static_cast<float>(std::clamp(time, 0., 1.));
-    std::vector<ModelBoneTransform> bind(model.bones.size()), pose(model.bones.size());
+    const size_t bone_count = model.bones.size();
+    transform_scratch->resize(bone_count * 2);
+    ModelBoneTransform* bind = transform_scratch->data();
+    ModelBoneTransform* pose = bind + bone_count;
     for (size_t b = 0; b < model.bones.size(); ++b) {
         const auto &bone = model.bones[b];
         auto local = bone.bind;
@@ -282,7 +281,7 @@ bool sample_entity_model(const Entity &entity, const EntityModel &model, double 
         pose[b] = b ? compose(pose[bone.parent], local) : local;
     }
     // MCP2 0x49DCD0 builds the current-global * inverse-bind palette.
-    for (size_t b = 0; b < pose.size(); ++b)
+    for (size_t b = 0; b < bone_count; ++b)
         pose[b] = compose(pose[b], inverse(bind[b]));
     *vertices = model.vertices;
     for (size_t i = 0; i < vertices->size(); ++i) {
@@ -293,14 +292,14 @@ bool sample_entity_model(const Entity &entity, const EntityModel &model, double 
             if (w <= 0)
                 continue;
             const auto &bone = pose[model.weights[i].bones[j]];
-            position = plus(position, times(plus(rotate(v.position, bone.orientation), bone.position), w));
-            normal = plus(normal, times(rotate(v.normal, bone.orientation), w));
+            position = plus(position, times(plus(rotate_by_quaternion(v.position, bone.orientation), bone.position), w));
+            normal = plus(normal, times(rotate_by_quaternion(v.normal, bone.orientation), w));
         }
         v.position = position;
         // The retail Character shader skins its normal with the first bone
         // only (MCP2 shader at 0x6FD038), while blending four position weights.
         v.normal = model.resource_subtype == ASURA_RESOURCEFILE_TYPE_PC_CHARACTER
-                       ? rotate(v.normal, pose[model.weights[i].bones[0]].orientation)
+                       ? rotate_by_quaternion(v.normal, pose[model.weights[i].bones[0]].orientation)
                        : normal;
     }
     return true;

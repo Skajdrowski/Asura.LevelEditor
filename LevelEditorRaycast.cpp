@@ -195,10 +195,9 @@ uint32_t EnvironmentRaycast::build_node(uint32_t first, uint32_t count) {
     return node_index;
 }
 
-bool EnvironmentRaycast::intersect(const Mesh& mesh, const EnvironmentRay& ray, EnvironmentRayHit* hit) const {
+bool EnvironmentRaycast::intersect(const EnvironmentRay& ray, EnvironmentRayHit* hit) const {
     if (!hit || nodes_.empty())
         return false;
-    (void)mesh;
     float closest = std::numeric_limits<float>::infinity();
     uint32_t closest_triangle = 0;
     bool found = false;

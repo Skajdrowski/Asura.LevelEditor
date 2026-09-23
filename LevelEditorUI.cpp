@@ -214,12 +214,6 @@ const EntityModel* entity_render_model(const Entity& entity) {
     return nullptr;
 }
 
-Asura_Vector_3 rotate_by_quaternion(Asura_Vector_3 value, const Asura_Quat& rotation) {
-    const Asura_Vector_3 q{rotation.x, rotation.y, rotation.z};
-    const Asura_Vector_3 twice_cross = mul(cross(q, value), 2.0f);
-    return add(value, add(mul(twice_cross, rotation.w), cross(q, twice_cross)));
-}
-
 Asura_Vector_3 entity_model_view_vector(Asura_Vector_3 value, const Entity& entity) {
     value = rotate_by_quaternion(value, euler_quaternion(entity.rotation));
     value.y = -value.y;
@@ -400,7 +394,7 @@ bool screen_ray(int x, int y, EnvironmentRay* ray) {
 bool environment_point_from_screen(int x, int y, Asura_Vector_3* game_point) {
     EnvironmentRay ray{};
     EnvironmentRayHit hit{};
-    if (!game_point || !screen_ray(x, y, &ray) || !g.environment_raycast.intersect(g.mesh, ray, &hit))
+    if (!game_point || !screen_ray(x, y, &ray) || !g.environment_raycast.intersect(ray, &hit))
         return false;
     // Mesh vertices are in editor/view coordinates; gameplay entities retain
     // the target's negative-up Y convention.
@@ -418,7 +412,7 @@ bool environment_occludes_view_position(const Asura_Vector_3& view_position) {
     const float distance = sqrtf(distance_squared);
     EnvironmentRayHit hit{};
     const EnvironmentRay ray{camera_position, mul(to_position, 1.0f / distance)};
-    if (!g.environment_raycast.intersect(g.mesh, ray, &hit))
+    if (!g.environment_raycast.intersect(ray, &hit))
         return false;
     const float surface_epsilon = fmaxf(.01f, distance * 1.0e-4f);
     return hit.distance + surface_epsilon < distance;
@@ -633,18 +627,18 @@ bool load_spawn_puppets() {
 void set_control_text(HWND control, const char* text) { SetWindowTextA(control, text ? text : ""); }
 
 void set_float(HWND control, float value) {
-    char text[384]{};
-    const std::to_chars_result result = std::to_chars(text, text + sizeof(text) - 1, value,
-                                                       std::chars_format::fixed, 15);
-    if (result.ec == std::errc{}) {
-        char* end = result.ptr;
-        while (end > text && end[-1] == '0')
-            --end;
-        if (end > text && end[-1] == '.')
-            *end++ = '0';
-        *end = 0;
-        SetWindowTextA(control, text);
-    }
+    char text[128]{};
+    const int length = snprintf(text, sizeof(text), "%.9f", static_cast<double>(value));
+    if (length < 0 || static_cast<size_t>(length) >= sizeof(text))
+        return;
+
+    char* end = text + length - 1;
+    while (end > text && *end == '0')
+        *end-- = '\0';
+    if (end > text && *end == '.')
+        *end = '\0';
+
+    SetWindowTextA(control, text);
 }
 
 float get_float(HWND control, float fallback) {
@@ -2053,20 +2047,26 @@ bool ray_hits_model_triangle(const EnvironmentRay& ray, const Asura_Vector_3& a,
     return true;
 }
 
-bool entity_model_ray_distance(const Entity& entity, const EnvironmentRay& ray,
+bool entity_model_ray_distance(const Entity& entity, const EntityModel& model, const EnvironmentRay& ray,
                                float* distance) {
-    const EntityModel* model = entity_render_model(entity);
-    if (!model || !distance)
+    if (!distance)
         return false;
+    const Asura_Quat orientation = euler_quaternion(entity.rotation);
+    const Asura_Vector_3 model_origin = entity_view_position(entity.position);
+    const auto model_position = [&](Asura_Vector_3 value) {
+        value = rotate_by_quaternion(value, orientation);
+        value.y = -value.y;
+        return add(model_origin, value);
+    };
     float closest = FLT_MAX;
     bool found = false;
-    for (const auto& face : model->faces) {
-        if (face[0] >= model->vertices.size() || face[1] >= model->vertices.size() ||
-            face[2] >= model->vertices.size())
+    for (const auto& face : model.faces) {
+        if (face[0] >= model.vertices.size() || face[1] >= model.vertices.size() ||
+            face[2] >= model.vertices.size())
             continue;
-        const Asura_Vector_3 a = entity_model_view_position(model->vertices[face[0]].position, entity);
-        const Asura_Vector_3 b = entity_model_view_position(model->vertices[face[1]].position, entity);
-        const Asura_Vector_3 c = entity_model_view_position(model->vertices[face[2]].position, entity);
+        const Asura_Vector_3 a = model_position(model.vertices[face[0]].position);
+        const Asura_Vector_3 b = model_position(model.vertices[face[1]].position);
+        const Asura_Vector_3 c = model_position(model.vertices[face[2]].position);
         float candidate = 0.0f;
         if (ray_hits_model_triangle(ray, a, b, c, closest, &candidate)) {
             closest = candidate;
@@ -2087,14 +2087,13 @@ int hit_entity(int x, int y) {
     const bool have_selection_ray = screen_ray(x, y, &selection_ray);
     EnvironmentRayHit environment_hit{};
     const bool have_environment_hit = have_selection_ray &&
-                                      g.environment_raycast.intersect(g.mesh, selection_ray,
-                                                                      &environment_hit);
+                                      g.environment_raycast.intersect(selection_ray, &environment_hit);
     for (int i = 0; i < static_cast<int>(g.document.entities.size()); ++i) {
         const Entity& entity = g.document.entities[i];
-        if (entity_render_model(entity)) {
+        if (const EntityModel* model = entity_render_model(entity)) {
             float model_distance = 0.0f;
             if (!have_selection_ray ||
-                !entity_model_ray_distance(entity, selection_ray, &model_distance))
+                !entity_model_ray_distance(entity, *model, selection_ray, &model_distance))
                 continue;
             const float surface_epsilon = fmaxf(.01f, model_distance * 1.0e-4f);
             if (!entity_is_selected(i) && have_environment_hit &&

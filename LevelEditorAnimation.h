@@ -11,6 +11,7 @@ bool decode_model_animations(const asura::level::ChunkList &chunks,
 const ModelAnimation *entity_model_animation(const Entity &entity, const EntityModel &model);
 // Skin into a separate vertex buffer; never mutate the shared bind-pose mesh.
 bool sample_entity_model(const Entity &entity, const EntityModel &model, double seconds,
-                         std::vector<EntityModelVertex> *vertices);
+                         std::vector<EntityModelVertex> *vertices,
+                         std::vector<ModelBoneTransform> *transform_scratch);
 
 } // namespace editor

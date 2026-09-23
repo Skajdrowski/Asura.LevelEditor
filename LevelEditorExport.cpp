@@ -1,4 +1,5 @@
 #include "LevelEditorExport.h"
+#include "LevelEditorGeometry.h"
 #include "LevelEditorImport.h"
 #include "LevelEditorSoundTriggers.h"
 
@@ -1927,47 +1928,21 @@ bool pc_environment_texture_resource(const ChunkList& chunks, Str texture_name,
     return false;
 }
 
-bool write_obj_texture(const std::string& path, const RscfInfo& resource, Error* err) {
-    if (resource.payload_size < 4 || memcmp(resource.payload, "DDS ", 4) != 0)
-        return fail(err, "environment texture resource is not DDS data: %s", path.c_str());
+bool write_obj_texture(const std::string& path, const uint8_t* bytes, size_t size,
+                       const char* invalid_message, Error* err) {
+    if (size < 4 || memcmp(bytes, "DDS ", 4) != 0)
+        return fail(err, invalid_message, path.c_str());
     std::ofstream file(path, std::ios::binary | std::ios::trunc);
     if (!file)
         return fail(err, "could not create OBJ texture: %s", path.c_str());
-    file.write(reinterpret_cast<const char*>(resource.payload), resource.payload_size);
+    file.write(reinterpret_cast<const char*>(bytes), size);
     if (!file)
         return fail(err, "could not write OBJ texture: %s", path.c_str());
     return true;
-}
-
-bool write_obj_texture(const std::string& path, const std::vector<uint8_t>& bytes, Error* err) {
-    if (bytes.size() < 4 || memcmp(bytes.data(), "DDS ", 4) != 0)
-        return fail(err, "object texture resource is not DDS data: %s", path.c_str());
-    std::ofstream file(path, std::ios::binary | std::ios::trunc);
-    if (!file)
-        return fail(err, "could not create OBJ texture: %s", path.c_str());
-    file.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
-    if (!file)
-        return fail(err, "could not write OBJ texture: %s", path.c_str());
-    return true;
-}
-
-Asura_Vector_3 obj_rotate_by_quaternion(Asura_Vector_3 value, const Asura_Quat& rotation) {
-    const Asura_Vector_3 q{rotation.x, rotation.y, rotation.z};
-    const Asura_Vector_3 twice_cross{
-        2.0f * (q.y * value.z - q.z * value.y),
-        2.0f * (q.z * value.x - q.x * value.z),
-        2.0f * (q.x * value.y - q.y * value.x)};
-    const Asura_Vector_3 q_cross_twice{
-        q.y * twice_cross.z - q.z * twice_cross.y,
-        q.z * twice_cross.x - q.x * twice_cross.z,
-        q.x * twice_cross.y - q.y * twice_cross.x};
-    return {value.x + rotation.w * twice_cross.x + q_cross_twice.x,
-            value.y + rotation.w * twice_cross.y + q_cross_twice.y,
-            value.z + rotation.w * twice_cross.z + q_cross_twice.z};
 }
 
 Asura_Vector_3 obj_static_object_vector(Asura_Vector_3 value, const Asura_Quat& rotation) {
-    value = obj_rotate_by_quaternion(value, rotation);
+    value = rotate_by_quaternion(value, rotation);
     // PC object geometry and entity transforms are in game coordinates. OBJ
     // authoring uses the same inverse Y/Z conversion as the environment export.
     value.y = -value.y;
@@ -1977,7 +1952,7 @@ Asura_Vector_3 obj_static_object_vector(Asura_Vector_3 value, const Asura_Quat& 
 
 Asura_Vector_3 obj_static_object_position(Asura_Vector_3 value, const Entity& entity,
                                           const Asura_Quat& rotation) {
-    value = obj_rotate_by_quaternion(value, rotation);
+    value = rotate_by_quaternion(value, rotation);
     value.x += entity.position.x;
     value.y += entity.position.y;
     value.z += entity.position.z;
@@ -2102,7 +2077,9 @@ bool export_static_object_obj(const Entity& entity, const EntityModel& model,
                     texture_name = texture_stem + "_" + std::to_string(suffix++) + ".dds";
                 }
                 const std::string texture_path = obj_export_join(texture_folder, texture_name);
-                if (!write_obj_texture(texture_path, material.texture_bytes, &err)) {
+                if (!write_obj_texture(texture_path, material.texture_bytes.data(),
+                                       material.texture_bytes.size(),
+                                       "object texture resource is not DDS data: %s", &err)) {
                     ok = false;
                     break;
                 }
@@ -2342,7 +2319,8 @@ bool export_pc_environment_obj(const std::string& source_pc_path, const char* ou
                 }
 
                 const std::string texture_path = obj_export_join(texture_folder, texture_name);
-                if (!write_obj_texture(texture_path, texture, &err)) {
+                if (!write_obj_texture(texture_path, texture.payload, texture.payload_size,
+                                       "environment texture resource is not DDS data: %s", &err)) {
                     ok = false;
                     break;
                 }

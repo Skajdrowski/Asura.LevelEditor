@@ -26,7 +26,7 @@ class EnvironmentRaycast {
 public:
     void clear();
     void build(const Mesh& mesh);
-    bool intersect(const Mesh& mesh, const EnvironmentRay& ray, EnvironmentRayHit* hit) const;
+    bool intersect(const EnvironmentRay& ray, EnvironmentRayHit* hit) const;
     bool empty() const { return nodes_.empty(); }
 
     struct Bounds {

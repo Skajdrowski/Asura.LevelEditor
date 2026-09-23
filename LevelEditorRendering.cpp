@@ -304,6 +304,7 @@ struct GpuRenderer {
     std::vector<GpuEntityModelRange> animated_model_ranges;
     std::vector<GpuVertex> animated_model_scratch;
     std::vector<EntityModelVertex> skinned_vertex_scratch;
+    std::vector<ModelBoneTransform> bone_transform_scratch;
     bool animated_models_active = false;
     ULONGLONG animation_start = GetTickCount64();
     std::vector<GpuTransparentEntityRange> transparent_entity_range_scratch;
@@ -2879,7 +2880,7 @@ void gpu_render() {
     const double animation_seconds = (GetTickCount64() - gpu.animation_start) * .001;
     for (size_t i = 0; i < entity_count; ++i) {
         if (!entity_models[i] || !sample_entity_model(g.document.entities[i], *entity_models[i],
-                animation_seconds, &gpu.skinned_vertex_scratch)) continue;
+                animation_seconds, &gpu.skinned_vertex_scratch, &gpu.bone_transform_scratch)) continue;
         append_gpu_entity_model(g.document.entities[i], entity_models[i], selection_order[i] != 0,
             &gpu.animated_model_scratch, &gpu.animated_model_ranges, &gpu.skinned_vertex_scratch);
     }

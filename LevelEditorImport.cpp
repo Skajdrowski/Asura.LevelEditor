@@ -1080,19 +1080,6 @@ struct HierarchyBindTransform {
     Asura_Quat orientation{0, 0, 0, 1};
 };
 
-Asura_Vector_3 hierarchy_rotate(Asura_Vector_3 value, const Asura_Quat& rotation) {
-    const Asura_Vector_3 q{rotation.x, rotation.y, rotation.z};
-    const Asura_Vector_3 twice_cross{2.0f * (q.y * value.z - q.z * value.y),
-                                     2.0f * (q.z * value.x - q.x * value.z),
-                                     2.0f * (q.x * value.y - q.y * value.x)};
-    const Asura_Vector_3 second_cross{q.y * twice_cross.z - q.z * twice_cross.y,
-                                      q.z * twice_cross.x - q.x * twice_cross.z,
-                                      q.x * twice_cross.y - q.y * twice_cross.x};
-    return {value.x + rotation.w * twice_cross.x + second_cross.x,
-            value.y + rotation.w * twice_cross.y + second_cross.y,
-            value.z + rotation.w * twice_cross.z + second_cross.z};
-}
-
 Asura_Quat hierarchy_multiply(const Asura_Quat& a, const Asura_Quat& b) {
     return {a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
             a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
@@ -1102,7 +1089,7 @@ Asura_Quat hierarchy_multiply(const Asura_Quat& a, const Asura_Quat& b) {
 
 HierarchyBindTransform hierarchy_compose(const HierarchyBindTransform& parent,
                                          const HierarchyBindTransform& local) {
-    const Asura_Vector_3 offset = hierarchy_rotate(local.position, parent.orientation);
+    const Asura_Vector_3 offset = rotate_by_quaternion(local.position, parent.orientation);
     return {{parent.position.x + offset.x, parent.position.y + offset.y, parent.position.z + offset.z},
             hierarchy_multiply(parent.orientation, local.orientation)};
 }
@@ -1248,11 +1235,11 @@ bool decode_pc_pickup_model(const ChunkList& chunks, uint32_t chunk_index, const
                             return fail(err, "pickup ObjectHierarchy '%.*s' expands beyond preview limits",
                                         resource.name.size, resource.name.data);
                         EntityModelVertex vertex = source_vertices[source_index];
-                        const Asura_Vector_3 rotated_position = hierarchy_rotate(vertex.position, bind.orientation);
+                        const Asura_Vector_3 rotated_position = rotate_by_quaternion(vertex.position, bind.orientation);
                         vertex.position = {rotated_position.x + bind.position.x,
                                            rotated_position.y + bind.position.y,
                                            rotated_position.z + bind.position.z};
-                        vertex.normal = hierarchy_rotate(vertex.normal, bind.orientation);
+                        vertex.normal = rotate_by_quaternion(vertex.normal, bind.orientation);
                         destination = static_cast<uint16_t>(next.mesh.vertices.size());
                         next.mesh.vertices.push_back(vertex);
                         ModelVertexWeights weights;

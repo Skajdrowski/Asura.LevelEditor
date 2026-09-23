@@ -100,7 +100,6 @@ Asura_Vector_3 entity_view_position(Asura_Vector_3 game_position);
 float dot(Asura_Vector_3 a, Asura_Vector_3 b);
 Asura_Vector_3 cross(Asura_Vector_3 a, Asura_Vector_3 b);
 Asura_Vector_3 normalized(Asura_Vector_3 a);
-Asura_Vector_3 rotate_by_quaternion(Asura_Vector_3 value, const Asura_Quat& rotation);
 Asura_Vector_3 entity_model_view_vector(Asura_Vector_3 value, const Entity& entity);
 Asura_Vector_3 entity_model_view_position(Asura_Vector_3 local_position,
                                           const Entity& entity);

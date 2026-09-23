@@ -27,4 +27,17 @@ void finish_mesh_bounds(Mesh* mesh) {
     mesh->radius = fmaxf(5.0f, sqrtf(dx * dx + dy * dy + dz * dz) * .5f);
 }
 
+Asura_Vector_3 rotate_by_quaternion(Asura_Vector_3 value, const Asura_Quat& rotation) {
+    const Asura_Vector_3 q{rotation.x, rotation.y, rotation.z};
+    const Asura_Vector_3 twice_cross{2.0f * (q.y * value.z - q.z * value.y),
+                                     2.0f * (q.z * value.x - q.x * value.z),
+                                     2.0f * (q.x * value.y - q.y * value.x)};
+    const Asura_Vector_3 q_cross_twice{q.y * twice_cross.z - q.z * twice_cross.y,
+                                       q.z * twice_cross.x - q.x * twice_cross.z,
+                                       q.x * twice_cross.y - q.y * twice_cross.x};
+    return {value.x + rotation.w * twice_cross.x + q_cross_twice.x,
+            value.y + rotation.w * twice_cross.y + q_cross_twice.y,
+            value.z + rotation.w * twice_cross.z + q_cross_twice.z};
+}
+
 } // namespace editor
