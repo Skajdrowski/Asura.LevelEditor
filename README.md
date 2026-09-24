@@ -27,6 +27,102 @@ The usual workflow for a new level is:
 
 You can save your work into Level Editor's own **.alev** project format and comeback to it later.
 
+# Asura materials
+
+Each material is identified by an **Asura material index** and level geometry faces reference that index.
+The material index then defines the texture and material behaviour used by the game.
+
+**Asura Material Map** Blender extension stores the following data for each material used by the scene:
+
+- **Material Index:** Numeric Asura material ID referenced by the exported level geometry.
+- **Texture Name:** Name of the corresponding texture resource. Level textures are supplied in **DDS** format.
+- **Surface Type:** Material ID. Game responds to them by footsteps or bullet impacts.
+- **Blending Flags:** Texture rendering flags.
+- **Collision Flags:** Collision behaviour flags.
+
+These properties are available in Blender under **Material Properties > Asura Material** and in the **Asura > Material Map** sidebar.
+The extension automatically fills missing material indices and texture names for materials which are actually used by mesh faces.
+A material named `mat_123` keeps index `123`; materials without an index in their name receive the lowest unused index alphabetically.
+Clearing an Asura material index leaves that material out of the exported map.
+
+> Asura material indices are independent from Blender material-slot indices.
+>
+> Material names in a material map **are not** case-sensitive.
+
+## Surface types
+
+Each material has one surface type:
+
+| Value | Surface type |
+| ---: | --- |
+| `1` | Concrete |
+| `2` | Glass |
+| `4` | Metal |
+| `5` | Water |
+| `6` | Wood |
+| `7` | Human body |
+| `8` | Wrecked car |
+| `10` | Dirt |
+| `11` | Grass |
+| `12` | Gravel |
+| `13` | Wet |
+
+## Blending flags
+
+Blending bit flags per material.
+
+>Textures need to have corresponding alpha packed channels for some of these flags to have visible results in-game.
+
+| Flag | Effect |
+| ---: | --- |
+| `0x1` | Additive |
+| `0x2` | Alpha texture |
+| `0x4` | Detail mapping via `detail.dds` |
+| `0x80` | `Spheremap1.dds` reflection |
+| `0x400` | Scrolling texture |
+| `0x1000` | Light shaft depth |
+| `0x4000` | Affected by rain |
+
+## Collision flags
+
+Collision bit flags per material.
+
+| Flag | Effect |
+| ---: | --- |
+| `0x20` | Ignore entities only |
+| `0x40` | Ignore bullets only |
+| `0x200` | Ignore bullets & grenades only |
+| `0x400` | Include backface |
+
+## Material map
+
+The Blender extension exports a JSON material map consumed by **Asura Level Editor**. Material names map to their Asura indices, while the remaining sections attach texture names and flags to those indices. For example:
+
+```json
+{
+  "Brick": 0,
+  "Window": 1,
+  "texture_by_material_index": {
+    "0": "brick.dds",
+    "1": "window.dds"
+  },
+  "surface_type_by_material_index": {
+    "0": 1,
+    "1": 2
+  },
+  "transparency_flag_by_material_index": {
+    "0": 0,
+    "1": 2
+  },
+  "collision_flags": {
+    "0": 0,
+    "1": 1024
+  }
+}
+```
+
+The same map can be loaded back into Blender or imported into **Asura Level Editor**. When exporting a custom level, Level Editor uses it to resolve OBJ material names to Asura material indices, to build the level's material, rendering and collision data.
+
 # Asura entities
 
 Level Editor supports 5 server-side entities: Spawn, Object, Pickup, Sound, Indoor Zone
