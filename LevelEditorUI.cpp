@@ -820,10 +820,11 @@ bool run_centered_modal(const char* window_class, const char* title,
 }
 
 enum SoundPropertiesId { ID_SOUND_START = 2100, ID_SOUND_TRIGGER, ID_SOUND_ONCE, ID_SOUND_EXIT,
-                         ID_SOUND_TRIGGER_OFFSET, ID_SOUND_TRIGGER_SIZE = ID_SOUND_TRIGGER_OFFSET + 3 };
+                         ID_SOUND_TRIGGER_OFFSET, ID_SOUND_TRIGGER_SIZE = ID_SOUND_TRIGGER_OFFSET + 3,
+                         ID_SOUND_PLAYBACK = ID_SOUND_TRIGGER_SIZE + 3 };
 struct SoundPropertiesState {
     HWND window = nullptr, start = nullptr, trigger = nullptr, once = nullptr, stop = nullptr;
-    HWND offset[3]{}, size[3]{};
+    HWND offset[3]{}, size[3]{}, playback_parameters[7]{};
     Entity value;
     bool accepted = false;
 };
@@ -871,6 +872,18 @@ LRESULT CALLBACK sound_properties_proc(HWND hwnd, UINT message, WPARAM wparam, L
                 (row ? state->size : state->offset)[axis] = field;
             }
         }
+        for (int i = 3; i < 7; ++i) {
+            const int y = 302 + (i - 3) / 2 * 38;
+            const bool maximum = (i - 3) % 2 != 0;
+            if (!maximum)
+                make_dialog_control(hwnd, "STATIC", i == 3 ? "Volume" : "Pitch",
+                                    SS_LEFT, 0, 18, y, 132, 24);
+            make_dialog_control(hwnd, "STATIC", maximum ? "Max" : "Min", SS_LEFT, 0,
+                                maximum ? 286 : 158, y, 36, 24);
+            state->playback_parameters[i] = make_dialog_control(hwnd, "EDIT", "",
+                ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP, ID_SOUND_PLAYBACK + i - 3,
+                maximum ? 322 : 190, y, 84, 24);
+        }
         const editor::Entity& e = state->value;
         SendMessageA(state->start, BM_SETCHECK, e.sound_controller_active ? BST_CHECKED : BST_UNCHECKED, 0);
         SendMessageA(state->trigger, BM_SETCHECK, e.sound_trigger_enabled ? BST_CHECKED : BST_UNCHECKED, 0);
@@ -881,8 +894,10 @@ LRESULT CALLBACK sound_properties_proc(HWND hwnd, UINT message, WPARAM wparam, L
         for (int axis = 0; axis < 3; axis++) {
             set_float(state->offset[axis], offset[axis]); set_float(state->size[axis], size[axis]);
         }
-        make_dialog_control(hwnd, "BUTTON", "Apply", BS_DEFPUSHBUTTON | WS_TABSTOP, IDOK, 310, 354, 104, 30);
-        make_dialog_control(hwnd, "BUTTON", "Cancel", BS_PUSHBUTTON | WS_TABSTOP, IDCANCEL, 422, 354, 104, 30);
+        for (int i = 3; i < 7; ++i)
+            set_float(state->playback_parameters[i], e.sound_phonon.m_afLegacyVolumeParameters[i]);
+        make_dialog_control(hwnd, "BUTTON", "Apply", BS_DEFPUSHBUTTON | WS_TABSTOP, IDOK, 310, 392, 104, 30);
+        make_dialog_control(hwnd, "BUTTON", "Cancel", BS_PUSHBUTTON | WS_TABSTOP, IDCANCEL, 422, 392, 104, 30);
         update_sound_properties(state);
         return 0;
     }
@@ -891,6 +906,21 @@ LRESULT CALLBACK sound_properties_proc(HWND hwnd, UINT message, WPARAM wparam, L
         if (id == ID_SOUND_TRIGGER || id == ID_SOUND_ONCE) update_sound_properties(state);
         if (id == IDOK) {
             Entity& e = state->value;
+            for (int i = 3; i < 7; ++i) {
+                char text[128]{}; char* end = nullptr;
+                GetWindowTextA(state->playback_parameters[i], text, sizeof(text));
+                const float value = strtof(text, &end);
+                const bool parsed = end != text;
+                while (*end == ' ' || *end == '\t') ++end;
+                if (!parsed || *end || !isfinite(value) ||
+                    (i < 5 ? value < 0.0f || value > 1.0f : value <= 0.0f)) {
+                    MessageBoxA(hwnd, i < 5 ? "Enter sound volume values from 0 to 1."
+                                              : "Enter positive pitch/speed values (1 is normal)",
+                                "Sound playback", MB_OK | MB_ICONWARNING);
+                    return 0;
+                }
+                e.sound_phonon.m_afLegacyVolumeParameters[i] = value;
+            }
             e.sound_trigger_enabled = SendMessageA(state->trigger, BM_GETCHECK, 0, 0) == BST_CHECKED;
             e.sound_trigger_once = SendMessageA(state->once, BM_GETCHECK, 0, 0) == BST_CHECKED;
             e.sound_stop_on_exit = SendMessageA(state->stop, BM_GETCHECK, 0, 0) == BST_CHECKED;
@@ -927,7 +957,7 @@ void command_sound_properties() {
     if (!valid_entity_index(g.selected) || g.document.entities[g.selected].kind != EntityKind::Sound) return;
     SoundPropertiesState state;
     state.value = g.document.entities[g.selected];
-    if (!run_centered_modal("Asura2005SoundProperties", "Sound playback", 560, 438, &state) ||
+    if (!run_centered_modal("Asura2005SoundProperties", "Sound playback", 560, 480, &state) ||
         !state.accepted || !g.history.begin(g.document, g.selected)) return;
     g.document.entities[g.selected] = std::move(state.value);
     commit_history_transaction();
@@ -1994,18 +2024,20 @@ void add_entity_at(EntityKind kind, const Asura_Vector_3& p) {
     char name[160]{};
     if (kind == EntityKind::SpawnPoint) {
         snprintf(name, sizeof(name), "Spawn %zu", g.document.entities.size() + 1);
-        e.value_u32_a = 5;
-        e.value_u32_b = 24;
+        e.value_u32_a = SnipeSpawnTeam_Deathmatch | SnipeSpawnTeam_Russian;
+        e.value_u32_b = SnipeSpawnGameMode_Deathmatch | SnipeSpawnGameMode_TeamDeathmatch;
         e.spawn_timer = 5.0f;
     } else if (kind == EntityKind::Light) {
         snprintf(name, sizeof(name), "Light %zu", g.document.entities.size() + 1);
-        e.value_a = 2.5f;
-        e.value_b = 1500;
+        e.value_a = 1.f;
+        e.value_b = 25;
         e.light = legacy_editor_light(e);
     } else if (kind == EntityKind::Sound) {
         snprintf(name, sizeof(name), "Sound %zu", g.document.entities.size() + 1);
-        e.value_a = 50;
-        e.value_b = 250;
+        e.value_a = 0;
+        e.value_b = 25;
+        for (int i = 3; i < 7; ++i)
+            e.sound_phonon.m_afLegacyVolumeParameters[i] = 1.f;
     } else if (kind == EntityKind::Pickup) {
         snprintf(name, sizeof(name), "%s %zu",
                  snipe_item_name(e.value_u32_a) ? snipe_item_name(e.value_u32_a) : "Pickup",

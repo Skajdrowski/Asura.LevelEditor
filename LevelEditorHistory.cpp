@@ -267,13 +267,16 @@ void canonicalize_clone(Entity* entity) {
         // rotation, spawn_direction, team mask, and game-mode mask are the
         // author-facing gameplay state and intentionally remain unchanged.
         break;
-    case EntityKind::Sound:
+    case EntityKind::Sound: {
         entity->sound_source_record = false;
         entity->sound_has_controller = false;
         entity->sound_trigger_source_guid = 0;
         entity->sound_controller_padding = 0x4974;
+        const Asura_Chunk_Phonons_PhononDataV9 phonon = entity->sound_phonon;
         entity->sound_phonon = {};
+        memcpy(entity->sound_phonon.m_afLegacyVolumeParameters, phonon.m_afLegacyVolumeParameters, sizeof(phonon.m_afLegacyVolumeParameters));
         break;
+    }
     case EntityKind::Pickup:
         entity->source_entity_classification = SnipeEntityClass_Pickup;
         // pickup_has_template, pickup_body, IDs, padding, and the user-visible

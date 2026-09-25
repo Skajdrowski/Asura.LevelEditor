@@ -282,9 +282,16 @@ bool make_editor_sounds(const Document& doc, Sounds* sounds, Arena* arena, Error
         s.position = e.position;
         s.inner_radius = e.value_a;
         s.outer_radius = e.value_b;
+        for (int i = 3; i < 7; ++i) {
+            const float value = e.sound_phonon.m_afLegacyVolumeParameters[i];
+            if (!isfinite(value) ||
+                (i < 5 ? value < 0.0f || value > 1.0f : value <= 0.0f))
+                return fail(err, i < 5 ? "sound '%s' needs volume values from 0 to 1"
+                                       : "sound '%s' needs positive pitch values", e.name.c_str());
+        }
+        memcpy(s.legacy_volume_parameters, e.sound_phonon.m_afLegacyVolumeParameters,
+               sizeof(s.legacy_volume_parameters));
         if (e.sound_source_record) {
-            memcpy(s.legacy_volume_parameters, e.sound_phonon.m_afLegacyVolumeParameters,
-                   sizeof(s.legacy_volume_parameters));
             s.inner_cuboid_radius = e.sound_phonon.m_xInnerCuboidRadius;
             s.outer_cuboid_radius = e.sound_phonon.m_xOuterCuboidRadius;
             s.retrigger_bounding_box = e.sound_phonon.m_xRetriggerBoundingBox;
@@ -297,8 +304,6 @@ bool make_editor_sounds(const Document& doc, Sounds* sounds, Arena* arena, Error
             s.emit_enti = e.sound_has_controller || e.sound_trigger_enabled;
             s.active = !e.sound_trigger_enabled && e.sound_controller_active;
         } else {
-            const float params[7] = {0, 0, 0, 1, 1, 1, 1};
-            memcpy(s.legacy_volume_parameters, params, sizeof(params));
             s.inner_cuboid_radius = {5, 5, 5};
             s.outer_cuboid_radius = {10, 10, 10};
             s.orientation = euler_quaternion(e.rotation);

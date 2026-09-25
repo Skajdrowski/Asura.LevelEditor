@@ -181,6 +181,8 @@ Each controller can play single imported **PCM `.wav`** audio within a defined r
 - **Use bounding box:** Audio starts playing when any player enters it's **Bounding Box**.
 - **Trigger once:** Prevents subsequent audio triggers. Otherwise, the audio controller rearms itself after all living players leave defined box.
 - **Stop when all players leave:** Stops playback when there's no player inside the box.
+- **Volume:** Sets playback volume from 0 to 1. Min and Max are used for randomization (For example Min=0 and Max=1 will randomize volume between 0 and 1)
+- **Pitch** Changes playback pitch and speed. Min and Max are used for randomization.
 
 <img width="546" height="431" alt="Audio properties" src="https://github.com/user-attachments/assets/d0817f56-1409-4837-966f-a59f98484165" />
 
