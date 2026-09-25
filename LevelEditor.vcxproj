@@ -103,7 +103,7 @@
       <LinkTimeCodeGeneration>UseFastLinkTimeCodeGeneration</LinkTimeCodeGeneration>
       <OptimizeReferences>true</OptimizeReferences>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
-      <GenerateMapFile Condition="'$(Configuration)|$(Platform)'=='Release|x64'">true</GenerateMapFile>
+      <GenerateMapFile Condition="'$(Configuration)|$(Platform)'=='Release|x64'">false</GenerateMapFile>
       <MapFileName Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(IntDir)AsuraLevelEditor.map</MapFileName>
     </Link>
   </ItemDefinitionGroup>

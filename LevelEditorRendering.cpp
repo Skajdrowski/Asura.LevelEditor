@@ -34,20 +34,23 @@ struct EnvironmentMaterialConstants {
     float has_material_color;
     float render_mode;
     float auxiliary_mode;
+    float scroll_offset;
+    float padding[3];
 };
 
-static_assert(sizeof(EnvironmentMaterialConstants) == 0x20,
+static_assert(sizeof(EnvironmentMaterialConstants) == 0x30,
               "environment material constants must preserve HLSL register packing");
 
 EnvironmentMaterialConstants environment_material_constants(
     DirectX::XMFLOAT4 fallback_color, bool has_texture, bool has_material_color,
-    float render_mode, float auxiliary_mode, bool alpha_test) {
+    float render_mode, float auxiliary_mode, bool alpha_test, float scroll_offset = 0.0f) {
     (void)alpha_test;
     return {fallback_color,
             has_texture ? 1.0f : 0.0f,
             has_material_color ? 1.0f : 0.0f,
             render_mode,
-            auxiliary_mode};
+            auxiliary_mode,
+            scroll_offset};
 }
 
 struct EnvironmentViewConstants {
@@ -240,7 +243,8 @@ bool gpu_material_is_solid_cutout(const GpuMaterialRange& range) {
     // wet roads, additive surfaces, and sphere-map surfaces still need their
     // original equations. Flag-0x4 solid fences stay cutouts; their target
     // detail multipass is precisely what makes them blow out in this viewport.
-    constexpr uint32_t composited_material_flags = 0x1u | 0x80u | 0x4000u;
+    // Flag 0x400 must reach the common textured pass for its UV transform.
+    constexpr uint32_t composited_material_flags = 0x1u | 0x80u | 0x400u | 0x4000u;
     return range.source_pc_material && gpu_material_uses_alpha(range) &&
            (range.texture_flags & 0x8u) == 0 &&
            (range.material_flags & composited_material_flags) == 0;
@@ -365,7 +369,10 @@ void refresh_scene_animation_timer() {
         return;
     const bool animated_clouds = g.document.skybox.draw_clouds && gpu.skybox_cloud;
     const bool animated_rain = g.document.rain_enabled && gpu.rain_texture && gpu.rain_pixel_shader;
-    if (animated_clouds || animated_rain || gpu.animated_models_active)
+    bool scrolling_material = false;
+    for (const GpuMaterialRange& range : gpu.material_ranges)
+        scrolling_material |= range.texture && (range.material_flags & 0x400u) != 0;
+    if (animated_clouds || animated_rain || gpu.animated_models_active || scrolling_material)
         SetTimer(g.window, 2, 33, nullptr);
     else
         KillTimer(g.window, 2);
@@ -1563,6 +1570,7 @@ cbuffer EnvironmentMaterialBuffer : register(b2) {
     float materialHasColor;
     float materialRenderMode;
     float materialAuxiliaryMode;
+    float materialScrollOffset;
 };
 cbuffer EnvironmentViewBuffer : register(b3) {
     float4 environmentCameraPosition;
@@ -1575,7 +1583,8 @@ float4 EnvPSMain(VSOutput input) : SV_TARGET {
     // ramp. Baked prelight therefore reaches the texture combiner unchanged.
     float3 diffuse = saturate(input.color.rgb);
     float4 albedo = materialHasTexture > 0.5
-                        ? environmentTexture.Sample(environmentSampler, input.uv)
+                        ? environmentTexture.Sample(environmentSampler,
+                                                    input.uv + float2(materialScrollOffset, 0.0))
                         : float4(1.0, 1.0, 1.0, 1.0);
     if (materialHasTexture < 0.5)
         return materialHasColor > 0.5
@@ -2586,6 +2595,10 @@ void gpu_draw_overlay_range(uint32_t start_vertex, uint32_t vertex_count,
 void gpu_render() {
     if (!gpu.ready || !g.viewport)
         return;
+    const double animation_seconds = (GetTickCount64() - gpu.animation_start) * .001;
+    // MCP2 sub_48C720 advances the environment texture matrix's U offset by
+    // 0.3 times frame delta, leaving V unchanged.
+    const float texture_scroll_offset = static_cast<float>(fmod(animation_seconds * .3, 1.0));
     gpu.alpha_tested_prelight_drawn = false;
     gpu.solid_cutout_prelight_drawn = false;
     gpu.composited_alpha_prelight_drawn = false;
@@ -2748,7 +2761,8 @@ void gpu_render() {
                 environment_material_constants(wet_splash ? wet_transform : range.fallback_color,
                                                true, range.has_material_color, 1.0f,
                                                wet_splash ? 1.0f : (detail ? 2.0f : 0.0f),
-                                               gpu_material_uses_alpha(range));
+                                               gpu_material_uses_alpha(range),
+                                               range.material_flags & 0x400u ? texture_scroll_offset : 0.0f);
             gpu.context->UpdateSubresource(gpu.environment_material_buffer, 0, nullptr, &material_constants, 0, 0);
             gpu.context->PSSetShaderResources(2, 1, &range.texture);
             gpu.context->DrawIndexed(range.index_count, range.start_index, 0);
@@ -2957,7 +2971,6 @@ void gpu_render() {
     // objects each frame, including separate poses for shared-mesh instances.
     gpu.animated_model_scratch.clear();
     gpu.animated_model_ranges.clear();
-    const double animation_seconds = (GetTickCount64() - gpu.animation_start) * .001;
     for (const GpuAnimatedEntity& animated : gpu.animated_entities) {
         const size_t i = animated.entity_index;
         if (!sample_entity_model(g.document.entities[i], *entity_models[i], *animated.animation,
@@ -3028,9 +3041,6 @@ void gpu_render() {
 }
 
 bool gpu_ready() { return gpu.ready; }
-bool gpu_has_skybox_cloud() { return gpu.skybox_cloud != nullptr; }
-bool gpu_has_rain_texture() { return gpu.rain_texture != nullptr; }
-bool gpu_has_animated_models() { return gpu.animated_models_active; }
 
 void gpu_set_skybox_tint(const SkyboxSettings& skybox) {
     gpu.skybox_tint = {std::clamp(skybox.red / 255.0f, 0.0f, 1.0f),

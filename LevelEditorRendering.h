@@ -17,9 +17,6 @@ struct SkyboxTextureScan {
 };
 
 bool gpu_ready();
-bool gpu_has_skybox_cloud();
-bool gpu_has_rain_texture();
-bool gpu_has_animated_models();
 void gpu_set_skybox_tint(const SkyboxSettings& skybox);
 void gpu_set_environment_wet_weather(bool enabled);
 

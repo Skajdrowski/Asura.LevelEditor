@@ -4024,8 +4024,7 @@ enum ObjectPropertiesId { ID_OBJECT_TEXTURE = 3600, ID_OBJECT_TEXTURE_CLEAR, ID_
 
 constexpr struct { const char* label; uint32_t mask; bool collision; } kObjectFlags[] = {
     {"Additive (0x1)", 1, false}, {"Alpha texture (0x2)", 2, false},
-    {"Detail mapping (0x4)", 4, false}, {"Reflection (0x80)", 0x80, false},
-    {"Scrolling texture (0x400)", 0x400, false}, {"Light shaft depth (0x1000)", 0x1000, false},
+    {"Detail mapping (0x4)", 4, false}, {"Reflection (0x80)", 0x80, false}, {"Light shaft depth (0x1000)", 0x1000, false},
     {"Ignore entities (0x20)", 0x20, true}, {"Ignore bullets / explosions (0x40)", 0x40, true}, {"Include backface (0x400)", 0x400, true}
 };
 
@@ -4086,7 +4085,7 @@ LRESULT CALLBACK object_properties_proc(HWND hwnd, UINT message, WPARAM wparam, 
         for (int i = 0; i < static_cast<int>(_countof(kObjectFlags)); ++i) {
             const bool collision = kObjectFlags[i].collision;
             state->checks[i] = make_dialog_control(hwnd, "BUTTON", kObjectFlags[i].label, BS_AUTOCHECKBOX | WS_TABSTOP,
-                ID_OBJECT_FLAG_FIRST + i, collision ? 346 : 16, 106 + (collision ? i - 6 : i) * 26, 306, 22);
+                ID_OBJECT_FLAG_FIRST + i, collision ? 346 : 16, 106 + (collision ? i - 5 : i) * 26, 306, 22);
         }
         set_u32_hex(state->blend, material.flags);
         set_u32_hex(state->collision, state->value.collision_flags);
@@ -4668,9 +4667,7 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
             g.fast_preview = false;
             invalidate_environment_cache();
             request_redraw();
-        } else if (wparam == 2 &&
-                   ((g.document.skybox.draw_clouds && gpu_has_skybox_cloud()) ||
-                    (g.document.rain_enabled && gpu_has_rain_texture()) || gpu_has_animated_models())) {
+        } else if (wparam == 2) {
             request_redraw();
         }
         return 0;
