@@ -1556,12 +1556,18 @@ float4 PSMain(VSOutput input) : SV_TARGET {
     if (input.color.a > 0.5)
         return input.color;
     float4 albedo = modelTexture.Sample(modelSampler, input.uv);
-    if (input.color.a < 0.0 && albedo.a <= 10.0 / 255.0)
+    if (input.color.a < 0.0 && input.color.a > -1.5 && albedo.a <= 10.0 / 255.0)
         discard;
     float light = 0.28 + 0.72 * abs(dot(normalize(input.normal), normalize(float3(-0.35, 0.8, -0.45))));
     float3 baseColor = dot(abs(input.color.rgb), float3(1.0, 1.0, 1.0)) > 0.001
                            ? input.color.rgb
                            : float3(0.32, 0.39, 0.43);
+    if (input.color.a < -1.5) {
+        // MCP2 combiner 5: MODULATE2X(texture, diffuse), then add the same
+        // texture weighted by the current (texture) alpha.
+        float3 current = saturate(2.0 * baseColor * albedo.rgb * light);
+        return float4(saturate(current + albedo.a * albedo.rgb), albedo.a);
+    }
     // Preserve texture alpha for translucent object materials. Opaque and
     // cutout draws still disable blending and write scene depth.
     return float4(baseColor * albedo.rgb * light, albedo.a);
@@ -2407,12 +2413,15 @@ void append_gpu_entity_model(const Entity& entity, const EntityModel* model, boo
         else if (selected)
             color = entity.kind == EntityKind::StaticObject ? DirectX::XMFLOAT4{.42f, 1.0f, .82f, 0}
                                                              : DirectX::XMFLOAT4{1.0f, .68f, .22f, 0};
-        // Negative alpha enables the target's alpha test. Opaque materials may
-        // contain unused texture alpha (zis5); Character never alpha-tests.
-        if (textured && model->resource_subtype != ASURA_RESOURCEFILE_TYPE_PC_CHARACTER &&
-            !(material->flags & 1u) && ((material->flags & 2u) ||
-                (model->resource_subtype == ASURA_RESOURCEFILE_TYPE_PC_OBJECT && (material->flags & 0x1000u))))
-            color.w = -1.0f;
+        // Vertex alpha selects the target's object combiner or alpha test.
+        // Character has neither flag-1 combiner 5 nor an alpha test here.
+        if (textured && model->resource_subtype != ASURA_RESOURCEFILE_TYPE_PC_CHARACTER) {
+            if (material->flags & 1u)
+                color.w = -2.0f;
+            else if ((material->flags & 2u) ||
+                     (model->resource_subtype == ASURA_RESOURCEFILE_TYPE_PC_OBJECT && (material->flags & 0x1000u)))
+                color.w = -1.0f;
+        }
         const uint32_t start_vertex = static_cast<uint32_t>(output->size());
         for (uint16_t index : face)
             output->push_back(gpu_model_vertex(posed_vertices ? (*posed_vertices)[index] : model->vertices[index], entity, color));
