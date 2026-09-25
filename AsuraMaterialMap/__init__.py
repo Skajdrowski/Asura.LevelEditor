@@ -29,10 +29,10 @@ SURFACE_TYPES = (
 BLENDING_FLAGS = (
     (1, "Additive pass (SRC_ALPHA / ONE)"),
     (2, "Alpha texture"),
-    (4, "?Detail mapping via detail.dds"),
-    (0x80, "Spheremap1.dds reflection"),
+    (4, "Detail mapping via detail.dds"),
+    (0x80, "Reflection via spheremap1.dds"),
+    (0x200, "Water animation"),
     (0x400, "Scrolling texture"),
-    (0x1000, "Light shaft depth"),
     (0x4000, "Affected by rain"),
 )
 
