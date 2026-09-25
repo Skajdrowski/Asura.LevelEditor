@@ -927,6 +927,12 @@ bool gpu_reload_environment_textures(std::string* why, uint32_t* loaded_count,
             *loaded_count = loaded;
         if (missing_count)
             *missing_count = missing;
+        if (gpu_has_material_flag(0x80u, true)) {
+            std::string texture_error;
+            if (!gpu_load_graphics_texture("SpecialFX\\spheremap1.dds", &gpu.environment_spheremap,
+                                           &texture_error))
+                last_texture_error = std::move(texture_error);
+        }
     }
     if (!ok && why)
         *why = err.set ? err.message : "Could not resolve environment materials.";
