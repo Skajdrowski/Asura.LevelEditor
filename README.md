@@ -147,7 +147,7 @@ Spawns also have their **Game mode gate**, which allows to create game mode excl
 
 ## Object
 
-Physical geometry objects hold only one material and one texture for their entire geometry.
+Physical geometry objects hold only one material, one texture and one blending/collision flag for their entire geometry.
 
 >Objects **do not** participate in level's prebaked vertex lighting.
 >They receive light only from **Light** entities.
