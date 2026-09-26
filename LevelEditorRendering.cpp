@@ -324,7 +324,7 @@ struct GpuRenderer {
     std::vector<EntityModelVertex> skinned_vertex_scratch;
     std::vector<ModelBoneTransform> bone_transform_scratch;
     bool animated_models_active = false;
-    ULONGLONG animation_start = GetTickCount64();
+    DWORD animation_start = GetTickCount();
     std::vector<GpuTransparentEntityRange> transparent_entity_range_scratch;
     std::vector<GpuVertex> overlay_scratch;
     std::vector<LightGizmoLine> entity_gizmo_scratch;
@@ -2312,7 +2312,7 @@ void gpu_render_skybox(const DirectX::XMFLOAT4X4& view_projection) {
     const UINT stride = sizeof(SkyboxVertex), offset = 0;
     gpu.context->IASetVertexBuffers(0, 1, &gpu.skybox_vertices, &stride, &offset);
     gpu.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    const float animation_time = static_cast<float>(fmod(GetTickCount64() * .001, 8192.0));
+    const float animation_time = fmod(GetTickCount() * .001f, 8192.0f);
     const SkyboxAnimationConstants animation{{animation_time / 128.0f, -animation_time / 64.0f},
                                               {animation_time / 64.0f, animation_time / 128.0f},
                                               gpu.skybox_tint};
@@ -2610,10 +2610,10 @@ void gpu_draw_overlay_range(uint32_t start_vertex, uint32_t vertex_count,
 void gpu_render() {
     if (!gpu.ready || !g.viewport)
         return;
-    const double animation_seconds = (GetTickCount64() - gpu.animation_start) * .001;
+    const float animation_seconds = (GetTickCount() - gpu.animation_start) * .001f;
     // MCP2 sub_48C720 advances the environment texture matrix's U offset by
     // 0.3 times frame delta, leaving V unchanged.
-    const float texture_scroll_offset = static_cast<float>(fmod(animation_seconds * .3, 1.0));
+    const float texture_scroll_offset = fmod(animation_seconds * .3f, 1.f);
     gpu.alpha_tested_prelight_drawn = false;
     gpu.solid_cutout_prelight_drawn = false;
     gpu.composited_alpha_prelight_drawn = false;
@@ -2751,7 +2751,7 @@ void gpu_render() {
         // The target refreshes the wet texture's offset from its renderer RNG.
         // Use one deterministic per-frame offset for every wet range, matching
         // the single shared texture matrix installed by sub_48C860.
-        const uint32_t wet_frame = static_cast<uint32_t>(GetTickCount64() / 33);
+        const uint32_t wet_frame = GetTickCount() / 33;
         const auto wet_random = [](uint32_t value) {
             value ^= value >> 16;
             value *= 0x7feb352du;
@@ -2815,7 +2815,7 @@ void gpu_render() {
         ID3D11ShaderResourceView* no_environment_textures[] = {nullptr, nullptr};
         gpu.context->PSSetShaderResources(2, _countof(no_environment_textures), no_environment_textures);
     }
-    const float rain_animation_time = static_cast<float>(fmod(GetTickCount64() * .001, 8192.0));
+    const float rain_animation_time = fmod(GetTickCount() * .001f, 8192.0f);
     gpu.context->RSSetState(gpu.rasterizer_no_cull);
     gpu_render_rain(camera_position, right, up, forward, fov_y,
                     static_cast<float>(width) / height, rain_animation_time);
