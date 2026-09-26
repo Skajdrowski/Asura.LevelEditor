@@ -28,6 +28,13 @@ struct SkyboxAnimationConstants {
     DirectX::XMFLOAT4 tint;
 };
 
+struct WaterAnimationConstants {
+    float wave_a;
+    float wave_b;
+    float scroll_u;
+    float frequency;
+};
+
 struct EnvironmentMaterialConstants {
     DirectX::XMFLOAT4 fallback_color;
     float has_texture;
@@ -266,6 +273,7 @@ struct GpuRenderer {
     ID3D11Texture2D* depth_texture = nullptr;
     ID3D11DepthStencilView* depth_view = nullptr;
     ID3D11VertexShader* vertex_shader = nullptr;
+    ID3D11VertexShader* water_vertex_shader = nullptr;
     ID3D11PixelShader* pixel_shader = nullptr;
     ID3D11PixelShader* environment_pixel_shader = nullptr;
     ID3D11PixelShader* rain_pixel_shader = nullptr;
@@ -276,6 +284,7 @@ struct GpuRenderer {
     ID3D11InputLayout* skybox_input_layout = nullptr;
     ID3D11Buffer* camera_buffer = nullptr;
     ID3D11Buffer* skybox_animation_buffer = nullptr;
+    ID3D11Buffer* water_animation_buffer = nullptr;
     ID3D11Buffer* environment_material_buffer = nullptr;
     ID3D11Buffer* environment_view_buffer = nullptr;
     ID3D11Buffer* skybox_vertices = nullptr;
@@ -369,10 +378,11 @@ void refresh_scene_animation_timer() {
         return;
     const bool animated_clouds = g.document.skybox.draw_clouds && gpu.skybox_cloud;
     const bool animated_rain = g.document.rain_enabled && gpu.rain_texture && gpu.rain_pixel_shader;
-    bool scrolling_material = false;
+    bool animated_material = false;
     for (const GpuMaterialRange& range : gpu.material_ranges)
-        scrolling_material |= range.texture && (range.material_flags & 0x400u) != 0;
-    if (animated_clouds || animated_rain || gpu.animated_models_active || scrolling_material)
+        animated_material |= (range.material_flags & 0x200u) != 0 ||
+                             (range.texture && (range.material_flags & 0x400u) != 0);
+    if (animated_clouds || animated_rain || gpu.animated_models_active || animated_material)
         SetTimer(g.window, 2, 33, nullptr);
     else
         KillTimer(g.window, 2);
@@ -1375,6 +1385,7 @@ void gpu_shutdown() {
     gpu_release(gpu.skybox_cloud_vertices);
     gpu_release(gpu.skybox_vertices);
     gpu_release(gpu.skybox_animation_buffer);
+    gpu_release(gpu.water_animation_buffer);
     gpu_release(gpu.environment_view_buffer);
     gpu_release(gpu.environment_material_buffer);
     gpu_release(gpu.skybox_input_layout);
@@ -1397,6 +1408,7 @@ void gpu_shutdown() {
     gpu_release(gpu.environment_pixel_shader);
     gpu_release(gpu.pixel_shader);
     gpu_release(gpu.vertex_shader);
+    gpu_release(gpu.water_vertex_shader);
     gpu_release(gpu.swap_chain);
     gpu_release(gpu.context);
     gpu_release(gpu.device);
@@ -1533,6 +1545,7 @@ bool gpu_init(HWND viewport) {
     }
     static const char shader_source[] = R"(
 cbuffer CameraBuffer : register(b0) { float4x4 viewProjection; };
+cbuffer WaterAnimationBuffer : register(b1) { float4 waterAnimation; };
 struct VSInput { float3 position : POSITION; float3 normal : NORMAL; float4 color : COLOR; float2 uv : TEXCOORD; };
 struct VSOutput {
     float4 position : SV_POSITION;
@@ -1549,6 +1562,13 @@ VSOutput VSMain(VSInput input) {
     output.uv = input.uv;
     output.worldPosition = input.position;
     return output;
+}
+VSOutput WaterVSMain(VSInput input) {
+    // Imported target Y is reflected into the editor's upright coordinates.
+    input.position.y -= waterAnimation.x * cos(input.uv.x * waterAnimation.w)
+                      + waterAnimation.y * sin(input.uv.y * waterAnimation.w);
+    input.uv.x += waterAnimation.z;
+    return VSMain(input);
 }
 Texture2D modelTexture : register(t0);
 SamplerState modelSampler : register(s0);
@@ -1696,7 +1716,7 @@ float4 SkyCloudPSMain(SkyVSOutput input) : SV_TARGET {
     return float4(cloudColour, horizonFade * 0.72);
 }
 )";
-    ID3DBlob *vs_blob = nullptr, *ps_blob = nullptr, *environment_ps_blob = nullptr,
+    ID3DBlob *vs_blob = nullptr, *water_vs_blob = nullptr, *ps_blob = nullptr, *environment_ps_blob = nullptr,
              *rain_ps_blob = nullptr;
     result = gpu_compile_shader(shader_source, sizeof(shader_source) - 1, "VSMain", "vs_4_0", &vs_blob);
     if (FAILED(result)) {
@@ -1704,7 +1724,10 @@ float4 SkyCloudPSMain(SkyVSOutput input) : SV_TARGET {
         gpu_shutdown();
         return false;
     }
-    result = gpu_compile_shader(shader_source, sizeof(shader_source) - 1, "PSMain", "ps_4_0", &ps_blob);
+    result = gpu_compile_shader(shader_source, sizeof(shader_source) - 1, "WaterVSMain", "vs_4_0",
+                                &water_vs_blob);
+    if (SUCCEEDED(result))
+        result = gpu_compile_shader(shader_source, sizeof(shader_source) - 1, "PSMain", "ps_4_0", &ps_blob);
     if (SUCCEEDED(result))
         result = gpu_compile_shader(shader_source, sizeof(shader_source) - 1, "EnvPSMain", "ps_4_0",
                                     &environment_ps_blob);
@@ -1713,6 +1736,8 @@ float4 SkyCloudPSMain(SkyVSOutput input) : SV_TARGET {
                                     &rain_ps_blob);
     if (FAILED(result) || FAILED(gpu.device->CreateVertexShader(vs_blob->GetBufferPointer(), vs_blob->GetBufferSize(),
                                                                 nullptr, &gpu.vertex_shader)) ||
+        FAILED(gpu.device->CreateVertexShader(water_vs_blob->GetBufferPointer(), water_vs_blob->GetBufferSize(),
+                                              nullptr, &gpu.water_vertex_shader)) ||
         FAILED(gpu.device->CreatePixelShader(ps_blob->GetBufferPointer(), ps_blob->GetBufferSize(), nullptr,
                                              &gpu.pixel_shader)) ||
         FAILED(gpu.device->CreatePixelShader(environment_ps_blob->GetBufferPointer(),
@@ -1722,6 +1747,7 @@ float4 SkyCloudPSMain(SkyVSOutput input) : SV_TARGET {
                                              rain_ps_blob->GetBufferSize(), nullptr,
                                              &gpu.rain_pixel_shader))) {
         gpu_release(vs_blob);
+        gpu_release(water_vs_blob);
         gpu_release(ps_blob);
         gpu_release(environment_ps_blob);
         gpu_release(rain_ps_blob);
@@ -1737,6 +1763,7 @@ float4 SkyCloudPSMain(SkyVSOutput input) : SV_TARGET {
     result = gpu.device->CreateInputLayout(elements, _countof(elements), vs_blob->GetBufferPointer(),
                                            vs_blob->GetBufferSize(), &gpu.input_layout);
     gpu_release(vs_blob);
+    gpu_release(water_vs_blob);
     gpu_release(ps_blob);
     gpu_release(environment_ps_blob);
     gpu_release(rain_ps_blob);
@@ -1869,6 +1896,11 @@ float4 SkyCloudPSMain(SkyVSOutput input) : SV_TARGET {
     }
     constant_desc.ByteWidth = sizeof(SkyboxAnimationConstants);
     if (FAILED(gpu.device->CreateBuffer(&constant_desc, nullptr, &gpu.skybox_animation_buffer))) {
+        gpu_shutdown();
+        return false;
+    }
+    constant_desc.ByteWidth = sizeof(WaterAnimationConstants);
+    if (FAILED(gpu.device->CreateBuffer(&constant_desc, nullptr, &gpu.water_animation_buffer))) {
         gpu_shutdown();
         return false;
     }
@@ -2692,7 +2724,7 @@ void gpu_render() {
         // is present before a puddle composites over it.
         gpu.context->OMSetBlendState(nullptr, nullptr, 0xffffffffu);
         for (const GpuMaterialRange& range : gpu.material_ranges) {
-            if (gpu_material_uses_alpha(range))
+            if (gpu_material_uses_alpha(range) || (range.material_flags & 0x200u))
                 continue;
             ID3D11ShaderResourceView* texture = range.texture ? range.texture : gpu.white_texture;
             const EnvironmentMaterialConstants material_constants =
@@ -2710,7 +2742,7 @@ void gpu_render() {
         gpu.context->OMSetDepthStencilState(gpu.depth_enabled, 0);
         gpu.context->OMSetBlendState(nullptr, nullptr, 0xffffffffu);
         for (const GpuMaterialRange& range : gpu.material_ranges) {
-            if (!gpu_material_is_solid_cutout(range))
+            if (!gpu_material_is_solid_cutout(range) || (range.material_flags & 0x200u))
                 continue;
             const EnvironmentMaterialConstants material_constants =
                 environment_material_constants(range.fallback_color, true,
@@ -2728,7 +2760,8 @@ void gpu_render() {
         // blended and multipass materials such as wet roads and detail fences.
         gpu.context->OMSetBlendState(gpu.alpha_blend, nullptr, 0xffffffffu);
         for (const GpuMaterialRange& range : gpu.material_ranges) {
-            if (!gpu_material_uses_alpha(range) || gpu_material_is_solid_cutout(range))
+            if (!gpu_material_uses_alpha(range) || gpu_material_is_solid_cutout(range) ||
+                (range.material_flags & 0x200u))
                 continue;
             const EnvironmentMaterialConstants material_constants =
                 environment_material_constants(range.fallback_color, true,
@@ -2763,7 +2796,8 @@ void gpu_render() {
         const DirectX::XMFLOAT4 wet_transform{
             wet_random(wet_frame ^ 0x51ed270bu), wet_random(wet_frame ^ 0xa3c59ac3u), 0.0f, 0.0f};
         for (const GpuMaterialRange& range : gpu.material_ranges) {
-            if (!range.texture || gpu_material_is_solid_cutout(range))
+            if (!range.texture || gpu_material_is_solid_cutout(range) ||
+                (range.material_flags & 0x200u))
                 continue;
             const bool wet_splash = gpu.environment_wet_weather && gpu.environment_splash &&
                                     (range.material_flags & 0x4000u) != 0;
@@ -2809,6 +2843,32 @@ void gpu_render() {
                 gpu.context->DrawIndexed(range.index_count, range.start_index, 0);
                 gpu.context->OMSetBlendState(gpu.modulate2x_blend, nullptr, 0xffffffffu);
             }
+        }
+        // MCP2 0x48DF71..0x48E0DF renders flag-0x200 strips with vertex
+        // shader 9, combiner 8 (texture RGBA), and SRC_ALPHA/INV_SRC_ALPHA.
+        if (gpu_has_material_flag(0x200u, false)) {
+            const WaterAnimationConstants water_animation{
+                sinf(animation_seconds * 1.2f) * .1f,
+                cosf(animation_seconds * 3.0f) * .1f,
+                fmod(animation_seconds * .1525f, 1.0f),
+                25.132742f};
+            gpu.context->UpdateSubresource(gpu.water_animation_buffer, 0, nullptr, &water_animation, 0, 0);
+            gpu.context->VSSetConstantBuffers(1, 1, &gpu.water_animation_buffer);
+            gpu.context->VSSetShader(gpu.water_vertex_shader, nullptr, 0);
+            gpu.context->OMSetDepthStencilState(gpu.depth_enabled, 0);
+            gpu.context->OMSetBlendState(gpu.alpha_blend, nullptr, 0xffffffffu);
+            for (const GpuMaterialRange& range : gpu.material_ranges) {
+                if ((range.material_flags & 0x200u) == 0)
+                    continue;
+                ID3D11ShaderResourceView* texture = range.texture ? range.texture : gpu.white_texture;
+                const EnvironmentMaterialConstants material_constants =
+                    environment_material_constants(range.fallback_color, range.texture != nullptr,
+                                                   range.has_material_color, 3.0f, false, false);
+                gpu.context->UpdateSubresource(gpu.environment_material_buffer, 0, nullptr, &material_constants, 0, 0);
+                gpu.context->PSSetShaderResources(2, 1, &texture);
+                gpu.context->DrawIndexed(range.index_count, range.start_index, 0);
+            }
+            gpu.context->VSSetShader(gpu.vertex_shader, nullptr, 0);
         }
         gpu.context->OMSetBlendState(nullptr, nullptr, 0xffffffffu);
         gpu.context->OMSetDepthStencilState(gpu.depth_enabled, 0);
